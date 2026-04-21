@@ -9,6 +9,107 @@
 
 #pragma comment(lib, "Ws2_32.lib")
 
+// OOP 싫어... RAII 싫어.. 근데 왜 재밌냐 시발
+
+class ClientSocket { // accept() 직후에 만들어지는 객체
+private:
+	SOCKET client_sock;
+public:
+	ClientSocket(SOCKET s) : client_sock(s) { }
+
+	ClientSocket(const ClientSocket&) = delete;
+	ClientSocket& operator=(const ClientSocket&) = delete;
+
+	int ClientRecvAll(char* buf, int len, NetState& state) {
+
+		int recv_all_res = recv_all(client_sock, state, buf, len);
+
+		if (recv_all_res == SOCKET_ERROR) {
+			return SOCKET_ERROR;
+		}
+
+		return recv_all_res;
+	}
+
+	int ClientSendAll(const char* msg, int len, NetState& state) {
+
+		int send_all_res = send_all(client_sock, state, msg, len);
+
+		if (send_all_res == SOCKET_ERROR) {
+			return SOCKET_ERROR;
+		}
+
+		return send_all_res;
+	}
+
+	~ClientSocket() {
+		if (client_sock != INVALID_SOCKET) {
+			closesocket(client_sock);
+		}
+	}
+
+	SOCKET get() const { return client_sock; }
+};
+
+class ListenSocket {
+private:
+	SOCKET sock;
+public:
+	ListenSocket() {
+		sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+		if (sock == INVALID_SOCKET) {
+			throw std::runtime_error("listen용 소켓 생성 실패");
+		}
+	}
+	void ListenSockBind(const sockaddr_in* addr) {
+
+		if (bind(sock, (sockaddr*) addr, sizeof(*addr)) == SOCKET_ERROR) {
+			throw std::runtime_error("listen용 소켓 바인딩 실패");
+		}
+		return;
+	}
+	void ListenSockListen() {
+
+		if (listen(sock, SOMAXCONN) == SOCKET_ERROR) {
+			throw std::runtime_error("listen() 실패");
+		}
+		return;
+	}
+	ClientSocket ListenSockAccept(sockaddr_in* client_addr) {
+		int addr_len = static_cast<int>(sizeof(*client_addr));
+		SOCKET client_sock = accept(sock, (sockaddr*) client_addr, &addr_len);
+		if (client_sock == INVALID_SOCKET) { // accept() 재실행은 catch문에서 continue를 호출해서 해결해야함
+			throw std::runtime_error("accept 실패");
+		}
+		
+		return ClientSocket(client_sock);
+	}
+
+	ListenSocket(const ListenSocket&) = delete;
+	ListenSocket& operator=(const ListenSocket&) = delete;
+
+
+	~ListenSocket() {
+		if (sock != INVALID_SOCKET) {
+			closesocket(sock);
+		}
+	}
+};
+
+class WinsockGuard {
+public:
+	WinsockGuard() {
+		WSADATA wsa;
+		int WSAStartupRes = WSAStartup(MAKEWORD(2, 2), &wsa);
+		if (WSAStartupRes != 0) {
+			throw std::runtime_error("윈속 초기화 실패");
+		}
+	}
+	~WinsockGuard() {
+		WSACleanup();
+	}
+};
+
 class ClientManager {
 private:
 	// 여기에다가 ClientMagager 클래스가 관리할 공유 컨테이너 선언
@@ -17,12 +118,12 @@ public:
 	// 여기에다가 공유 컨테이너에 삽입, 삭제, 클라이언트 수 체크를 담당할 함수 선언
 };
 
-struct client_info {
-	SOCKET sock;
+struct ClientInfo {
+	ClientSocket sock;
 	sockaddr_in addr;
 };
 
-const int SERVER_PORT = htonl(9000);
+const int SERVER_PORT = htons(9000);
 const int PAYLOAD_SIZE = 4096;
 const int BUFFER_SIZE = 4096;
 const int HEADER_SIZE = 8;
@@ -32,54 +133,53 @@ const int HEADER_LENGTH_SIZE = 4;
 const int32_t HEADER_ERROR = 0;
 const int32_t HEADER_SAFE = -1;
 
-int client_thread(client_info info) { // 지금은 단순 값 복사. 스마트 포인터 배우면 std::shared_ptr 사용해볼 예정.
+ClientManager Manager;
+
+int client_thread(ClientInfo info) { // 지금은 단순 값 복사. 스마트 포인터 배우면 std::shared_ptr 사용해볼 예정.
 
 }
 
 int main() {
+	try {
+		WinsockGuard winsock;
 
-	WSADATA wsa;
-	int WSAStartupRes = WSAStartup(MAKEWORD(2, 2), &wsa);
-	if (WSAStartupRes != 0) {
-		std::cout << "[ERROR]윈속 초기화 실패 : 에러 코드 = " << WSAStartupRes << '\n';
-		return 1;
-	}
+		ListenSocket server_sock;
+		sockaddr_in server_addr{};
+		server_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+		server_addr.sin_family = AF_INET;
+		server_addr.sin_port = SERVER_PORT;
 
-	SOCKET listen_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-	if (listen_sock == INVALID_SOCKET) {
-		std::cout << "[ERROR] Listen용 소켓 생성 실패 : \n";
-		err_quit("socket()");
-		return 1;
-	}
+		server_sock.ListenSockBind(&server_addr);
 
-	sockaddr_in server_addr{};
-	server_addr.sin_addr.s_addr = htonl(INADDR_ANY);
-	server_addr.sin_family = AF_INET;
-	server_addr.sin_port = SERVER_PORT;
-
-	if (bind(listen_sock, (sockaddr*)&server_addr, sizeof(server_addr)) == SOCKET_ERROR) {
-		std::cout << "[ERROR] Bind 실패 : \n";
-		err_quit("bind()");
-		return 1;
-	}
-
-	if (listen(listen_sock, SOMAXCONN) == SOCKET_ERROR) {
-		std::cout << "[ERROR] Listen 실패 : \n";
-		err_quit("listen()");
-		return 1;
-	}
-
-	while (true) {
-		sockaddr_in client_addr{};
-		int client_addr_len = sizeof(client_addr);
-		SOCKET client_sock = accept(listen_sock, (sockaddr*)&client_addr, &client_addr_len);
+		server_sock.ListenSockListen();
 		
-		if (client_sock == INVALID_SOCKET) {
-			std::cout << "[ERROR] accept 실패. 다시 accept() 대기합니다. : \n";
-			err_display("accept()");
-			continue;
-		}
+		while (true) {
+			sockaddr_in client_addr{};
+			try {
 
+				ClientInfo client{
+				server_sock.ListenSockAccept(&client_addr),
+				client_addr
+				};
+
+				
+				std::thread ClientThread(client_thread, );
+
+				ClientThread.detach();
+		    }
+			catch (const std::exception& e) {
+				std::cerr << e.what() << '\n';
+				continue;
+			}
+			
+
+		}
+		
 
 	}
+	catch(const std::exception& e) {
+		std::cerr << e.what() << '\n';
+	}
+
+	return 0;
 }

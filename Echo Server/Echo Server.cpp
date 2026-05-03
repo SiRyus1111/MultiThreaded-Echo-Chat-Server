@@ -4,123 +4,67 @@
 #include "Common.h" // err_quit, err_display
 #include "NetCommon.h" // 기존의 에코 서버의 상태 관리 구조체, 헤더 구조체, 송 / 수신 함수
 #include <thread>
+#include <vector>
+#include <memory>
 #include <map>
 #include <mutex>
+#include "socketRAII.h"
 
 #pragma comment(lib, "Ws2_32.lib")
 
 // OOP 싫어... RAII 싫어.. 근데 왜 재밌냐 시발
 
-class ClientSocket { // accept() 직후에 만들어지는 객체
+class ClientManager;
+
+class ClientSession {
 private:
-	SOCKET client_sock;
-public:
-	ClientSocket(SOCKET s) : client_sock(s) { }
+	std::unique_ptr<ClientSocket> ClientSock;
+	sockaddr_in ClientAddr;
+	std::weak_ptr<ClientManager> Manager_wp;
+public:	
+	ClientSession(std::unique_ptr<ClientSocket> s, sockaddr_in addr) : ClientSock(std::move(s)), ClientAddr(addr) { // move로 ClientSocket 객체 옮기기, addr은 모르겠다.. 일단 오늘은 단순히 복사하기로 하자.. 피곤해.
 
-	ClientSocket(const ClientSocket&) = delete;
-	ClientSocket& operator=(const ClientSocket&) = delete;
-
-	int ClientRecvAll(char* buf, int len, NetState& state) {
-
-		int recv_all_res = recv_all(client_sock, state, buf, len);
-
-		if (recv_all_res == SOCKET_ERROR) {
-			return SOCKET_ERROR;
-		}
-
-		return recv_all_res;
 	}
 
-	int ClientSendAll(const char* msg, int len, NetState& state) {
+	// share_from_this()로 받기 / ClientManager 객체에서 사용하는 함수
+	void AddToManager(std::shared_ptr<ClientManager> Manager_sp) {
+		Manager_wp = Manager_sp;
 
-		int send_all_res = send_all(client_sock, state, msg, len);
-
-		if (send_all_res == SOCKET_ERROR) {
-			return SOCKET_ERROR;
-		}
-
-		return send_all_res;
-	}
-
-	~ClientSocket() {
-		if (client_sock != INVALID_SOCKET) {
-			closesocket(client_sock);
-		}
-	}
-
-	SOCKET get() const { return client_sock; }
-};
-
-class ListenSocket {
-private:
-	SOCKET sock;
-public:
-	ListenSocket() {
-		sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-		if (sock == INVALID_SOCKET) {
-			throw std::runtime_error("listen용 소켓 생성 실패");
-		}
-	}
-	void ListenSockBind(const sockaddr_in* addr) {
-
-		if (bind(sock, (sockaddr*) addr, sizeof(*addr)) == SOCKET_ERROR) {
-			throw std::runtime_error("listen용 소켓 바인딩 실패");
-		}
 		return;
 	}
-	void ListenSockListen() {
 
-		if (listen(sock, SOMAXCONN) == SOCKET_ERROR) {
-			throw std::runtime_error("listen() 실패");
-		}
-		return;
-	}
-	ClientSocket ListenSockAccept(sockaddr_in* client_addr) {
-		int addr_len = static_cast<int>(sizeof(*client_addr));
-		SOCKET client_sock = accept(sock, (sockaddr*) client_addr, &addr_len);
-		if (client_sock == INVALID_SOCKET) { // accept() 재실행은 catch문에서 continue를 호출해서 해결해야함
-			throw std::runtime_error("accept 실패");
-		}
-		
-		return ClientSocket(client_sock);
-	}
+	// ClientSession 객체 복사 방지용
+	ClientSession& operator=(const ClientSession& c) = delete;
+	ClientSession(const ClientSession&) = delete;
 
-	ListenSocket(const ListenSocket&) = delete;
-	ListenSocket& operator=(const ListenSocket&) = delete;
-
-
-	~ListenSocket() {
-		if (sock != INVALID_SOCKET) {
-			closesocket(sock);
+	~ClientSession() {
+		if (std::shared_ptr<ClientManager> locked = Manager_wp.lock()) {
+			// 여기서 ClientManager의 공유 컨테이너에서 해당 클라이언트 제거하는 함수 호출?
 		}
 	}
 };
 
-class WinsockGuard {
-public:
-	WinsockGuard() {
-		WSADATA wsa;
-		int WSAStartupRes = WSAStartup(MAKEWORD(2, 2), &wsa);
-		if (WSAStartupRes != 0) {
-			throw std::runtime_error("윈속 초기화 실패");
-		}
-	}
-	~WinsockGuard() {
-		WSACleanup();
-	}
-};
-
-class ClientManager {
+class ClientManager : public std::enable_shared_from_this<ClientManager> {
 private:
-	// 여기에다가 ClientMagager 클래스가 관리할 공유 컨테이너 선언
+	std::vector<std::shared_ptr<ClientSession>> clients;
 	std::mutex client_mutex;
 public:
-	// 여기에다가 공유 컨테이너에 삽입, 삭제, 클라이언트 수 체크를 담당할 함수 선언
-};
+	ClientManager() {};
+	~ClientManager() {};
 
-struct ClientInfo {
-	ClientSocket sock;
-	sockaddr_in addr;
+	// ClientSession 객체 복사 방지용
+	ClientManager& operator=(const ClientManager& c) = delete;
+	ClientManager(const ClientManager&) = delete;
+
+	// 여기에다가 공유 컨테이너에 삽입, 삭제, 클라이언트 수 체크를 담당할 함수 선언
+	void AddClient(std::shared_ptr<ClientSession> client) {
+		std::lock_guard<std::mutex> lock(client_mutex); // lock_guard로 스코프 벗어나면 락 해제. 공유 컨테이너에 접근하는 모든 함수에 자동으로 이걸 적용하는게 좋아보임. 반복 줄이기.
+
+		clients.push_back(client);
+		client->AddToManager(shared_from_this());
+
+		return;
+	}
 };
 
 const int SERVER_PORT = htons(9000);
@@ -130,12 +74,9 @@ const int HEADER_SIZE = 8;
 const int HEADER_TYPE_SIZE = 4;
 const int HEADER_LENGTH_SIZE = 4;
 
-const int32_t HEADER_ERROR = 0;
-const int32_t HEADER_SAFE = -1;
+std::shared_ptr<ClientManager> manager = std::make_shared<ClientManager>();
 
-ClientManager Manager;
-
-int client_thread(ClientInfo info) { // 지금은 단순 값 복사. 스마트 포인터 배우면 std::shared_ptr 사용해볼 예정.
+int client_thread(ClientSession session) { // 지금은 단순 값 복사. 스마트 포인터 배우면 std::shared_ptr / std::unique_ptr 사용해볼 예정.
 
 }
 
@@ -157,12 +98,10 @@ int main() {
 			sockaddr_in client_addr{};
 			try {
 
-				ClientInfo client{
-				server_sock.ListenSockAccept(&client_addr),
-				client_addr
-				};
+				std::unique_ptr<ClientSocket> client_socket = std::make_unique<ClientSocket>(server_sock.ListenSockAccept(&client_addr));
 
-				
+				ClientSession client(std::move(client_socket), client_addr); // unique_ptr 배운 후 수정 예정
+
 				std::thread ClientThread(client_thread, );
 
 				ClientThread.detach();

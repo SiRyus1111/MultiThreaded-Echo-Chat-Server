@@ -58,3 +58,52 @@
 	  - ..인데 이건 나중에 다시 봐야할 듯. 재검토 필요. 
 - 추가적인 수정은 unique_ptr 공부한 후에 할 예정.
 - 시발 내가 지금 뭘 한거지 시발 ㅈ됐다 못 쉬고 이런거 적어버렸다 시발 번아웃 상태인데 시발 진짜 ㅈ됐다
+
+### 26.05.04
+
+- 각 객체 간의 관계 설계
+  - IdeaNote 참조
+- `unique_ptr`, `shared_ptr` 관련 Syntax Error 해결
+  - `std::move()`함수에 대한 이해 부족이 원인.
+    - 생성자의 인자로 `unique_ptr<ClientSocket>`을 move를 이용해 받아왔지만, 객체 내부에 `unique_ptr<ClientSocket>`인 ClientSock에 소유권을 이전할 때 `std::move()` 함수를 사용하지 않았음.
+	- 생성자 내부에서도 `std::move()` 함수로 ClientSock에 소유권을 이동시켜서 해결.
+  - 추가적으로, `main()` 함수의 `shared_ptr<ClientSession>`을 생성하는 부분에서 오류 발생.
+	- 초기화가 문제였음. 단순히 `shared_ptr<ClientSession> client(std::move(client_socket), client_addr)`로 잘못된 방식이었음.(생성자인줄 알고 생성자처럼 인자를 넣어버림)
+	- `std::make_shared()` 함수로 초기화하여 해결.
+- 서버 코드에 IdeaNote에서 설계한 ClientSession을 직접 코드로 구현
+  - ClientSession 
+    - 클라이언트 하나의 연결 단위
+	- 해당 클라이언트의 ClientSocket 소유(`unique_ptr`)
+	- 해당 클라이언트의 주소, 송수신 상태 저장(단순 값)
+	- 필요시 ClientManager 참조(소유하지 않음. `weak_ptr`)
+	- 1 client_thread() <-> 1 ClientSession 구조
+	- private 접근 지정자
+	  - `unique_ptr<ClientSocket>` ClientSock 
+		- raw SOCKET을 객체로 감싼 RAII 객체의 `unique_ptr`. 
+		- `unique_ptr`을 사용해서 해당 클라이언트의 ClientSession 객체만 해당 클라이언트의 `ClientSocket` 객체를 소유할 수 있음을 명시.
+		- send_all(), recv_all()은 이 객체가 함, 복사 불가, 단독 소유.
+		- 이건 이미 지난번에 구현해놓음.
+      - `sockaddr_in` ClientAddr 
+		- 클라이언트 IP 주소를 저장할 소켓 주소 구조체. 
+		- 이것도 이미 지난번에 구현해놓음.
+      - `weak_ptr<ClientManager>` Manager_wp 
+		- ClientManager 소유하지 않고 참조만 할 용도의 `weak_ptr`.
+		- 이것도 이미 지난번에 구현해놓음.
+      - `NetState` ClientState 
+		- 송 / 수신의 현재 과정과 예외 상황을 기록할 상태 관리 구조체.
+		- `ClientSocket`이 `ClientState&`를 멤버로 들고 있을 필요는 없음.
+		- `ClientSession`이 `ClientState`를 값으로 소유하고, 송 / 수신 시 `ClientSockSend()` / `ClientSockRecv()`에 레퍼런스로 넘겨 상태 변화를 반영.
+    - public 접근 지정자
+	  - ClientSession() - 생성자
+		- 받은 `unique_ptr<ClientSocket> s`를 `std::move(s)`로 멤버 `ClientSock`에 이동시켜 초기화.
+		- ClientAddr은 값 복사로 받아서 초기화. - 간단한 값일 뿐이므로. (소유권 상관없음)
+		- ClientState는 모든 필드 0(false)로 초기화. - 혹시 모를 쓰레기값이 있을까봐.
+	  - void AddToManager(shared_ptr<ClientManager> manager_sp)
+		- `shared_ptr<ClientManager>`를 받아서 Manager_wp를 초기화하는 함수
+	  - void Run()
+		- 이 함수는 아예 갈아엎음.
+		- 원래는 송 / 수신 함수를 분리할 예정이었지만, ClientState를 보고 각 에러에 맞는 메시지를 출력, 에러 메시지를 클라이언트에 전송하는 과정을 넣기 어려울 것 같아서 Run() 함수로 송 / 수신 과정을 통합.
+		- 이전의 에코 서버와 로직 변경 없음. 기존의 에코 서버의 송 / 수신 코드 사실상 복붙함.
+		- 딱 변수 이름 + 포인터 역참조 변경밖에 변경점 없음.
+		- 이거 하다가 토할뻔 함.
+		- 나중에 구조가 안정된다면 `RecvPacket()`, `SendPacket()`, `SendHeaderErrorPacket()` 같은 함수로 분리할 수 있음.

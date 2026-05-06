@@ -554,15 +554,19 @@ ClientManager
 
 ```cpp
 void ClientManager::AddClient(std::shared_ptr<ClientSession> client) {
-    std::lock_guard<std::mutex> lock(client_mutex);
-
-    clients.push_back(client);
     client->AddToManager(shared_from_this());
+
+    std::lock_guard<std::mutex> lock(client_mutex);
+    clients.push_back(client);
 }
 ```
 
 `clients`는 여러 thread가 접근할 수 있는 공유 컨테이너이므로,
 `std::lock_guard<std::mutex>`를 사용하여 접근 구간을 보호합니다.
+
+`std::lock_guard<std::mutex>`를 사용하는 경우,
+`lock`을 획득 후 타 객체의 함수를 호출하는 것은 `ClientManager` 외부의 코드를 통제할 수 없어 위험하므로
+오로지 `clients`를 관리하는 동작에만 짧게 `lock`을 획득 후 `clients`에 대한 연산을 진행합니다.
 
 현재는 기본적인 추가 구조를 먼저 구현한 상태이며,
 추후 lock 범위와 함수 호출 순서는 다시 조정할 수 있습니다.

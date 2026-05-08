@@ -212,7 +212,7 @@ void ClientSession::Run() {
 	return;
 }
 
-auto manager = std::make_shared<ClientManager>();
+std::shared_ptr<ClientManager> manager = std::make_shared<ClientManager>();
 
 void client_thread(std::shared_ptr<ClientSession> session) { // detach()로 분리한 스레드
 	session->Run();
@@ -238,9 +238,9 @@ int main() {
 			sockaddr_in client_addr{};
 			try {
 
-				auto client_socket = std::make_unique<ClientSocket>(server_sock.ListenSockAccept(&client_addr));
+				std::unique_ptr<ClientSocket> client_socket = std::make_unique<ClientSocket>(server_sock.ListenSockAccept(&client_addr));
 
-				auto client_session = std::make_shared<ClientSession>(std::move(client_socket), client_addr); // unique_ptr 배운 후 수정 예정
+				std::shared_ptr<ClientSession> client_session = std::make_shared<ClientSession>(std::move(client_socket), client_addr); // unique_ptr 배운 후 수정 예정
 
 				manager->AddClient(client_session);
 

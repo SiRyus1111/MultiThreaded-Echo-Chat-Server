@@ -61,7 +61,7 @@
 멀티클라이언트 / 멀티스레드 Echo Server
         ↓
 브로드캐스트 Chat Server
-````
+```
 
 ### 3-1. 기존 단일 클라이언트 Echo Server
 
@@ -371,14 +371,16 @@ ClientSocket(ClientSocket&& other) noexcept;
 * `ClientManager`
 * `client_thread()`
 
-이 챕터에서는 기존 객체가 아닌,
-이번 프로젝트에서 새로 추가되는 설계 요소만 정리합니다.
+이 챕터에서는 기존 객체가 아닌, 이번 프로젝트에서 새로 추가되는 설계 요소만 정리합니다.
 
 ---
 
 ### 9-1. ClientSession
 
-`ClientSession`은 클라이언트 한 명의 세션 정보를 표현하는 객체입니다.
+`ClientSession`은 클라이언트 한 명의 연결 단위를 표현하는 객체입니다.
+
+현재 설계에서는 `ClientSession` 하나가 특정 클라이언트에 대한 대부분의 정보를 담당합니다.
+즉, 클라이언트의 socket, 주소 정보, 송수신 상태, 종료 예정 상태, 송수신 루프를 하나의 세션 객체 안에서 관리합니다.
 
 역할:
 
@@ -386,6 +388,7 @@ ClientSocket(ClientSocket&& other) noexcept;
 * 해당 클라이언트의 `ClientSocket` 소유
 * 클라이언트 주소 정보 저장
 * 클라이언트별 송수신 상태 저장
+* 클라이언트별 논리적 종료 상태 저장
 * 클라이언트별 송수신 루프 실행
 * 필요 시 자신을 관리하는 `ClientManager` 참조
 * 추후 채팅 서버에서 닉네임 / 세션 ID / 접속 상태 등 관리 가능
@@ -393,17 +396,22 @@ ClientSocket(ClientSocket&& other) noexcept;
 현재 구조:
 
 ```cpp
-class ClientSession {
+class ClientSession : public std::enable_shared_from_this<ClientSession> {
 private:
     std::unique_ptr<ClientSocket> ClientSock;
     sockaddr_in ClientAddr;
     std::weak_ptr<ClientManager> Manager_wp;
     NetState ClientState;
+    std::atomic<bool> closing = false;
 
 public:
     ClientSession(std::unique_ptr<ClientSocket> s, sockaddr_in addr);
+
     void AddToManager(std::shared_ptr<ClientManager> manager_sp);
     void Run();
+    void RemoveThisClient();
+
+    bool IsClosing() const;
 };
 ```
 
@@ -416,25 +424,22 @@ ClientSession
   └── unique_ptr<ClientSocket>
 ```
 
-`ClientSocket`은 실제 raw `SOCKET`을 소유하는 RAII 객체이며,
-해당 socket은 특정 클라이언트 세션 하나에만 속하는 것이 자연스럽습니다.
+`ClientSocket`은 실제 raw `SOCKET`을 소유하는 RAII 객체이며, 해당 socket은 특정 클라이언트 세션 하나에만 속하는 것이 자연스럽습니다.
 
-따라서 현재 설계에서는 `unique_ptr<ClientSocket>`을 사용하여
-`ClientSession`이 `ClientSocket`을 독점 소유하도록 구성했습니다.
+따라서 현재 설계에서는 `unique_ptr<ClientSocket>`을 사용하여 `ClientSession`이 `ClientSocket`을 독점 소유하도록 구성했습니다.
 
 ```cpp
 ClientSession::ClientSession(std::unique_ptr<ClientSocket> s, sockaddr_in addr)
     : ClientSock(std::move(s)),
       ClientAddr(addr),
-      ClientState{} {
+      ClientState{},
+      closing(false) {
 }
 ```
 
-생성자 매개변수로 들어온 `s`는 타입이 `unique_ptr<ClientSocket>`이라도,
-함수 내부에서는 이름이 있는 변수이므로 lvalue로 취급됩니다.
+생성자 매개변수로 들어온 `s`는 타입이 `unique_ptr<ClientSocket>`이라도, 함수 내부에서는 이름이 있는 변수이므로 lvalue로 취급됩니다.
 
-따라서 멤버인 `ClientSock`으로 소유권을 넘기려면
-생성자 내부에서도 `std::move(s)`가 필요합니다.
+따라서 멤버인 `ClientSock`으로 소유권을 넘기려면 생성자 내부에서도 `std::move(s)`가 필요합니다.
 
 #### ClientAddr
 
@@ -444,8 +449,7 @@ ClientSession::ClientSession(std::unique_ptr<ClientSocket> s, sockaddr_in addr)
 sockaddr_in ClientAddr;
 ```
 
-`SOCKET`처럼 닫아야 하는 자원이 아니라 단순 값 데이터에 가까우므로,
-현재는 값 복사로 관리합니다.
+`SOCKET`처럼 닫아야 하는 자원이 아니라 단순 값 데이터에 가까우므로, 현재는 값 복사로 관리합니다.
 
 추후 IPv6까지 고려한다면 `sockaddr_storage`로 확장할 수 있습니다.
 
@@ -456,7 +460,7 @@ sockaddr_in ClientAddr;
 예:
 
 * 접속 종료 시 자신을 목록에서 제거 요청
-* 채팅 메시지 broadcast 요청
+* 추후 채팅 메시지 broadcast 요청
 * 서버 공용 상태 접근
 
 하지만 `ClientSession`이 `ClientManager`를 소유해서는 안 됩니다.
@@ -473,9 +477,7 @@ ClientSession
 
 이 구조를 통해 순환 참조를 방지합니다.
 
-`ClientSession`은 `AddToManager()`를 통해
-`ClientManager`의 `shared_ptr`을 전달받고,
-이를 내부의 `weak_ptr<ClientManager>`에 저장합니다.
+`ClientSession`은 `AddToManager()`를 통해 `ClientManager`의 `shared_ptr`을 전달받고, 이를 내부의 `weak_ptr<ClientManager>`에 저장합니다.
 
 ```cpp
 void ClientSession::AddToManager(std::shared_ptr<ClientManager> manager_sp) {
@@ -483,29 +485,71 @@ void ClientSession::AddToManager(std::shared_ptr<ClientManager> manager_sp) {
 }
 ```
 
+#### closing
+
+`closing`은 `ClientSession`의 논리적 종료 상태를 나타냅니다.
+
+```cpp
+std::atomic<bool> closing = false;
+```
+
+의미:
+
+```text
+closing == false
+  → 아직 정상 송수신 가능한 세션
+
+closing == true
+  → 객체는 아직 살아있지만, 더 이상 정상적인 송신 대상으로 보지 않는 종료 예정 세션
+```
+
+`detach()` 기반 구조에서는 `std::thread` 객체를 통해 client thread의 종료 여부를 직접 관측하지 않습니다.
+따라서 분리된 thread의 상태는 `std::thread` 객체가 아니라 `ClientSession` 객체 내부 상태로 기록합니다.
+
+현재는 `Run()` 실행 중 `transport error`, `peer exit`, `protocol error` 등으로 세션을 종료해야 하는 상황이 발생하면 `closing`을 `true`로 바꿉니다.
+이후 `ClientManager`가 broadcast를 수행할 때 `closing == true`인 세션에는 `SendPacket()`을 수행하지 않도록 설계할 예정입니다.
+
+`closing`은 여러 스레드에서 읽고 쓸 수 있으므로 `std::atomic<bool>`을 사용합니다.
+단일 bool 값의 원자적인 읽기 / 쓰기만 필요하고, 복잡한 상태 변경을 보호하는 상황은 아니기 때문에 현재 단계에서는 `std::mutex`보다 `std::atomic`이 더 적절하다고 판단했습니다.
+
 #### Run()
 
 `Run()`은 해당 클라이언트의 송신 / 수신 루프를 담당합니다.
 
-현재는 기존 단일 클라이언트 Echo Server의 송수신 로직을 기반으로,
-`ClientSession` 내부에서 직접 송신 / 수신 과정을 수행하도록 구성했습니다.
+현재는 기존 단일 클라이언트 Echo Server의 송수신 로직을 기반으로, `ClientSession` 내부에서 직접 송신 / 수신 과정을 수행하도록 구성했습니다.
 
-기존 Echo Server와 큰 로직 변화는 없으며,
-주요 변경점은 다음과 같습니다.
+기존 Echo Server와 큰 로직 변화는 없으며, 주요 변경점은 다음과 같습니다.
 
 * raw socket 직접 사용 대신 `ClientSock` 사용
 * 전역 또는 지역 상태 대신 `ClientState` 사용
 * `ClientSockSend()` / `ClientSockRecv()` 호출 시 `ClientState`를 레퍼런스로 전달
 * 클라이언트 한 명의 통신 흐름을 `ClientSession::Run()` 안에 통합
+* 종료 상황 발생 시 `closing`을 `true`로 변경
+* 종료 직전 `RemoveThisClient()`를 호출하여 `ClientManager`에 제거 요청
 
-현재는 송신 / 수신 함수를 더 잘게 분리하지 않고,
-에러 처리 흐름과 기존 Echo 로직을 유지하기 위해 `Run()` 안에 통합했습니다.
+현재는 송신 / 수신 함수를 더 잘게 분리하지 않고, 에러 처리 흐름과 기존 Echo 로직을 유지하기 위해 `Run()` 안에 통합했습니다.
 
 추후 구조가 안정되면 다음 함수들로 분리할 수 있습니다.
 
 * `RecvPacket()`
 * `SendPacket()`
 * `SendHeaderErrorPacket()`
+
+#### RemoveThisClient()
+
+`RemoveThisClient()`는 현재 `ClientSession`이 자신을 관리하는 `ClientManager`에게 제거를 요청하는 함수입니다.
+
+```cpp
+void ClientSession::RemoveThisClient() {
+    if (auto locked = Manager_wp.lock()) {
+        locked->RemoveClient(shared_from_this());
+    }
+}
+```
+
+`Manager_wp`는 `weak_ptr<ClientManager>`이므로, 실제로 `ClientManager`에 접근하기 전 `lock()`을 통해 아직 `ClientManager`가 살아있는지 확인합니다.
+
+`shared_from_this()`를 사용하려면 `ClientSession`이 `std::enable_shared_from_this<ClientSession>`를 상속해야 하며, `ClientSession` 객체가 반드시 `std::shared_ptr`로 관리되는 상태여야 합니다.
 
 ---
 
@@ -518,7 +562,7 @@ void ClientSession::AddToManager(std::shared_ptr<ClientManager> manager_sp) {
 * 클라이언트 추가
 * 클라이언트 제거
 * 현재 접속 중인 클라이언트 목록 관리
-* 브로드캐스트 메시지 전송
+* 추후 브로드캐스트 메시지 전송
 * 공유 컨테이너 동기화
 
 현재 구조:
@@ -531,22 +575,21 @@ private:
 
 public:
     void AddClient(std::shared_ptr<ClientSession> client);
+    void RemoveClient(std::shared_ptr<ClientSession> client);
 };
 ```
 
 #### ClientSession 관리
 
-`ClientManager`는 여러 `ClientSession`을 관리해야 하므로
-`std::vector<std::shared_ptr<ClientSession>>` 형태의 컨테이너를 사용합니다.
+`ClientManager`는 여러 `ClientSession`을 관리해야 하므로 `std::vector<std::shared_ptr<ClientSession>>` 형태의 컨테이너를 사용합니다.
 
 ```text
 ClientManager
   └── vector<shared_ptr<ClientSession>>
 ```
 
-`ClientSession`은 `ClientManager`뿐만 아니라
-각 클라이언트를 담당하는 thread에서도 사용되므로
-`shared_ptr<ClientSession>`으로 생명주기를 관리합니다.
+`ClientSession`은 `ClientManager`뿐만 아니라 각 클라이언트를 담당하는 thread에서도 사용됩니다.
+따라서 `shared_ptr<ClientSession>`으로 세션 객체의 물리적 생존을 관리합니다.
 
 #### AddClient()
 
@@ -561,25 +604,41 @@ void ClientManager::AddClient(std::shared_ptr<ClientSession> client) {
 }
 ```
 
-`clients`는 여러 thread가 접근할 수 있는 공유 컨테이너이므로,
-`std::lock_guard<std::mutex>`를 사용하여 접근 구간을 보호합니다.
+`clients`는 여러 thread가 접근할 수 있는 공유 컨테이너이므로 `std::lock_guard<std::mutex>`를 사용하여 접근 구간을 보호합니다.
 
-`std::lock_guard<std::mutex>`를 사용하는 경우,
-`lock`을 획득 후 타 객체의 함수를 호출하는 것은 `ClientManager` 외부의 코드를 통제할 수 없어 위험하므로
-오로지 `clients`를 관리하는 동작에만 짧게 `lock`을 획득 후 `clients`에 대한 연산을 진행합니다.
+현재 구조에서는 `ClientManager`가 `shared_ptr<ClientSession>`을 보관하고, detached client thread도 `shared_ptr<ClientSession>`을 보관합니다.
+따라서 둘 중 하나라도 세션 객체를 참조하고 있다면 `ClientSession`은 소멸하지 않습니다.
 
-현재는 기본적인 추가 구조를 먼저 구현한 상태이며,
-추후 lock 범위와 함수 호출 순서는 다시 조정할 수 있습니다.
+#### RemoveClient()
+
+`RemoveClient()`는 특정 `ClientSession`을 `clients` 컨테이너에서 제거합니다.
+
+```cpp
+void ClientManager::RemoveClient(std::shared_ptr<ClientSession> client) {
+    std::lock_guard<std::mutex> lock(client_mutex);
+
+    clients.erase(
+        std::remove(clients.begin(), clients.end(), client),
+        clients.end()
+    );
+}
+```
+
+`RemoveClient()`는 현재 임시 구현 단계입니다.
+추후 `ClientManager` 구조를 더 정리하면서 제거 정책과 broadcast 중 제거 처리 방식을 다시 다듬을 예정입니다.
+
+중요한 점은 `RemoveClient()`가 곧바로 `ClientSession` 객체의 소멸을 의미하지 않는다는 것입니다.
+
+`RemoveClient()`는 `ClientManager`의 관리 목록에서 해당 세션을 제외하는 동작입니다.
+만약 detached client thread가 아직 `shared_ptr<ClientSession>`을 들고 있다면, `ClientManager`에서 제거된 뒤에도 세션 객체는 계속 살아있습니다.
 
 #### shared_from_this()
 
 `ClientManager`가 자신을 관리하는 `shared_ptr`을 `ClientSession`에 전달해야 할 수 있습니다.
 
-이때 `this`로부터 직접 `shared_ptr`을 만들면
-기존 control block과 다른 control block이 생길 수 있어 위험합니다.
+이때 `this`로부터 직접 `shared_ptr`을 만들면 기존 control block과 다른 control block이 생길 수 있어 위험합니다.
 
-따라서 `ClientManager`는 `std::enable_shared_from_this<ClientManager>`를 상속하고,
-`shared_from_this()`를 통해 기존 control block을 공유하는 `shared_ptr`을 얻도록 설계합니다.
+따라서 `ClientManager`는 `std::enable_shared_from_this<ClientManager>`를 상속하고, `shared_from_this()`를 통해 기존 control block을 공유하는 `shared_ptr`을 얻도록 설계합니다.
 
 ```cpp
 class ClientManager
@@ -593,8 +652,7 @@ class ClientManager
 auto manager = std::make_shared<ClientManager>();
 ```
 
-처럼 `ClientManager` 객체가 반드시 `shared_ptr`로 관리되는 상태에서
-`shared_from_this()`를 호출해야 합니다.
+처럼 `ClientManager` 객체가 반드시 `shared_ptr`로 관리되는 상태에서 `shared_from_this()`를 호출해야 합니다.
 
 ---
 
@@ -611,9 +669,7 @@ void client_thread(std::shared_ptr<ClientSession> session) {
 ```
 
 `ClientSession`은 `ClientManager`와 `client_thread()` 양쪽에서 사용됩니다.
-
-따라서 thread에는 `shared_ptr<ClientSession>`을 전달하여,
-thread가 실행되는 동안 해당 세션 객체가 살아있도록 합니다.
+따라서 thread에는 `shared_ptr<ClientSession>`을 전달하여, thread가 실행되는 동안 해당 세션 객체가 살아있도록 합니다.
 
 ```text
 ClientManager
@@ -623,9 +679,30 @@ client_thread()
   └── shared_ptr<ClientSession>
 ```
 
+현재는 `std::thread` 생성 직후 `detach()`를 호출하는 구조를 사용합니다.
+
+```cpp
+auto session = std::make_shared<ClientSession>(std::move(client_socket), client_addr);
+manager->AddClient(session);
+
+std::thread ClientThread(client_thread, session);
+ClientThread.detach();
+```
+
+`detach()`를 선택한 이유는 현재 단계에서 `join()` 기반으로 thread 종료 시점, `ClientSession` 제거 시점, `ClientManager`의 관리 책임을 모두 정확히 묶는 구조가 지나치게 복잡했기 때문입니다.
+
+따라서 1차 구현에서는 다음 구조를 선택했습니다.
+
+```text
+std::thread 객체로 client thread의 종료를 직접 회수하지 않는다.
+대신 ClientSession의 shared_ptr와 closing 상태값으로 세션 객체의 수명과 종료 상태를 관리한다.
+```
+
+`detach()`는 thread를 완전히 방치한다는 의미가 아니라, `std::thread` 객체를 통한 회수를 포기하고 다른 수명 / 상태 모델로 관리한다는 의미에 가깝습니다.
+
 ---
 
-## 10. 객체 소유 관계
+## 10. 객체 소유 관계와 종료 상태
 
 현재 객체 소유 관계는 다음과 같습니다.
 
@@ -637,47 +714,127 @@ client_thread()
   └── shared_ptr<ClientSession>
 
 ClientSession
-  └── unique_ptr<ClientSocket>
+  ├── unique_ptr<ClientSocket>
+  ├── weak_ptr<ClientManager>
+  ├── NetState
+  └── atomic<bool> closing
 
 ClientSocket
   └── SOCKET
 ```
 
-### 의미
+### 10-1. 물리적 생존
 
-* `ClientManager`
+`ClientSession`의 물리적 생존은 `shared_ptr`의 reference count로 관리합니다.
 
-  * 여러 `ClientSession`을 관리합니다.
-  * 세션 목록을 유지해야 하므로 `shared_ptr<ClientSession>`을 가집니다.
+```text
+ClientManager가 clients에 보관 중이거나
+OR
+client_thread가 shared_ptr<ClientSession>을 들고 있으면
 
-* `client_thread()`
+ClientSession 객체는 소멸하지 않는다.
+```
 
-  * 특정 클라이언트의 송수신 루프를 담당합니다.
-  * thread가 실행되는 동안 세션 객체가 살아있어야 하므로 `shared_ptr<ClientSession>`을 가집니다.
+따라서 `ClientManager`에서 해당 세션을 `RemoveClient()`로 제거하더라도, detached client thread가 아직 `shared_ptr<ClientSession>`을 들고 있으면 세션 객체는 즉시 소멸하지 않습니다.
 
-* `ClientSession`
+반대로 client thread가 먼저 종료되더라도 `ClientManager`가 아직 세션을 보관하고 있다면 세션 객체는 여전히 살아있습니다.
 
-  * 특정 클라이언트의 socket을 독점 소유합니다.
-  * 내부에 `unique_ptr<ClientSocket>`을 가집니다.
+### 10-2. 논리적 종료 상태
 
-* `ClientSocket`
+`ClientSession`의 논리적 종료 상태는 `closing`으로 관리합니다.
 
-  * raw `SOCKET`을 소유합니다.
-  * 소멸 시 `closesocket()`을 호출합니다.
+```text
+closing == false
+  → 정상 송수신 대상
+
+closing == true
+  → 객체는 아직 살아있지만, 종료 예정 상태
+```
+
+즉, `shared_ptr`은 `ClientSession`의 물리적 생존을 보장하고, `closing`은 `ClientSession`의 논리적 종료 상태를 나타냅니다.
+
+### 10-3. RemoveClient의 의미
+
+`RemoveClient()`는 세션 객체를 즉시 소멸시키는 함수가 아니라, `ClientManager`의 관리 목록에서 해당 세션을 제외하는 함수입니다.
+
+```text
+RemoveClient()
+  → clients 컨테이너에서 shared_ptr 제거
+  → ClientManager의 관리 목록에서 제외
+  → 마지막 shared_ptr이 사라진 경우에만 ClientSession 소멸
+```
+
+따라서 현재 구조에서는 다음 세 가지를 구분합니다.
+
+```text
+shared_ptr
+  → 물리적 생존 보장
+
+closing
+  → 논리적 종료 상태
+
+RemoveClient()
+  → ClientManager의 관리 목록에서 제거
+```
 
 ---
 
-## 11. Echo Server에서 Chat Server로 확장
+## 11. main thread와 client_thread 흐름
 
-초기 단계에서는 기존 Echo Server와 동일하게,
-클라이언트가 보낸 메시지를 해당 클라이언트에게 그대로 돌려보냅니다.
+현재 서버의 thread 흐름은 다음과 같습니다.
+
+```text
+main thread
+  ├── WinsockGuard 생성
+  ├── ListenSocket 생성
+  ├── accept() loop
+  │     ├── ClientSocket 생성
+  │     ├── ClientSession 생성
+  │     ├── ClientManager::AddClient(session)
+  │     ├── std::thread ClientThread(client_thread, session)
+  │     └── ClientThread.detach()
+  └── accept() loop 계속 진행
+```
+
+각 client thread의 흐름은 다음과 같습니다.
+
+```text
+client_thread
+  └── session->Run()
+          ├── header recv
+          ├── payload recv
+          ├── echo send
+          ├── error / peer_exit / protocol error 감지
+          ├── closing = true
+          ├── RemoveThisClient()
+          └── return
+```
+
+전체 종료 흐름은 다음과 같습니다.
+
+```text
+1. client_thread가 transport error / peer exit / protocol error를 감지한다.
+2. ClientSession::closing을 true로 변경한다.
+3. 이후 ClientManager의 broadcast는 해당 세션을 send 대상에서 제외한다.
+4. client_thread는 Run() 종료 전에 RemoveThisClient()를 호출한다.
+5. RemoveThisClient()는 Manager_wp.lock()으로 ClientManager에 접근한다.
+6. ClientManager::RemoveClient()가 clients에서 해당 shared_ptr을 제거한다.
+7. Run()이 return되면 client_thread가 들고 있던 shared_ptr도 해제된다.
+8. 마지막 shared_ptr이 사라지면 ClientSession이 소멸한다.
+9. ClientSession이 소유하던 ClientSocket도 소멸하면서 raw SOCKET이 closesocket()으로 정리된다.
+```
+
+---
+
+## 12. Echo Server에서 Chat Server로 확장
+
+초기 단계에서는 기존 Echo Server와 동일하게, 클라이언트가 보낸 메시지를 해당 클라이언트에게 그대로 돌려보냅니다.
 
 ```text
 Client A → Server → Client A
 ```
 
-이후 Chat Server 단계에서는,
-한 클라이언트가 보낸 메시지를 다른 클라이언트들에게 전달합니다.
+이후 Chat Server 단계에서는, 한 클라이언트가 보낸 메시지를 다른 클라이언트들에게 전달합니다.
 
 ```text
 Client A → Server → Client B
@@ -700,15 +857,29 @@ void ClientManager::Broadcast(
 브로드캐스트 시 고려할 점:
 
 * sender 자신에게도 보낼 것인지 여부
+* `closing == true`인 세션을 송신 대상에서 제외
 * 연결이 끊긴 클라이언트 제거
 * 송신 중 실패한 클라이언트 처리
 * `clients` 컨테이너 순회 중 동기화
 * broadcast 중 lock 범위 최소화
 * 추후 메시지 타입 확장
 
+현재 구상 중인 기본 흐름은 다음과 같습니다.
+
+```text
+1. ClientManager가 client_mutex를 잡는다.
+2. clients 컨테이너의 snapshot을 복사한다.
+3. client_mutex를 해제한다.
+4. snapshot을 순회한다.
+5. closing == true인 세션은 건너뛴다.
+6. 나머지 세션에 SendPacket()을 수행한다.
+```
+
+이 구조를 사용하면 `clients` 컨테이너를 순회하는 동안 lock을 오래 잡지 않아도 되며, `send()`처럼 블로킹될 수 있는 작업을 `client_mutex`를 잡은 상태에서 수행하지 않을 수 있습니다.
+
 ---
 
-## 12. 현재 구현 / 설계 상태
+## 13. 현재 구현 / 설계 상태
 
 현재까지의 상태는 다음과 같습니다.
 
@@ -720,18 +891,23 @@ void ClientManager::Broadcast(
 * `ConnectSocket` 설계 완료
 * `ClientManager` 기본 구조 구현
 * `ClientSession` 기본 구조 구현
-* `ClientSession` 내부에 `ClientSocket`, `ClientAddr`, `Manager_wp`, `ClientState` 배치
+* `ClientSession` 내부에 `ClientSocket`, `ClientAddr`, `Manager_wp`, `ClientState`, `closing` 배치
 * `ClientSession` 생성자에서 `unique_ptr<ClientSocket>` 소유권 이동 처리
 * `std::make_shared<ClientSession>()`를 통한 세션 객체 생성 구조 적용
 * `ClientSession::Run()`에 기존 Echo Server 송수신 루프 이식
 * `client_thread(std::shared_ptr<ClientSession>)` 구조 적용
+* `std::thread` 생성 직후 `detach()`하는 구조 적용
+* detached thread가 `shared_ptr<ClientSession>`을 들고 `Run()`을 실행하는 구조 적용
+* `std::atomic<bool> closing`을 통한 논리적 종료 상태 관리 구조 추가
+* `ClientSession::RemoveThisClient()` 구조 추가
+* `ClientManager::RemoveClient(std::shared_ptr<ClientSession>)` 임시 구현
 * `shared_ptr` / `weak_ptr` / `unique_ptr` 기반 객체 소유 관계 설계 중
 * 멀티스레딩 / 동기화 구조는 구현 및 검증 예정
 * 브로드캐스트 Chat Server 기능은 추후 구현 예정
 
 ---
 
-## 13. 사용 환경
+## 14. 사용 환경
 
 * Windows
 * C++
@@ -740,7 +916,7 @@ void ClientManager::Broadcast(
 
 ---
 
-## 14. 실행 방법
+## 15. 실행 방법
 
 현재 프로젝트는 기존 Echo Server를 멀티클라이언트 / 멀티스레드 구조로 확장하는 단계입니다.
 
@@ -768,23 +944,30 @@ Client.cpp 실행
 
 ### 5. Chat 단계
 
-브로드캐스트 기능이 추가되면,
-한 클라이언트가 보낸 메시지를 다른 클라이언트들이 수신합니다.
+브로드캐스트 기능이 추가되면, 한 클라이언트가 보낸 메시지를 다른 클라이언트들이 수신합니다.
 
 ---
 
-## 15. 향후 개선 예정
+## 16. 향후 개선 예정
 
 * `ClientSocket` move assignment 정리
 * `ClientSession` 내부 송수신 로직 분리
   * `RecvPacket()`
   * `SendPacket()`
   * `SendHeaderErrorPacket()`
-* `ClientManager::RemoveClient()` 구현
+* `ClientSession`의 `closing` 상태 접근 함수 정리
+  * `IsClosing()`
+  * `MarkClosing()`
+* `ClientSession`의 `shared_from_this()` 사용 구조 검증
+* `ClientManager::RemoveClient()` 정식 구현
 * `ClientManager::Broadcast()` 구현
+* broadcast 시 snapshot 복사 구조 구현
+* `closing == true`인 세션 송신 제외 처리
 * mutex 기반 `clients` 컨테이너 동기화 구조 검증
 * `std::lock_guard` / `std::unique_lock` 적용 범위 정리
+* `send()` 중 blocking될 수 있는 구간과 lock 범위 분리
 * 접속 종료된 클라이언트 정리
+* detach 기반 구조의 종료 정책 추가 검증
 * 멀티클라이언트 / 멀티스레드 Echo 단계 안정화
 * Broadcast Chat 단계 구현
 * 추후 message type 확장

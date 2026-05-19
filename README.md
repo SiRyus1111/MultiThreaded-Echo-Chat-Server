@@ -46,25 +46,29 @@
 
 - 기존 단일 클라이언트 Echo Server 로직을 `ClientSession` 기반 구조로 이식
 - 클라이언트마다 독립적인 `ClientSession` 객체 생성
-- 각 `ClientSession`이 자기 자신의 `ClientSocket`, `NetState`, `closing` 상태 소유
+- 각 `ClientSession`이 자기 자신의 `ClientSocket`, `ClientAddr`, `ClientAddrStr`, `NetState`, `closing` 상태 소유
 - `ClientManager`가 현재 접속 중인 `ClientSession` 목록 관리
 - 클라이언트별 `std::thread` 생성
 - detached thread가 `shared_ptr<ClientSession>`을 들고 `Run()` 실행
 - 종료 상황 발생 시 `ClientSession`이 `ClientManager`에게 자기 자신 제거 요청
 - `shared_ptr` / `weak_ptr` / `unique_ptr` 기반 객체 소유 관계 설계
+- `ClientSession::RecvPacket()` 1차 구현
+- `ClientSession::SendPacket()` 1차 구현
+- `Run()`에서 패킷 송수신 세부 로직을 분리하고, Echo Server의 고수준 흐름만 남김
+- `PacketType` enum class 도입
+- `PacketHeader::type`은 실제 전송 필드로 `int32_t`를 유지하고, `PacketType`은 코드 내부 의미 표현용으로 사용
+- payload length가 `0`이거나 `PAYLOAD_SIZE`를 초과하면 protocol error로 처리
+- `TransportExceptionHandling()`을 통해 통신 종료 / 예외 후처리 흐름 정리
 
 ### 구현 예정
 
 - `SessionID`
-- `ClientSession::SendPacket()`
-- `ClientSession::RecvPacket()`
+- 로그 출력 형식 개선
 - ClientSession별 `send_mutex`
 - `ClientManager::Broadcast()`
 - broadcast 시 clients snapshot 복사 구조
 - nickname / message type 확장
 - broadcast 중 송신 실패 세션 정리 정책
-
----
 
 ## 3. 핵심 설계 요약
 
@@ -145,7 +149,7 @@ MultiThreaded Echo-Chat Server
 
 | 문서 | 내용 |
 |---|---|
-| [`docs/architecture.md`](docs/architecture.md) | main thread, client thread, ClientSession, ClientManager 등 스레드 / 클래스의 책임 분리, 전체적인 구조|
+| [`docs/architecture.md`](docs/architecture.md) | main thread, client thread, ClientSession, ClientManager 등 스레드 / 클래스의 책임 분리, 전체적인 구조 |
 | [`docs/protocol.md`](docs/protocol.md) | TCP byte stream, partial send/recv 처리, 애플리케이션 레벨 프로토콜 관련 |
 | [`docs/socket-raii.md`](docs/socket-raii.md) | WinsockGuard, ListenSocket, ClientSocket, ConnectSocket, socket lifetime |
 | [`docs/concurrency-design.md`](docs/concurrency-design.md) | 멀티스레딩, 객체 소유권, 세션 생명주기, 동기화 관련 설계 |
@@ -174,13 +178,26 @@ struct PacketHeader {
 - `type`: 일반 메시지 / 에러 메시지 / 추후 채팅 메시지 타입 구분
 - `length`: payload 길이
 - 최대 payload 길이: `4096 bytes`
+- payload length가 `0`이거나 최대 크기를 초과하면 protocol error로 처리
+
+현재 코드에서는 패킷 타입을 의미 있게 표현하기 위해 `PacketType` enum class를 사용합니다.
+다만 실제 네트워크 패킷에 들어가는 `PacketHeader::type` 필드는 `int32_t`로 유지합니다.
+
+```cpp
+enum class PacketType : int32_t {
+    SAFE = -1,
+    HEADER_ERROR = 0
+};
+```
+
+송신 시에는 `PacketType`을 `int32_t`로 변환한 뒤 `htonl()`을 적용하고,
+수신 시에는 `ntohl()`로 변환한 정수값을 `PacketType`의 허용 값과 비교합니다.
 
 TCP는 message boundary를 보장하지 않는 byte stream 기반 프로토콜이므로,
 `send_all()` / `recv_all()` helper를 통해 요청한 길이만큼 반복 송수신합니다.
+현재 `ClientSession`은 이 송수신 절차를 `SendPacket()` / `RecvPacket()`으로 분리하여 관리합니다.
 
 자세한 내용은 [`docs/protocol.md`](docs/protocol.md)를 참고합니다.
-
----
 
 ## 7. 동기화 설계 요약
 
@@ -262,9 +279,9 @@ Client A → Server → Client B
 
 단기 목표:
 
-- `SendPacket()` / `RecvPacket()` 분리
-- `ClientSession`별 `send_mutex` 추가
 - `SessionID` 도입
+- 로그 출력 형식 개선
+- `ClientSession`별 `send_mutex` 추가
 - `ClientManager::Broadcast()` 구현
 
 중기 목표:

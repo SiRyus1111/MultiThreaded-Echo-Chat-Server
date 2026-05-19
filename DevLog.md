@@ -62,7 +62,7 @@
 ### 26.05.04
 
 - 각 객체 간의 관계 설계
-  - IdeaNote 참조
+  - IdeaScatch 참조
 - `unique_ptr`, `shared_ptr` 관련 Syntax Error 해결
   - `std::move()`함수에 대한 이해 부족이 원인.
     - 생성자의 인자로 `unique_ptr<ClientSocket>`을 move를 이용해 받아왔지만, 객체 내부에 `unique_ptr<ClientSocket>`인 ClientSock에 소유권을 이전할 때 `std::move()` 함수를 사용하지 않았음.
@@ -70,7 +70,7 @@
   - 추가적으로, `main()` 함수의 `shared_ptr<ClientSession>`을 생성하는 부분에서 오류 발생.
 	- 초기화가 문제였음. 단순히 `shared_ptr<ClientSession> client(std::move(client_socket), client_addr)`로 잘못된 방식이었음.(생성자인줄 알고 생성자처럼 인자를 넣어버림)
 	- `std::make_shared()` 함수로 초기화하여 해결.
-- 서버 코드에 IdeaNote에서 설계한 ClientSession을 직접 코드로 구현
+- 서버 코드에 IdeaScatch에서 설계한 ClientSession을 직접 코드로 구현
   - ClientSession 
     - 클라이언트 하나의 연결 단위
 	- 해당 클라이언트의 ClientSocket 소유(`unique_ptr`)
@@ -111,10 +111,10 @@
 ## 26.05.08 ~ 26.05.09
 
 - main 스레드와 client_thread 스레드 간의 흐름 설계
-  - IdeaNote 참조
+  - IdeaScatch 참조
 - ClientSession 객체 추가 설계
-  - IdeaNote의 ClientSession 설계도(4) 참조
-- 서버 코드에 IdeaNote에서 설계한 스레드 간의 흐름을 직접 코드로 구현
+  - IdeaScatch의 ClientSession 설계도(4) 참조
+- 서버 코드에 IdeaScatch에서 설계한 스레드 간의 흐름을 직접 코드로 구현
   - `ClientThread` (`client_thread()` 함수)  
 	- `std::thread` `ClientThread` : 생성 직후 `detach()`
 	  - `join()`으로 구조 짜는건 지금 당장은 도저히 못하겠음. 
@@ -135,3 +135,14 @@
 - shared_ptr = 물리적 생존 보장
 - closing = 논리적 종료 상태
 - RemoveClient = 관리 목록에서 제거
+
+## 26.05.19 
+
+- 밀린 로그 정리
+  - 전체적인 각 스레드 / 객체의 책임, 역할 설계 - IdeaScatch 참조
+  - 클라이언트 코드 - 기존 Echo Server 코드의 클라이언트 코드 복붙
+  - 실제 실행 - [velog](https://velog.io/@siryus0907/MultiClient-Echo-26.05.18%EC%9B%94-%EB%A9%80%ED%8B%B0%EC%8A%A4%EB%A0%88%EB%93%9C-%EB%A9%80%ED%8B%B0%ED%81%B4%EB%9D%BC%EC%9D%B4%EC%96%B8%ED%8A%B8-%EC%97%90%EC%BD%94%EC%84%9C%EB%B2%84%EC%9D%98-%EC%8B%A4%ED%96%89-%EA%B0%9C%EC%84%A0%EC%A0%90)
+    - 이상 없이 잘 의도한 대로 실행됨
+	- 개선점
+	  - ClientSession을 더 잘 구분할 수 있도록 SessionID가 필요함.
+	  - 서버의 로그가 좀 더 세부적이어야 함 - 현재는 송 / 수신 시에만 출력함. 클라이언트 접속 / 접속 종료 시에도 출력해야 할 것 같음.

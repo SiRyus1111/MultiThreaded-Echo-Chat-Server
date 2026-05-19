@@ -1,0 +1,69 @@
+1. SessionID 부여 규칙 설계
+
+SessionID의 목적 : 
+클라이언트 세션들을 구분해서 매니저가 인식할 수 있도록. 
+IP:Port만으로는 부족해. 
+그리고 매니저가 shared_ptr 대조가 아니라 
+세션 아이디로 바로바로 RemoveClient() 할 세션을 찾을 수 있도록.
+어쨌든 **Manager의 Session관리 편의성**을 위해서. 
+
+SessionID에 대한 브레인스토밍 :
+1. 세션 ID 부여 규칙이 필요하다. 
+    - 이거 어떻게 할까?
+2. 세션 ID로 각 클라이언트 세션을 구분한다. 
+    - ㅇㅇ. 이게 목적이지.
+3. 추후에 key-value 느낌의 자료구조로 바꾸면 
+key = 세션 ID
+value = ClientSession 객체
+로 해놓아서 key만 대조해보면 바로 ClientSession을 식별할 수 있게 하는 식으로 개편할 수도 있지 않을까.. 
+    - 항상 말나오던 unordered_map? 자료구조 & C++의 컨테이너 공부 좀 해보자.
+4. 클라이언트를 식별하는 부분의 로직을 최대한 세션 ID 기반으로 리팩토링?
+    - 이건 코딩 스타일? 문제인지라 좀 생각해볼 필요 있음.
+5. 세션 ID를 어느 시점에서 부여받아야할까?
+    - accept() 직후? client_thread 실행 직후?
+
+2. 로그 출력 개선
+
+로그 출력 개선의 목적 : 좀 더 서버에 세부적인 로그를 찍는게 좋아보임. 지금은 송 / 수신만 로그가 찍힘.
+
+로그 출력 개선에 대한 브레인스토밍:
+1. 로그 출력이 필요한 곳이 어디일까?
+    - 일단 클라이언트 접속 : IP:Port, 세션 ID 출력
+    - 클라이언트 통신 중단 : 세션 ID, IP:Port, 중단 이유(NetState 구조체 참조) 출력
+    - 클라이언트의 송 / 수신 : 세션 ID 출력(근데 이건 ClientSocket까지 내려가야해서 흠..)
+2. 위의 개선안이 적용되는 부분을 고치려면 어디를 손봐야할까?
+    - 클라이언트 접속 : client_thread 시작 부분 or accept() 직후(이게 좀 더 적합해보임, 하지만 세션ID를 이미 부여받은 상태여야 함)
+    - 클라이언트의 통신 중단 : ClientSession 객체 / client_thread 범위 안에서. ClientManager의 범위는 아님. 
+    - 송 / 수신 : 노답. 그냥 송 / 수신하는 바이트 수를 ClientSession까지 뺀 후 출력하는거 어떨까 싶음.. 
+    (송 / 수신한 총 바이트 수는 이미 ClientSession의 Run() 함수 안에 있음.)
+
+SessionID 설계 + 구현 -> 로그 출력 개선 -> 자료구조 몇 개 구현해보기(adam drozdek) -> 최종 clients 컨테이너 종류 결정(아마 key-value가 되는 자료구조 선택 예정) -> 동기화 관련 라이브러리 공부(std::mutex, std::condition_variable, std::atomic, josuttis) -> 락 프리 스택 가볍게 구현해보기 -> 브로드캐스트 설계 및 구현 -> ...
+
+SendPacket(const char* msg, PacketType type)
+1. PacketHeader 구성 - strlen(msg)로 length, 입력받은 type으로 type
+2. network byte order 변환 - htonl()
+3. header send_all()
+4. payload send_all()
+5. 실패 여부 반환 - 바깥에 if문으로, 실패했을 때는 따로 SOCKET_ERROR 반환
+6. 나중에 send_mutex 적용 가능 - 아직은 아님
+
+RecvPacket(char* buf)
+1. PacketHeader 수신 - PacketHeader 구조체를 그대로 char*로 캐스팅
+2. network byte order 변환
+3. length 검증(protocol error 판단) - length <= PAYLOAD_SIZE인지 검증
+4. payload 수신 - length만큼 수신
+5. peer exit / transport error 판단 
+6. 성공하면 받은 바이트 수 반환, 받은 메시지는 buf에 있음(맨 끝에 \0 있음)
+
+1. SessionID 설계 + 구현
+2. 로그 출력 개선
+3. clients 컨테이너 임시 결정
+4. std::mutex / std::lock_guard / std::unique_lock / std::atomic 기본 공부
+5. SendPacket / RecvPacket 분리
+6. ClientSession별 send_mutex 적용
+7. Broadcast MVP 구현
+8. clients 컨테이너 최종 결정 및 교체
+9. condition_variable 공부
+10. 자료구조 몇 개 구현해보기
+11. lock-free stack 가볍게 구현해보기
+12. send queue / worker thread 구조 검토

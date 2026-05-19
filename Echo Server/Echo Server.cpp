@@ -57,6 +57,13 @@ public:
 
 	}
 
+	enum class PacketType : int32_t {
+		HEADER_ERROR,
+		SAFE
+	};
+
+	
+
 	// share_from_this()로 받기 / ClientManager 객체에서 사용하는 함수
 	void AddToManager(std::shared_ptr<ClientManager> Manager_sp) {
 		Manager_wp = Manager_sp;
@@ -65,13 +72,17 @@ public:
 
 	// 송수신 로직이 구현되어있는 함수
 	void Run();
+
+	int SendPacket(const char* msg, PacketType type);
+
+	int RecvPacket(char* buf);
 	
 	void RemoveThisClient() {
 		if (auto locked = Manager_wp.lock()) {
 			locked->RemoveClient(shared_from_this());
 		}
 		else {
-			std::cout << "ClientManager 객체 이미 소멸됨. RemoveClient()가 실행되지 않습니다.";
+			std::cout << "ClientManager 객체 이미 소멸됨. RemoveClient()가 실행되지 않습니다.\n";
 		}
 	}
 
@@ -79,11 +90,6 @@ public:
 	ClientSession& operator=(const ClientSession& c) = delete;
 	ClientSession(const ClientSession&) = delete;
 
-	~ClientSession() {
-		if (std::shared_ptr<ClientManager> locked = Manager_wp.lock()) {
-			// 여기서 ClientManager의 공유 컨테이너에서 해당 클라이언트 제거하는 함수 호출? 아직 결정난건 아님.
-		}
-	}
 };
 
 void ClientManager::AddClient(std::shared_ptr<ClientSession> client) {
@@ -210,6 +216,14 @@ void ClientSession::Run() {
 
 	// 여기에 RemoveClient() - clients에서 해당 ClientSession 제거
 	return;
+}
+
+int ClientSession::SendPacket(const char* msg, PacketType type) {
+	
+}
+
+int ClientSession::RecvPacket(char* buf) {
+
 }
 
 auto manager = std::make_shared<ClientManager>();

@@ -193,7 +193,7 @@ ClientSession
 
 따라서 ClientSocket, NetState, closing은 모두 세션 내부에 위치하는 것이 자연스럽습니다.
 
-그리고 5.20(수) 리팩토링으로 `Run()`은 더 이상 Header / Payload 송수신 세부 절차를 직접 담당하지 않습니다.
+그리고 26.05.20(수) 리팩토링으로 `Run()`은 더 이상 Header / Payload 송수신 세부 절차를 직접 담당하지 않습니다.
 `Run()`은 Echo Server의 실행 흐름을 제어하고, 실제 패킷 송수신은 `RecvPacket()` / `SendPacket()`이 담당합니다.
 
 ```text

@@ -67,6 +67,18 @@
 - `ClientManager::RemoveClient(std::shared_ptr<ClientSession>)` 임시 구현
 - `std::atomic<bool> closing`을 통한 논리적 종료 상태 관리
 
+### ClientSession 송수신 함수 분리
+
+- `ClientSession::RecvPacket()` 1차 구현
+- `ClientSession::SendPacket()` 1차 구현
+- `Run()`에서 Header / Payload 송수신 세부 로직 분리
+- `Run()`은 Echo Server의 고수준 흐름 제어만 담당하도록 정리
+- `PacketType` enum class 도입
+- `PacketHeader::type`은 `int32_t` 전송 필드로 유지하고, `PacketType`은 코드 내부 의미 표현용으로 사용
+- payload length가 `0`이거나 `PAYLOAD_SIZE`를 초과하면 protocol error로 처리
+- `TransportExceptionHandling()`을 통해 통신 오류 / peer exit / protocol error 후처리 흐름 정리
+- `ClientAddrStr`을 통해 클라이언트 IP 문자열을 세션 생성 시점에 저장
+
 ### 객체 소유권
 
 - `shared_ptr<ClientSession>` 기반 세션 생존 관리
@@ -82,10 +94,9 @@
 
 - Broadcast Chat 기능
 - `SessionID`
+- 로그 출력 형식 개선
 - nickname 기반 클라이언트 식별
 - 메시지 타입별 채팅 프로토콜 분기
-- `ClientSession::SendPacket()`
-- `ClientSession::RecvPacket()`
 - ClientSession별 `send_mutex`
 - broadcast 중 송신 실패 세션 정리 정책
 - clients snapshot 기반 broadcast 구조
@@ -94,32 +105,7 @@
 
 ## 4. 단기 구현 목표
 
-### 4-1. ClientSession 송수신 함수 분리
-
-현재 `Run()`에 들어가 있는 송수신 로직을 다음 함수로 분리합니다.
-
-- `RecvPacket()`
-- `SendPacket()`
-
-목표:
-
-```text
-Run()
-  → 전체 흐름 제어
-
-RecvPacket()
-  → PacketHeader + Payload 수신
-
-SendPacket()
-  → PacketHeader + Payload 송신
-```
-
-이렇게 분리하면 Echo Server에서 Chat Server로 확장할 때
-송수신 로직을 재사용하기 쉬워집니다.
-
----
-
-### 4-2. SessionID 도입
+### 4-1. SessionID 도입
 
 `SessionID`의 목적은 다음과 같습니다.
 
@@ -149,6 +135,25 @@ ClientManager
 
 ---
 
+### 4-2. 로그 출력 개선
+
+현재 `ClientSession`은 생성 시점에 `ClientAddrStr`을 저장합니다.
+이를 기반으로 다음 단계에서는 로그 형식을 정리합니다.
+
+예상 형식:
+
+```text
+[Session ?][127.0.0.1:53021][RecvPacket] header received
+[Session ?][127.0.0.1:53021][RecvPacket] payload received
+[Session ?][127.0.0.1:53021][SendPacket] packet sent
+[Session ?][127.0.0.1:53021][Close] peer exit
+```
+
+`SessionID`가 도입되면 로그에 `SessionID`도 함께 출력하여
+멀티클라이언트 상황에서 어떤 세션의 로그인지 쉽게 구분할 수 있게 합니다.
+
+---
+
 ### 4-3. send_mutex 추가
 
 Chat Server 단계에서는 여러 thread가 같은 `ClientSession`에게
@@ -163,7 +168,7 @@ private:
     std::mutex send_mutex;
 
 public:
-    void SendPacket(const char* msg, PacketType type);
+    NetState SendPacket(const char* msg, uint32_t len, PacketType type);
 };
 ```
 
@@ -325,9 +330,11 @@ thread-per-client 구조를 구현한 뒤,
 - [v] 클라이언트 1개 접속 후 echo 정상 동작
 - [v] 클라이언트 여러 개 접속 후 각자 echo 정상 동작
 - [v] 한 클라이언트 종료 시 다른 클라이언트 영향 없음
-- [ ] payload 길이 0 또는 비정상 length 처리
+- [v] payload 길이 0 또는 비정상 length 처리
 - [v] 최대 payload 길이 근처 메시지 처리
 - [v] partial send / recv 상황에서도 정상 동작
+- [ ] `RecvPacket()` / `SendPacket()` 분리 후 Echo 동작 재확인
+- [ ] `PacketType` 변환 및 type 검증 테스트
 - [v] transport error 발생 시 세션 종료 처리
 - [v] peer exit 발생 시 세션 제거 처리
 
@@ -388,8 +395,8 @@ docs/original-design-note.md
 
 ```text
 1. Echo Server 멀티클라이언트 구조 안정화
-2. ClientSession 송수신 함수 분리
-3. SessionID 도입
+2. SessionID 도입
+3. 로그 출력 형식 개선
 4. send_mutex 추가
 5. Broadcast 구현
 6. nickname / message type 확장

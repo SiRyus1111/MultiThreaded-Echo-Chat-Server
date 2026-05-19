@@ -96,11 +96,12 @@ void client_thread(std::shared_ptr<ClientSession> session) {
 ### 역할
 
 - 특정 `ClientSession` 하나를 인자로 받음
-- 현재는 `ClientSession::Run()` 실행
-- 추후 `ClientSession::SendPacket()` / `ClientSession::RecvPacket()` 실행
+- `ClientSession::Run()` 실행
+- `Run()` 내부에서 `RecvPacket()` / `SendPacket()`을 호출하여 Echo 흐름 수행
 - 해당 클라이언트의 송 / 수신 루프 수행
 - transport error / peer exit / protocol error 감지
 - 종료 상황 발생 시 `closing = true` 설정
+- 종료 후 `TransportExceptionHandling()`을 통해 상태별 후처리 수행
 - 종료 전 `ClientManager`에 자기 세션 제거 요청
 
 현재 Echo Server 단계에서는 수신한 메시지를 같은 클라이언트에게 다시 돌려보냅니다.
@@ -109,7 +110,20 @@ void client_thread(std::shared_ptr<ClientSession> session) {
 Client A → Server → Client A
 ```
 
-추후 Chat Server 단계에서는 수신한 메시지를
+현재 `Run()`은 Echo Server의 고수준 흐름만 담당합니다.
+
+```text
+Run()
+  ├── RecvPacket()
+  ├── 수신 상태 확인
+  ├── SendPacket()
+  ├── 송신 상태 확인
+  └── transport error / peer exit / protocol error 감지
+        ├── MarkClosing()
+        └── TransportExceptionHandling()
+```
+
+추후 Chat Server 단계에서는 수신한 메시지를 그대로 echo하지 않고,
 `ClientManager::Broadcast()`로 전달하는 구조로 확장할 예정입니다.
 
 ```text
@@ -124,18 +138,21 @@ Client A → Server → Client B
 
 `ClientSession`은 클라이언트 한 명의 연결 단위를 표현하는 객체입니다.
 
-즉, 클라이언트 한 명과 관련된 socket, 주소, 통신 상태, 종료 상태, 송수신 흐름을 하나의 객체로 묶습니다.
+즉, 클라이언트 한 명과 관련된 socket, 주소, 통신 상태, 종료 상태, 패킷 송수신 흐름을 하나의 객체로 묶습니다.
 
 ### 역할
 
 - 클라이언트 한 명의 연결 단위 표현
 - 해당 클라이언트의 `ClientSocket` 소유
 - 클라이언트 주소 정보 저장
+- 로그 출력을 위한 클라이언트 IP 문자열 `ClientAddrStr` 저장
 - 클라이언트별 `NetState` 저장
 - 클라이언트별 논리적 종료 상태 `closing` 관리
-- 해당 클라이언트의 송수신 루프 구현
+- Echo Server 단계의 고수준 실행 흐름 `Run()` 구현
+- `RecvPacket()`으로 패킷 수신
+- `SendPacket()`으로 패킷 송신
+- `TransportExceptionHandling()`으로 통신 종료 / 예외 후처리
 - 종료 시 `ClientManager`에 자기 자신 제거 요청
-- 추후 `SendPacket()` / `RecvPacket()` 제공
 - 추후 nickname / `SessionID` / 접속 상태 관리
 
 현재 구조는 다음과 같습니다.
@@ -145,6 +162,7 @@ class ClientSession : public std::enable_shared_from_this<ClientSession> {
 private:
     std::unique_ptr<ClientSocket> ClientSock;
     sockaddr_in ClientAddr;
+    char ClientAddrStr[INET_ADDRSTRLEN];
     std::weak_ptr<ClientManager> Manager_wp;
     NetState ClientState;
     std::atomic<bool> closing = false;
@@ -154,9 +172,13 @@ public:
 
     void AddToManager(std::shared_ptr<ClientManager> manager_sp);
     void Run();
-    void RemoveThisClient();
 
-    bool IsClosing() const;
+    NetState RecvPacket(char* buf);
+    NetState SendPacket(const char* msg, uint32_t len, PacketType type);
+
+    void MarkClosing();
+    void TransportExceptionHandling();
+    void RemoveThisClient();
 };
 ```
 
@@ -169,9 +191,27 @@ ClientSession
   → 클라이언트 한 명의 생명주기와 통신 흐름을 표현하는 객체
 ```
 
-따라서 `ClientSocket`, `NetState`, `closing`은 모두 세션 내부에 위치하는 것이 자연스럽습니다.
+따라서 ClientSocket, NetState, closing은 모두 세션 내부에 위치하는 것이 자연스럽습니다.
 
----
+그리고 5.20(수) 리팩토링으로 `Run()`은 더 이상 Header / Payload 송수신 세부 절차를 직접 담당하지 않습니다.
+`Run()`은 Echo Server의 실행 흐름을 제어하고, 실제 패킷 송수신은 `RecvPacket()` / `SendPacket()`이 담당합니다.
+
+```text
+Run()
+  → Echo Server 흐름 제어
+
+RecvPacket()
+  → PacketHeader + Payload 수신
+
+SendPacket()
+  → PacketHeader + Payload 송신
+
+TransportExceptionHandling()
+  → 오류 / 종료 상태별 후처리
+```
+
+따라서 나중에 Chat Server로 확장할 때는 `Run()`의 메시지 처리 부분을 `Broadcast()` 호출로 바꾸더라도,
+패킷 송수신 절차는 그대로 재사용할 수 있습니다.
 
 ## 6. ClientManager
 

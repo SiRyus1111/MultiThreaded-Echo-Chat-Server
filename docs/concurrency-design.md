@@ -281,7 +281,8 @@ RemoveClient()
 9. ClientSession이 소유하던 ClientSocket도 소멸하면서 raw SOCKET이 closesocket()으로 정리된다.
 ```
 
----
+이 흐름에서 중요한 점은 `closing = true`가 객체 소멸을 의미하지 않는다는 것입니다.
+`closing`은 논리적 종료 상태이며, 실제 객체 소멸은 마지막 `shared_ptr`이 사라지는 시점에 발생합니다.
 
 ## 10. ClientManager lock
 
@@ -365,6 +366,10 @@ ClientSession의 send_mutex
 “같은 ClientSession에 대한 패킷 송신 순서”이다.
 ```
 
+26.05.20(수) 리팩토링으로 `ClientSession::SendPacket()`이 1차 구현되었습니다.
+따라서 추후 `send_mutex`는 새 송신 함수를 따로 만드는 방식이 아니라,
+이미 존재하는 `SendPacket()` 내부의 Header + Payload 송신 구간을 감싸는 방식으로 적용할 수 있습니다.
+
 같은 클라이언트에게 다음과 같이 패킷이 섞이면 안 됩니다.
 
 ```text
@@ -387,7 +392,7 @@ Header_B
 Payload_B
 ```
 
-이를 위해 각 `ClientSession`마다 별도의 `send_mutex`를 둡니다.
+예상 구조:
 
 ```cpp
 class ClientSession {
@@ -395,11 +400,12 @@ private:
     std::mutex send_mutex;
 
 public:
-    void SendPacket(const Packet& packet) {
+    NetState SendPacket(const char* msg, uint32_t len, PacketType type) {
         std::lock_guard<std::mutex> lock(send_mutex);
 
-        send_all(packet.header);
-        send_all(packet.payload);
+        // 1. PacketHeader 구성
+        // 2. Header 송신
+        // 3. Payload 송신
     }
 };
 ```
@@ -423,7 +429,11 @@ public:
 예상 구조:
 
 ```cpp
-void ClientManager::Broadcast(const Packet& packet) {
+void ClientManager::Broadcast(
+    const char* msg,
+    uint32_t len,
+    PacketType type
+) {
     std::vector<std::shared_ptr<ClientSession>> snapshot;
 
     {
@@ -439,7 +449,7 @@ void ClientManager::Broadcast(const Packet& packet) {
             continue;
         }
 
-        client->SendPacket(packet);
+        client->SendPacket(msg, len, type);
     }
 }
 ```

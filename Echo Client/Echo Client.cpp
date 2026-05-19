@@ -53,10 +53,10 @@ int main() {
 
             // 헤더 직렬화(?)
             memcpy(buf, user_input.c_str(), send_host_header.length);
-            send_host_header.type = SAFE;
+            send_host_header.type = static_cast<int32_t>(PacketType::SAFE);
 
             PacketHeader send_net_header;
-            send_net_header.type = htonl(send_host_header.type);
+            send_net_header.type = htonl(static_cast<int32_t>(send_host_header.type));
             send_net_header.length = htonl(send_host_header.length);
 
             // 헤더 send()
@@ -87,7 +87,7 @@ int main() {
 
             // 헤더 해석
             PacketHeader recv_host_header;
-            recv_host_header.type = ntohl(recv_net_header.type);
+            recv_host_header.type = ntohl(static_cast<int32_t>(recv_net_header.type));
             recv_host_header.length = ntohl(recv_net_header.length);
 
             if (recv_host_header.length > 4096) {
@@ -109,7 +109,7 @@ int main() {
 
             std::cout << "[ECHO FROM SERVER]" << buf << '\n';
 
-            if (recv_host_header.type == HEADER_ERROR) {
+            if (recv_host_header.type == static_cast<int32_t>(PacketType::HEADER_ERROR)) {
                 client_state.if_peer_error = true;
                 break;
             }
@@ -130,7 +130,7 @@ int main() {
             std::cout << "서버에서 송신된 헤더의 값이 4096을 초과.\n";
 
             PacketHeader protocol_err_header;
-            protocol_err_header.type = htonl(HEADER_ERROR);
+            protocol_err_header.type = htonl(static_cast<int32_t>(PacketType::HEADER_ERROR));
             protocol_err_header.length = htonl(host_err_msg_len);
 
             int header_err_send_res = connect_sock.ConnectSockSend(client_state, (char*)&protocol_err_header, HEADER_SIZE);

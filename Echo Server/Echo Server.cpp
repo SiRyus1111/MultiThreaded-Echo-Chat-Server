@@ -18,7 +18,7 @@
 
 const int SERVER_PORT = 9000;
 const int PAYLOAD_SIZE = 4096;
-const int BUFFER_SIZE = 4096;
+const int BUFFER_SIZE = PAYLOAD_SIZE + 1; // \0을 맨 끝에 추가해야하므로
 const int HEADER_SIZE = 8;
 const int HEADER_TYPE_SIZE = 4;
 const int HEADER_LENGTH_SIZE = 4;
@@ -49,20 +49,59 @@ class ClientSession : public std::enable_shared_from_this<ClientSession> {
 private:
 	std::unique_ptr<ClientSocket> ClientSock;
 	sockaddr_in ClientAddr;
+	char ClientAddrStr[INET_ADDRSTRLEN];
 	std::weak_ptr<ClientManager> Manager_wp;
 	NetState ClientState; // 단순 값 복사
 	std::atomic<bool> closing = false; // alignas(64) 가급적 필요할 듯. false sharing 고려해야함.
 public:	
-	ClientSession(std::unique_ptr<ClientSocket> s, sockaddr_in addr) : ClientSock(std::move(s)), ClientAddr(addr), ClientState{} { // move로 ClientSocket unique_ptr 객체 옮기기, addr 소켓 주소 구조체는 간단한 구조체이므로 단순 복사
-
+	ClientSession(std::unique_ptr<ClientSocket> s, sockaddr_in addr) : ClientSock(std::move(s)), ClientAddr(addr), ClientAddrStr{}, ClientState{}, closing(false) { // move로 ClientSocket unique_ptr 객체 옮기기, addr 소켓 주소 구조체는 간단한 구조체이므로 단순 복사
+		inet_ntop(AF_INET, &ClientAddr.sin_addr, ClientAddrStr, sizeof(ClientAddrStr));
 	}
 
-	enum class PacketType : int32_t {
-		HEADER_ERROR,
-		SAFE
-	};
+	void TransportExceptionHandling() {
 
-	
+		if (ClientState.if_error) {
+			std::cout << "클라이언트와의 통신 과정에서 오류 발생 : ";
+
+			if (ClientState.header_recv) std::cout << "헤더 수신 과정에서 오류 발생\n";
+
+			else if (ClientState.payload_recv) std::cout << "페이로드 수신 과정에서 오류 발생\n";
+
+			else if (ClientState.header_send) std::cout << "헤더 송신 과정에서 오류 발생\n";
+
+			else if (ClientState.payload_send) std::cout << "페이로드 송신 과정에서 오류 발생\n";
+
+		}
+		else if (ClientState.if_header_error) {
+
+			std::cout << "헤더의 값이 4096을 초과. 페이로드 수신 불가.\n";
+
+			PacketHeader protocol_err_header;
+			protocol_err_header.type = htonl(static_cast<int32_t>(PacketType::HEADER_ERROR));
+			protocol_err_header.length = htonl(host_err_msg_len);
+
+			int header_err_send_res = ClientSock->ClientSockSend(ClientState, (char*)&protocol_err_header, HEADER_SIZE);
+			if (header_err_send_res == SOCKET_ERROR) {
+				std::cout << "헤더 오류 메시지 클라이언트에 전송 실패.\n";
+			}
+			else {
+				int err_send_res = ClientSock->ClientSockSend(ClientState, header_err_msg, host_err_msg_len);
+				if (err_send_res == SOCKET_ERROR) {
+					std::cout << "헤더 오류 메시지 클라이언트에 전송 실패.\n";
+				}
+			}
+		}
+		else if (ClientState.if_peer_error) {
+			std::cout << "클라이언트에 보낸 헤더의 오류 수신.\n";
+		}
+		else if (ClientState.if_peer_exit) {
+			std::cout << "클라이언트에서 연결을 종료하였습니다.\n";
+		}
+
+		RemoveThisClient();
+
+		return;
+	}
 
 	// share_from_this()로 받기 / ClientManager 객체에서 사용하는 함수
 	void AddToManager(std::shared_ptr<ClientManager> Manager_sp) {
@@ -73,9 +112,13 @@ public:
 	// 송수신 로직이 구현되어있는 함수
 	void Run();
 
-	int SendPacket(const char* msg, PacketType type);
+	NetState SendPacket(const char* msg, uint32_t len, PacketType type);
 
-	int RecvPacket(char* buf);
+	NetState RecvPacket(char* buf);
+
+	void MarkClosing() {
+		closing.store(true);
+	}
 	
 	void RemoveThisClient() {
 		if (auto locked = Manager_wp.lock()) {
@@ -112,118 +155,109 @@ void ClientManager::RemoveClient(std::shared_ptr<ClientSession> client) {
 
 void ClientSession::Run() {
 	char buf[BUFFER_SIZE + 1];
-	char addr[INET_ADDRSTRLEN];
-	inet_ntop(AF_INET, &ClientAddr.sin_addr, addr, sizeof(addr));
 
 	while (true) {
 
-		PacketHeader recv_net_header{};
+		NetState recv_state = RecvPacket(buf);
 
-		ClientState.header_recv = true;
-		int header_recv_res = ClientSock->ClientSockRecv(ClientState, (char*)&recv_net_header, sizeof(PacketHeader));
+		if (recv_state.if_error ||
+			recv_state.if_header_error ||
+			recv_state.if_peer_error ||
+			recv_state.if_peer_exit) break;
 
-		if (header_recv_res == SOCKET_ERROR || header_recv_res == 0) {
-			break;
-		}
-		ClientState.header_recv = false;
+		NetState send_state = SendPacket(buf, (uint32_t)strlen(buf), PacketType::SAFE);
 
-		PacketHeader recv_host_header{};
-		recv_host_header.type = ntohl(recv_net_header.type);
-		recv_host_header.length = ntohl(recv_net_header.length);
-
-		if (recv_host_header.length > BUFFER_SIZE) {
-			ClientState.if_header_error = true;
-			break;
-		}
-
-		ClientState.payload_recv = true;
-		int payload_recv_res = ClientSock->ClientSockRecv(ClientState, (char*)buf, recv_host_header.length);
-
-		if (payload_recv_res == SOCKET_ERROR || payload_recv_res == 0) {
-			break;
-		}
-		ClientState.payload_recv = false;
-
-		buf[payload_recv_res] = '\0';
-
-		std::cout << "송신한 클라이언트 : IP 주소 = " << addr << " 포트 번호 = " << ntohs(ClientAddr.sin_port) << '\n';
-		std::cout << "받은 총 바이트 수 : " << payload_recv_res + header_recv_res << " 받은 메시지 : " << buf << '\n';
-
-		if (recv_host_header.type == HEADER_ERROR) {
-			ClientState.if_peer_error = true;
-			break;
-		}
-
-		PacketHeader send_net_header{};
-		send_net_header.length = htonl(payload_recv_res);
-		send_net_header.type = htonl(SAFE);
-
-		ClientState.header_send = true;
-		int header_send_res = ClientSock->ClientSockSend(ClientState, (char*)&send_net_header, sizeof(PacketHeader)); // PacketHeader 구조체에는 패딩 없음.
-
-		if (header_send_res == SOCKET_ERROR) {
-			break;
-		}
-		ClientState.header_send = false;
-
-		ClientState.payload_send = true;
-		int payload_send_res = ClientSock->ClientSockSend(ClientState, buf, recv_host_header.length);
-
-		if (payload_send_res == SOCKET_ERROR) {
-			break;
-		}
-		ClientState.payload_send = false;
+		if (send_state.if_error ||
+			send_state.if_header_error ||
+			send_state.if_peer_error ||
+			send_state.if_peer_exit) break;
 
 	}
-	closing.store(true);
-	if (ClientState.if_error) {
-		std::cout << "클라이언트와의 통신 과정에서 오류 발생 : ";
+	MarkClosing();
+	TransportExceptionHandling();
 
-		if (ClientState.header_recv) std::cout << "헤더 수신 과정에서 오류 발생\n";
-
-		else if (ClientState.payload_recv) std::cout << "페이로드 수신 과정에서 오류 발생\n";
-
-		else if (ClientState.header_send) std::cout << "헤더 송신 과정에서 오류 발생\n";
-
-		else if (ClientState.payload_send) std::cout << "페이로드 송신 과정에서 오류 발생\n";
-
-	}
-	else if (ClientState.if_header_error) {
-
-		std::cout << "헤더의 값이 4096을 초과. 페이로드 수신 불가.\n";
-
-		PacketHeader protocol_err_header;
-		protocol_err_header.type = htonl(HEADER_ERROR);
-		protocol_err_header.length = htonl(host_err_msg_len);
-
-		int header_err_send_res = ClientSock->ClientSockSend(ClientState, (char*)&protocol_err_header, HEADER_SIZE);
-		if (header_err_send_res == SOCKET_ERROR) {
-			std::cout << "헤더 오류 메시지 클라이언트에 전송 실패.\n";
-		}
-		else {
-			int err_send_res = ClientSock->ClientSockSend(ClientState, header_err_msg, host_err_msg_len);
-			if (err_send_res == SOCKET_ERROR) {
-				std::cout << "헤더 오류 메시지 클라이언트에 전송 실패.\n";
-			}
-		}
-	}
-	else if (ClientState.if_peer_error) {
-		std::cout << "클라이언트에 보낸 헤더의 오류 수신.\n";
-	}
-	else if (ClientState.if_peer_exit) {
-		std::cout << "클라이언트에서 연결을 종료하였습니다.\n";
-	}
-
-	// 여기에 RemoveClient() - clients에서 해당 ClientSession 제거
 	return;
 }
 
-int ClientSession::SendPacket(const char* msg, PacketType type) {
-	
+// msg는 반드시 BUFFER_SIZE 이내의 크기여야 한다. len은 메시지의 크기를 나타낸다.
+NetState ClientSession::SendPacket(const char* msg, uint32_t len, PacketType type) {
+	if (len > PAYLOAD_SIZE) {
+		ClientState.if_header_error = true;
+		return ClientState;
+	}
+
+	PacketHeader send_net_header{};
+	send_net_header.length = htonl(len);
+	send_net_header.type = htonl(static_cast<int32_t>(type));
+
+	ClientState.header_send = true;
+	int header_send_res = ClientSock->ClientSockSend(ClientState, (char*)&send_net_header, sizeof(PacketHeader)); // 해당 함수 내에서 transport error나 peer exit는 기록됨
+
+	if (header_send_res == SOCKET_ERROR) {
+		return ClientState;
+	}
+	ClientState.header_send = false;
+
+	ClientState.payload_send = true;
+	int payload_send_res = ClientSock->ClientSockSend(ClientState, msg, len);
+
+	if (payload_send_res == SOCKET_ERROR) {
+		return ClientState;
+	}
+	ClientState.payload_send = false;
+
+	return ClientState;
 }
 
-int ClientSession::RecvPacket(char* buf) {
+// buf는 반드시 BUFFER_SIZE 크기여야 한다.
+NetState ClientSession::RecvPacket(char* buf) {
 
+	// 헤더 수신
+	PacketHeader recv_net_header{};
+
+	ClientState.header_recv = true;
+	int header_recv_res = ClientSock->ClientSockRecv(ClientState, (char*)&recv_net_header, sizeof(PacketHeader));
+
+	if (header_recv_res == SOCKET_ERROR || header_recv_res == 0) {
+		return ClientState;
+	}
+	ClientState.header_recv = false;
+
+	PacketHeader recv_host_header{};
+	recv_host_header.type = ntohl(static_cast<int32_t>(recv_net_header.type));
+	recv_host_header.length = ntohl(recv_net_header.length);
+
+	if (recv_host_header.length > PAYLOAD_SIZE || recv_host_header.length == 0) { // length == 0이어도 protocol error로 처리
+		ClientState.if_header_error = true;
+		return ClientState;
+	}
+
+	if (recv_host_header.type != static_cast<int32_t>(PacketType::SAFE) &&
+		recv_host_header.type != static_cast<int32_t>(PacketType::HEADER_ERROR)) {
+		ClientState.if_header_error = true;
+		return ClientState;
+	}
+
+	// 페이로드 수신
+	ClientState.payload_recv = true;
+	int payload_recv_res = ClientSock->ClientSockRecv(ClientState, (char*)buf, recv_host_header.length);
+
+	if (payload_recv_res == SOCKET_ERROR || payload_recv_res == 0) {
+		return ClientState;
+	}
+	ClientState.payload_recv = false;
+
+	buf[recv_host_header.length] = '\0';
+
+	std::cout << "송신한 클라이언트 : IP 주소 = " << ClientAddrStr << " 포트 번호 = " << ntohs(ClientAddr.sin_port) << '\n';
+	std::cout << "받은 총 바이트 수 : " << payload_recv_res + header_recv_res << " 받은 메시지 : " << buf << '\n';
+
+	if (recv_host_header.type == static_cast<int32_t>(PacketType::HEADER_ERROR)) {
+		ClientState.if_peer_error = true;
+		return ClientState;
+	}
+
+	return ClientState;
 }
 
 auto manager = std::make_shared<ClientManager>();

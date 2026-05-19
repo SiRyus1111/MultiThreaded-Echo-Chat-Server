@@ -61,7 +61,44 @@ struct PacketHeader {
 
 현재는 일반 메시지와 에러 메시지 구분에 사용합니다.
 
-예상 타입:
+현재 코드에서는 패킷 타입의 의미를 표현하기 위해 `PacketType` enum class를 사용합니다.
+
+```cpp
+enum class PacketType : int32_t {
+    SAFE = -1,
+    HEADER_ERROR = 0
+};
+```
+
+단, `PacketHeader::type` 자체는 `PacketType`이 아니라 `int32_t`로 유지합니다.
+
+```text
+PacketHeader::type
+  → 실제 네트워크 패킷에 들어가는 정수 필드 = 값인 int32_t 형으로 읽히는게 좋다.
+
+PacketType
+  → 코드 내부에서 패킷 타입의 의미를 표현하는 enum class - 의미인 enum class로 읽히는게 좋다.
+```
+
+송신 시에는 `PacketType`을 `int32_t`로 변환한 뒤 `htonl()`을 적용합니다.
+
+```cpp
+send_net_header.type = htonl(static_cast<int32_t>(type));
+```
+
+수신 시에는 네트워크 바이트 오더의 `type`을 `ntohl()`로 변환한 뒤,
+허용된 `PacketType` 값과 비교합니다.
+
+```cpp
+recv_host_header.type = ntohl(recv_net_header.type);
+
+if (recv_host_header.type != static_cast<int32_t>(PacketType::SAFE) &&
+    recv_host_header.type != static_cast<int32_t>(PacketType::HEADER_ERROR)) {
+    // protocol error
+}
+```
+
+현재 타입:
 
 ```text
 SAFE
@@ -92,9 +129,17 @@ ERROR_MESSAGE
 4096 bytes
 ```
 
-`length`가 허용 범위를 벗어나면 protocol error로 판단합니다.
+현재 정책은 다음과 같습니다.
 
----
+```text
+length == 0
+  → protocol error
+
+length > PAYLOAD_SIZE
+  → protocol error
+```
+
+`length`가 허용 범위를 벗어나면 payload를 수신하지 않고 protocol error로 판단합니다.
 
 ## 3. Payload
 
@@ -169,21 +214,36 @@ while 이미 받은 길이 < 전체 길이:
 
 ## 6. 송수신 순서
 
-현재 기본 수신 흐름은 다음과 같습니다.
+현재 기본 수신 흐름은 `ClientSession::RecvPacket()`으로 분리되어 있습니다.
 
 ```text
 1. PacketHeader 수신
-2. type / length 검사
-3. payload 길이만큼 payload 수신
-4. 메시지 처리
+2. network byte order → host byte order 변환
+3. length 검사
+4. type 검사
+5. payload 길이만큼 payload 수신
+6. 문자열 출력용 null 문자 추가
+7. HEADER_ERROR 패킷이면 peer error로 기록
 ```
 
-현재 기본 송신 흐름은 다음과 같습니다.
+현재 기본 송신 흐름은 `ClientSession::SendPacket()`으로 분리되어 있습니다.
 
 ```text
-1. PacketHeader 구성
-2. PacketHeader 송신
-3. Payload 송신
+1. payload 길이 검사
+2. PacketHeader 구성
+3. host byte order → network byte order 변환
+4. PacketHeader 송신
+5. Payload 송신
+```
+
+즉, `Run()`은 byte order 변환이나 Header / Payload 송수신 세부 절차를 직접 알 필요가 없습니다.
+
+```text
+Run()
+  → RecvPacket()
+  → 상태 확인
+  → SendPacket()
+  → 상태 확인
 ```
 
 중요한 점은 Header와 Payload가 논리적으로 하나의 패킷이라는 것입니다.
@@ -211,9 +271,7 @@ Header_B
 Payload_B
 ```
 
-이 문제는 추후 `ClientSession`별 `send_mutex`를 통해 해결할 예정입니다.
-
----
+이 문제는 추후 `ClientSession`별 `send_mutex`를 `SendPacket()` 내부에 적용하여 해결할 예정입니다.
 
 ## 7. NetState
 
@@ -329,3 +387,17 @@ TCP는 message boundary를 보장하지 않는다.
 send() / recv() 한 번을 믿지 않고,
 send_all() / recv_all()로 원하는 길이만큼 반복 처리한다.
 ```
+
+26.05.20(수) 리팩토링 이후에는 이 패킷 송수신 절차가 `ClientSession::RecvPacket()`과
+`ClientSession::SendPacket()`으로 분리되었습니다.
+
+```text
+RecvPacket()
+  → PacketHeader + Payload 단위의 애플리케이션 패킷을 수신한다.
+
+SendPacket()
+  → PacketHeader + Payload 단위의 애플리케이션 패킷을 송신한다.
+```
+
+따라서 Echo Server 단계에서는 `Run()`이 `RecvPacket()` 후 `SendPacket()`을 호출하고,
+Chat Server 단계에서는 `RecvPacket()` 후 `ClientManager::Broadcast()`로 확장할 수 있습니다.

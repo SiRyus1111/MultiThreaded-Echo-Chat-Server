@@ -149,8 +149,8 @@ Client A → Server → Client B
 - 클라이언트별 `NetState` 저장
 - 클라이언트별 논리적 종료 상태 `closing` 관리
 - Echo Server 단계의 고수준 실행 흐름 `Run()` 구현
-- `RecvPacket()`으로 패킷 수신
-- `SendPacket()`으로 패킷 송신
+- `RecvPacket()`으로 패킷 수신, 수신 후 상태(`NetState`) 반환
+- `SendPacket()`으로 패킷 송신, 송신 후 상태(`NetState`) 반환
 - `TransportExceptionHandling()`으로 통신 종료 / 예외 후처리
 - 종료 시 `ClientManager`에 자기 자신 제거 요청
 - 추후 nickname / `SessionID` / 접속 상태 관리

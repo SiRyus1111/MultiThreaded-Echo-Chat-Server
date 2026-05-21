@@ -149,8 +149,8 @@ Client A → Server → Client B
 - 클라이언트별 `NetState` 저장
 - 클라이언트별 논리적 종료 상태 `closing` 관리
 - Echo Server 단계의 고수준 실행 흐름 `Run()` 구현
-- `RecvPacket()`으로 패킷 수신
-- `SendPacket()`으로 패킷 송신
+- `RecvPacket()`으로 패킷 수신, 수신 후 상태(`NetState`) 반환
+- `SendPacket()`으로 패킷 송신, 송신 후 상태(`NetState`) 반환
 - `TransportExceptionHandling()`으로 통신 종료 / 예외 후처리
 - 종료 시 `ClientManager`에 자기 자신 제거 요청
 - 추후 nickname / `SessionID` / 접속 상태 관리
@@ -193,7 +193,7 @@ ClientSession
 
 따라서 ClientSocket, NetState, closing은 모두 세션 내부에 위치하는 것이 자연스럽습니다.
 
-그리고 5.20(수) 리팩토링으로 `Run()`은 더 이상 Header / Payload 송수신 세부 절차를 직접 담당하지 않습니다.
+그리고 26.05.20(수) 리팩토링으로 `Run()`은 더 이상 Header / Payload 송수신 세부 절차를 직접 담당하지 않습니다.
 `Run()`은 Echo Server의 실행 흐름을 제어하고, 실제 패킷 송수신은 `RecvPacket()` / `SendPacket()`이 담당합니다.
 
 ```text

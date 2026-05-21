@@ -39,7 +39,7 @@ value = ClientSession 객체
 
 SessionID 설계 + 구현 -> 로그 출력 개선 -> 자료구조 몇 개 구현해보기(adam drozdek) -> 최종 clients 컨테이너 종류 결정(아마 key-value가 되는 자료구조 선택 예정) -> 동기화 관련 라이브러리 공부(std::mutex, std::condition_variable, std::atomic, josuttis) -> 락 프리 스택 가볍게 구현해보기 -> 브로드캐스트 설계 및 구현 -> ...
 
-SendPacket(const char* msg, PacketType type)
+SendPacket(const char* msg, int len, PacketType type)
 1. PacketHeader 구성 - strlen(msg)로 length, 입력받은 type으로 type
 2. network byte order 변환 - htonl()
 3. header send_all()
@@ -67,3 +67,23 @@ RecvPacket(char* buf)
 10. 자료구조 몇 개 구현해보기
 11. lock-free stack 가볍게 구현해보기
 12. send queue / worker thread 구조 검토
+
+브로드캐스트 
+ClientManager::Broadcast(SessionID session, const char* message, int len) {
+	std::unordered_map<SessionID, std::shared_ptr<ClientSession>> snapshot;
+	{
+		std::lock_guard<std::mutex> lock(client_mutex);
+		snapshot = clients;
+	}
+
+	for (auto [ID, pSession] : snapshot){
+		if (ID == session) {
+			continue;
+		}
+		if (closing == true) {
+			continue;
+		}
+
+		pSession->SendPacket(message, len, PacketType::SAFE);
+	}
+}

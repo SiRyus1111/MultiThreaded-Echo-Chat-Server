@@ -19,7 +19,7 @@
 
 ```text
 ClientManager
-  └── shared_ptr<ClientSession>
+  └── unordered_map<SessionID, shared_ptr<ClientSession>>
 
 client_thread()
   └── shared_ptr<ClientSession>
@@ -28,7 +28,8 @@ ClientSession
   ├── unique_ptr<ClientSocket>
   ├── weak_ptr<ClientManager>
   ├── NetState
-  └── atomic<bool> closing
+  ├── atomic<bool> closing
+  └── SessionID session_id
 
 ClientSocket
   └── SOCKET
@@ -40,9 +41,11 @@ ClientSocket
 ClientManager와 client_thread가 ClientSession을 공유 소유한다.
 ClientSession은 ClientSocket을 독점 소유한다.
 ClientSession은 ClientManager를 소유하지 않고 weak_ptr로 참조한다.
+ClientManager는 SessionID를 key로 ClientSession을 관리한다.
 ```
 
----
+`SessionID`는 소유권을 의미하지 않습니다.
+`SessionID`는 `ClientManager`가 특정 세션을 찾고 제거하기 위한 서버 내부 식별자입니다.
 
 ## 2. shared_ptr의 역할
 
@@ -124,7 +127,7 @@ ClientSession
 
 ```cpp
 if (auto manager = Manager_wp.lock()) {
-    manager->RemoveClient(shared_from_this());
+    manager->RemoveClient(session_id);
 }
 ```
 
@@ -132,19 +135,18 @@ if (auto manager = Manager_wp.lock()) {
 
 ## 5. enable_shared_from_this
 
-`ClientSession`이 자기 자신을 `shared_ptr` 형태로 `ClientManager`에게 넘기려면
-`std::enable_shared_from_this<ClientSession>`가 필요합니다.
+현재 구조에서 `ClientManager`는 `ClientSession`에게 자기 자신을 `shared_ptr` 형태로 전달해야 합니다.
 
 ```cpp
-class ClientSession
-    : public std::enable_shared_from_this<ClientSession> {
-};
+client->AddToManager(shared_from_this());
 ```
 
-그리고 다음처럼 호출합니다.
+이를 위해 `ClientManager`는 `std::enable_shared_from_this<ClientManager>`를 상속합니다.
 
 ```cpp
-shared_from_this()
+class ClientManager
+    : public std::enable_shared_from_this<ClientManager> {
+};
 ```
 
 주의할 점은 다음입니다.
@@ -154,16 +156,33 @@ shared_from_this()를 호출하는 객체는
 반드시 이미 shared_ptr로 관리되고 있어야 한다.
 ```
 
-따라서 `ClientSession`은 다음처럼 생성해야 합니다.
+따라서 `ClientManager`는 다음처럼 생성해야 합니다.
 
 ```cpp
-auto session = std::make_shared<ClientSession>(std::move(client_socket), client_addr);
+auto manager = std::make_shared<ClientManager>();
 ```
 
-물론 `ClientManager`도 자신을 `shared_ptr`로 전달해야 하므로
-`std::enable_shared_from_this<ClientManager>`를 상속합니다.
+이전 구조에서는 `ClientSession::RemoveThisClient()`가
+`shared_from_this()`를 통해 자기 자신의 `shared_ptr`을 `RemoveClient()`에 넘기는 형태였습니다.
 
----
+하지만 `SessionID` 기반 제거 구조에서는
+`ClientSession`이 자기 자신의 `session_id`를 보관하고,
+`RemoveClient(session_id)`를 호출하면 됩니다.
+
+```cpp
+void ClientSession::RemoveThisClient() {
+    if (auto manager = Manager_wp.lock()) {
+        manager->RemoveClient(session_id);
+    }
+}
+```
+
+따라서 `RemoveThisClient()`만 놓고 보면
+`ClientSession`은 더 이상 `shared_from_this()`에 의존하지 않습니다.
+
+다만 추후 다른 함수에서 `shared_from_this()`를 사용할 가능성이 있다면
+`ClientSession`의 `std::enable_shared_from_this<ClientSession>` 상속을 유지할 수 있습니다.
+반대로 더 이상 사용할 일이 없다면 장기적으로 제거를 검토할 수 있습니다.
 
 ## 6. detach 기반 thread 관리
 
@@ -238,9 +257,17 @@ client thread의 종료 여부를 직접 관측할 수 없습니다.
 
 `RemoveClient()`는 세션 객체를 즉시 소멸시키는 함수가 아닙니다.
 
+SessionID 도입 이후 `RemoveClient()`는 다음 형태가 됩니다.
+
+```cpp
+void RemoveClient(SessionID id);
+```
+
+의미는 다음과 같습니다.
+
 ```text
-RemoveClient()
-  → ClientManager의 clients 컨테이너에서 shared_ptr 제거
+RemoveClient(SessionID id)
+  → ClientManager의 clients unordered_map에서 해당 key 제거
   → ClientManager의 관리 목록에서 제외
   → 마지막 shared_ptr이 사라진 경우에만 ClientSession 소멸
 ```
@@ -254,6 +281,9 @@ shared_ptr
 closing
   → 세션의 논리적 종료 상태
 
+SessionID
+  → Manager가 세션을 식별하기 위한 서버 내부 ID
+
 RemoveClient()
   → ClientManager의 관리 목록에서 제거
 ```
@@ -263,7 +293,9 @@ RemoveClient()
 객체가 아직 살아있다는 것과,
 그 객체가 정상적인 송수신 대상으로 남아있다는 것은 서로 다른 문제입니다.
 
----
+또한 `SessionID`는 객체 생존을 보장하지 않습니다.
+세션의 생존은 여전히 `shared_ptr`이 담당하고,
+`SessionID`는 `ClientManager`가 어떤 세션을 제거할지 식별하는 기준으로만 사용됩니다.
 
 ## 9. 종료 흐름
 
@@ -275,21 +307,25 @@ RemoveClient()
 3. 이후 ClientManager의 broadcast는 해당 세션을 send 대상에서 제외한다.
 4. client_thread는 Run() 종료 전에 RemoveThisClient()를 호출한다.
 5. RemoveThisClient()는 Manager_wp.lock()으로 ClientManager에 접근한다.
-6. ClientManager::RemoveClient()가 clients에서 해당 shared_ptr을 제거한다.
-7. Run()이 return되면 client_thread가 들고 있던 shared_ptr도 해제된다.
-8. 마지막 shared_ptr이 사라지면 ClientSession이 소멸한다.
-9. ClientSession이 소유하던 ClientSocket도 소멸하면서 raw SOCKET이 closesocket()으로 정리된다.
+6. RemoveThisClient()는 자기 자신의 session_id를 넘겨 RemoveClient(session_id)를 호출한다.
+7. ClientManager::RemoveClient(SessionID)가 clients unordered_map에서 해당 key를 제거한다.
+8. Run()이 return되면 client_thread가 들고 있던 shared_ptr도 해제된다.
+9. 마지막 shared_ptr이 사라지면 ClientSession이 소멸한다.
+10. ClientSession이 소유하던 ClientSocket도 소멸하면서 raw SOCKET이 closesocket()으로 정리된다.
 ```
 
 이 흐름에서 중요한 점은 `closing = true`가 객체 소멸을 의미하지 않는다는 것입니다.
 `closing`은 논리적 종료 상태이며, 실제 객체 소멸은 마지막 `shared_ptr`이 사라지는 시점에 발생합니다.
+
+또한 `RemoveClient(session_id)`는 key 기반으로 `ClientManager`의 관리 목록에서 세션을 제거하는 동작입니다.
+이 함수가 호출되었다고 해서 즉시 `ClientSession` 객체가 소멸한다고 보장할 수는 없습니다.
 
 ## 10. ClientManager lock
 
 `ClientManager`는 접속 중인 `ClientSession` 목록을 관리합니다.
 
 ```cpp
-std::vector<std::shared_ptr<ClientSession>> clients;
+std::unordered_map<SessionID, std::shared_ptr<ClientSession>> clients;
 std::mutex clients_mutex;
 ```
 
@@ -300,30 +336,35 @@ std::mutex clients_mutex;
 - 새 client 추가
 - 기존 client 제거
 - client 목록 snapshot 생성
+- 추후 특정 SessionID 기반 조회
 
 예상 구조:
 
 ```cpp
-void ClientManager::AddClient(std::shared_ptr<ClientSession> client) {
+void ClientManager::AddClient(std::shared_ptr<ClientSession> client, SessionID id) {
     client->AddToManager(shared_from_this());
 
     std::lock_guard<std::mutex> lock(clients_mutex);
-    clients.push_back(client);
+    clients[id] = client;
 }
 ```
 
 ```cpp
-void ClientManager::RemoveClient(std::shared_ptr<ClientSession> client) {
+void ClientManager::RemoveClient(SessionID id) {
     std::lock_guard<std::mutex> lock(clients_mutex);
-
-    clients.erase(
-        std::remove(clients.begin(), clients.end(), client),
-        clients.end()
-    );
+    clients.erase(id);
 }
 ```
 
----
+현재 `SessionID` 부여는 `main thread`의 accept loop에서만 수행합니다.
+따라서 단일 accept thread 구조에서는 ID 증가 변수 자체에 별도 lock이 필요하지 않습니다.
+
+하지만 `clients` 컨테이너는 여러 client thread에서 제거 요청이 들어올 수 있으므로,
+`AddClient()` / `RemoveClient()` / snapshot 생성은 `clients_mutex`로 보호합니다.
+
+추후 중복 ID 삽입을 더 엄격히 검사하고 싶다면
+`clients[id] = client` 대신 `clients.emplace(id, client)`를 사용하고
+삽입 성공 여부를 확인하는 구조도 검토할 수 있습니다.
 
 ## 11. Broadcast 전체 lock 방식의 문제
 
@@ -353,7 +394,7 @@ Broadcast() 시작
 
 ```text
 ClientManager의 clients_mutex
-  → 현재 접속 중인 ClientSession 목록 보호
+  → 현재 접속 중인 ClientSession map 보호
 
 ClientSession의 send_mutex
   → 해당 클라이언트에게 보내는 Header + Payload의 패킷 경계 보호

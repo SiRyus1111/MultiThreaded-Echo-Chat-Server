@@ -344,7 +344,48 @@ ClientSock->ClientSockRecv(ClientState, buf, len);
 
 ---
 
-## 9. Chat Server 확장 방향
+## 9. SessionID와 프로토콜의 관계
+
+`SessionID`는 서버 내부에서 `ClientSession`을 식별하기 위한 값입니다.
+
+현재 구조에서 `SessionID`는 다음 용도로 사용합니다.
+
+```text
+ClientManager 내부 세션 관리
+RemoveClient(SessionID id)
+로그 출력
+추후 세션 조회
+```
+
+반면, `SessionID`는 현재 애플리케이션 레벨 패킷의 필드는 아닙니다.
+
+```text
+PacketHeader
+  ├── type
+  └── length
+
+SessionID
+  → 서버 내부 관리용 ID
+```
+
+따라서 `PacketHeader` 구조는 그대로 유지합니다.
+
+```cpp
+#pragma pack(push, 1)
+struct PacketHeader {
+    int32_t type;
+    uint32_t length;
+};
+#pragma pack(pop)
+```
+
+추후 클라이언트에게 자신의 세션 ID를 알려주거나,
+서버 메시지에 세션 ID를 포함하고 싶다면 별도의 message type 또는 payload 형식으로 확장할 수 있습니다.
+현재 단계에서는 `SessionID`를 네트워크 프로토콜에 포함하지 않고 서버 내부 관리용으로만 사용합니다.
+
+---
+
+## 10. Chat Server 확장 방향
 
 현재 `PacketHeader`의 `type` 필드는 추후 Chat Server 단계에서 확장할 수 있습니다.
 
@@ -372,7 +413,7 @@ message type 확장은 Broadcast Chat 단계에서 진행할 예정입니다.
 
 ---
 
-## 10. 정리
+## 11. 정리
 
 현재 프로토콜의 핵심은 다음과 같습니다.
 

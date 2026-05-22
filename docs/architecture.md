@@ -36,10 +36,13 @@ Chat Server 단계는 아직 구현 전이며,
 main thread
   ├── WinsockGuard 생성
   ├── ListenSocket 생성
+  ├── SessionID의 초기값 준비
   ├── accept() loop
   │     ├── ClientSocket 생성
+  │     ├── 현재 연결에 SessionID 부여
   │     ├── ClientSession 생성
-  │     ├── ClientManager::AddClient(session)
+  │     ├── ClientManager::AddClient(session, session_id)
+  │     ├── 다음 SessionID 설정
   │     ├── std::thread ClientThread(client_thread, session)
   │     └── ClientThread.detach()
   └── accept() loop 계속 진행
@@ -47,8 +50,35 @@ main thread
 
 핵심은 `main thread`가 각 클라이언트의 송수신을 직접 처리하지 않는다는 점입니다.
 
-`main thread`는 새 연결을 받아 `ClientSession`으로 묶고,
-해당 세션을 담당할 `client_thread`를 시작하는 역할에 집중합니다.
+`main thread`는 새 연결을 받아 `SessionID`를 부여하고,
+해당 연결을 `ClientSession`으로 묶은 뒤,
+그 세션을 담당할 `client_thread`를 시작하는 역할에 집중합니다.
+
+현재 구조에서는 `SessionID` 부여가 `main thread`의 accept loop 안에서만 일어납니다.
+따라서 여러 클라이언트가 동시에 접속하더라도,
+세션 ID를 증가시키는 변수에 대한 레이스 컨디션을 걱정할 필요가 없습니다.
+
+```cpp
+using SessionID = uint64_t;
+
+SessionID next_session_id = INITIAL_SESSION_ID;
+
+while (true) {
+    // accept() 성공 후
+    SessionID session_id = next_session_id++;
+
+    auto session = std::make_shared<ClientSession>(
+        std::move(client_socket),
+        client_addr,
+        session_id
+    );
+
+    manager->AddClient(session, session_id);
+}
+```
+
+단, 추후 여러 thread가 accept를 수행하는 구조로 확장한다면
+`next_session_id`는 `std::atomic<SessionID>` 또는 mutex로 보호해야 합니다.
 
 ---
 
@@ -64,8 +94,9 @@ main thread
 - `accept()` loop 실행
 - 새 클라이언트 연결 수락
 - `ClientSocket` 생성
+- 새 연결에 `SessionID` 부여
 - `ClientSession` 생성
-- `ClientManager`에 세션 등록
+- `ClientManager`에 `SessionID`와 함께 세션 등록
 - 클라이언트별 `std::thread` 생성
 - 생성한 thread를 `detach()`
 
@@ -73,7 +104,8 @@ main thread
 
 ```text
 새 클라이언트 연결을 받아
-ClientSession 객체로 만들고
+SessionID를 부여하고
+ClientSession 객체로 만든 뒤
 client_thread에 넘긴다.
 ```
 
@@ -138,7 +170,8 @@ Client A → Server → Client B
 
 `ClientSession`은 클라이언트 한 명의 연결 단위를 표현하는 객체입니다.
 
-즉, 클라이언트 한 명과 관련된 socket, 주소, 통신 상태, 종료 상태, 패킷 송수신 흐름을 하나의 객체로 묶습니다.
+즉, 클라이언트 한 명과 관련된 socket, 주소, 세션 ID, 통신 상태, 종료 상태,
+패킷 송수신 흐름을 하나의 객체로 묶습니다.
 
 ### 역할
 
@@ -146,14 +179,15 @@ Client A → Server → Client B
 - 해당 클라이언트의 `ClientSocket` 소유
 - 클라이언트 주소 정보 저장
 - 로그 출력을 위한 클라이언트 IP 문자열 `ClientAddrStr` 저장
+- 서버 내부 세션 식별자인 `SessionID` 저장
 - 클라이언트별 `NetState` 저장
 - 클라이언트별 논리적 종료 상태 `closing` 관리
 - Echo Server 단계의 고수준 실행 흐름 `Run()` 구현
 - `RecvPacket()`으로 패킷 수신, 수신 후 상태(`NetState`) 반환
 - `SendPacket()`으로 패킷 송신, 송신 후 상태(`NetState`) 반환
 - `TransportExceptionHandling()`으로 통신 종료 / 예외 후처리
-- 종료 시 `ClientManager`에 자기 자신 제거 요청
-- 추후 nickname / `SessionID` / 접속 상태 관리
+- 종료 시 `ClientManager`에 자기 `SessionID` 기반 제거 요청
+- 추후 nickname / 접속 상태 관리
 
 현재 구조는 다음과 같습니다.
 
@@ -166,9 +200,10 @@ private:
     std::weak_ptr<ClientManager> Manager_wp;
     NetState ClientState;
     std::atomic<bool> closing = false;
+    SessionID session_id;
 
 public:
-    ClientSession(std::unique_ptr<ClientSocket> s, sockaddr_in addr);
+    ClientSession(std::unique_ptr<ClientSocket> s, sockaddr_in addr, SessionID id);
 
     void AddToManager(std::shared_ptr<ClientManager> manager_sp);
     void Run();
@@ -191,7 +226,15 @@ ClientSession
   → 클라이언트 한 명의 생명주기와 통신 흐름을 표현하는 객체
 ```
 
-따라서 ClientSocket, NetState, closing은 모두 세션 내부에 위치하는 것이 자연스럽습니다.
+따라서 ClientSocket, ClientAddr, ClientAddrStr, SessionID, NetState, closing은
+모두 세션 내부에 위치하는 것이 자연스럽습니다.
+
+`SessionID`는 `ClientManager`가 세션을 빠르게 식별하기 위한 서버 내부 ID입니다.
+IP:Port만으로는 세션 관리가 애매할 수 있고,
+`shared_ptr<ClientSession>` 대조 기반 제거는 컨테이너 구조가 커질수록 불편해질 수 있습니다.
+
+따라서 현재 구조에서는 `ClientSession`이 자기 자신의 `session_id`를 값으로 보관하고,
+종료 시 `ClientManager::RemoveClient(session_id)`를 호출하도록 설계합니다.
 
 그리고 26.05.20(수) 리팩토링으로 `Run()`은 더 이상 Header / Payload 송수신 세부 절차를 직접 담당하지 않습니다.
 `Run()`은 Echo Server의 실행 흐름을 제어하고, 실제 패킷 송수신은 `RecvPacket()` / `SendPacket()`이 담당합니다.
@@ -222,6 +265,7 @@ TransportExceptionHandling()
 - 새 `ClientSession` 추가
 - 종료된 `ClientSession` 제거
 - 현재 접속 중인 클라이언트 목록 관리
+- `SessionID` 기반 세션 식별
 - clients 컨테이너 동기화
 - 추후 broadcast 수행
 
@@ -230,12 +274,12 @@ TransportExceptionHandling()
 ```cpp
 class ClientManager : public std::enable_shared_from_this<ClientManager> {
 private:
-    std::vector<std::shared_ptr<ClientSession>> clients;
-    std::mutex client_mutex;
+    std::unordered_map<SessionID, std::shared_ptr<ClientSession>> clients;
+    std::mutex clients_mutex;
 
 public:
-    void AddClient(std::shared_ptr<ClientSession> client);
-    void RemoveClient(std::shared_ptr<ClientSession> client);
+    void AddClient(std::shared_ptr<ClientSession> client, SessionID id);
+    void RemoveClient(SessionID id);
 };
 ```
 
@@ -248,7 +292,15 @@ ClientManager
   → 여러 ClientSession의 등록, 제거, 순회, broadcast를 담당
 ```
 
----
+이때 세션 식별 기준은 `shared_ptr<ClientSession>` 대조가 아니라 `SessionID`입니다.
+
+```text
+key   = SessionID
+value = shared_ptr<ClientSession>
+```
+
+따라서 특정 세션을 제거할 때는 `clients.erase(session_id)`처럼
+key 기반으로, O(N)의 시간복잡도로 관리 목록에서 제거할 수 있습니다.
 
 ## 7. 객체 책임 요약
 
@@ -256,8 +308,8 @@ ClientManager
 |---|---|
 | `main thread` | 새 연결 수락, 세션 생성, client thread 시작 |
 | `client_thread` | 특정 세션 하나의 실행 흐름 담당 |
-| `ClientSession` | 클라이언트 한 명의 socket, 상태, 송수신 흐름 관리 |
-| `ClientManager` | 여러 세션의 목록과 관계 관리 |
+| `ClientSession` | 클라이언트 한 명의 socket, SessionID, 상태, 송수신 흐름 관리 |
+| `ClientManager` | SessionID 기반으로 여러 세션의 목록과 관계 관리 |
 | `ClientSocket` | raw `SOCKET` 소유 및 송수신 |
 | `NetState` | 송수신 단계와 예외 상태 기록 |
 

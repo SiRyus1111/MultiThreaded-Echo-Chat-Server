@@ -64,8 +64,13 @@
 - `ClientSession` 기본 구조 구현
 - `ClientManager`가 현재 접속 중인 `ClientSession` 목록 관리
 - `ClientSession::RemoveThisClient()` 구조 추가
-- `ClientManager::RemoveClient(std::shared_ptr<ClientSession>)` 임시 구현
 - `std::atomic<bool> closing`을 통한 논리적 종료 상태 관리
+- `SessionID` 1차 도입
+- `ClientSession`에 `SessionID session_id` 멤버 추가
+- `ClientManager`의 clients 컨테이너를 `unordered_map<SessionID, shared_ptr<ClientSession>>`로 변경
+- `ClientManager::AddClient(std::shared_ptr<ClientSession>, SessionID)` 구조 적용
+- `ClientManager::RemoveClient(SessionID)` 구조 적용
+- `ClientSession::RemoveThisClient()`가 `shared_from_this()` 대신 `session_id` 기반으로 제거 요청하도록 변경
 
 ### ClientSession 송수신 함수 분리
 
@@ -93,7 +98,6 @@
 현재 기준으로 다음 기능은 아직 구현되지 않았습니다.
 
 - Broadcast Chat 기능
-- `SessionID`
 - 로그 출력 형식 개선
 - nickname 기반 클라이언트 식별
 - 메시지 타입별 채팅 프로토콜 분기
@@ -105,35 +109,52 @@
 
 ## 4. 단기 구현 목표
 
-### 4-1. SessionID 도입
+### 4-1. SessionID 기반 구조 검증
 
-`SessionID`의 목적은 다음과 같습니다.
+`SessionID`는 1차 도입되었지만,
+아직 세부 정책과 주변 구조는 더 검증할 필요가 있습니다.
+
+현재 설계의 목적은 다음과 같습니다.
 
 ```text
 클라이언트 세션들을 구분해서
-ClientManager가 특정 세션을 쉽게 찾을 수 있도록 한다.
+ClientManager가 특정 세션을 쉽게 찾고 제거할 수 있도록 한다.
 ```
 
-IP:Port만으로는 세션 식별에 한계가 있으므로,
-서버 내부에서 고유한 `SessionID`를 부여합니다.
+현재 방향:
 
-초기 구현 방향:
-
-```text
+```cpp
 using SessionID = uint64_t;
+const SessionID INITIAL_SESSION_ID = 0;
 ```
 
-예상 구조:
+현재 구조:
 
 ```text
 ClientManager
   └── unordered_map<SessionID, shared_ptr<ClientSession>>
+
+ClientSession
+  └── SessionID session_id
 ```
 
-단기적으로는 기존 `vector<shared_ptr<ClientSession>>`를 유지하되,
-`SessionID` 필드부터 추가할 수 있습니다.
+현재 제거 흐름:
 
----
+```text
+ClientSession::RemoveThisClient()
+  → ClientManager::RemoveClient(session_id)
+  → clients.erase(session_id)
+```
+
+남은 검증 사항:
+
+- `SessionID` 부여 시점이 accept 직후로 적절한지 확인
+- `next_session_id` 증가가 main thread에서만 일어나는 현재 구조 유지
+- 추후 multi-accept 구조로 바뀔 경우 atomic 또는 mutex 필요성 검토
+- 로그 출력에 `SessionID`를 포함하는 형식 정리
+- `ClientSession`의 `enable_shared_from_this` 상속이 계속 필요한지 검토
+- `clients[id] = client` 대신 `emplace()`를 사용할지 검토
+- `unordered_map` 기반 broadcast snapshot 생성 방식 정리
 
 ### 4-2. 로그 출력 개선
 
@@ -333,8 +354,8 @@ thread-per-client 구조를 구현한 뒤,
 - [v] payload 길이 0 또는 비정상 length 처리
 - [v] 최대 payload 길이 근처 메시지 처리
 - [v] partial send / recv 상황에서도 정상 동작
-- [ ] `RecvPacket()` / `SendPacket()` 분리 후 Echo 동작 재확인
-- [ ] `PacketType` 변환 및 type 검증 테스트
+- [v] `RecvPacket()` / `SendPacket()` 분리 후 Echo 동작 재확인
+- [v] `PacketType` 변환 및 type 검증 테스트
 - [v] transport error 발생 시 세션 종료 처리
 - [v] peer exit 발생 시 세션 제거 처리
 

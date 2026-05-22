@@ -59,16 +59,18 @@
 - `PacketHeader::type`은 실제 전송 필드로 `int32_t`를 유지하고, `PacketType`은 코드 내부 의미 표현용으로 사용
 - payload length가 `0`이거나 `PAYLOAD_SIZE`를 초과하면 protocol error로 처리
 - `TransportExceptionHandling()`을 통해 통신 종료 / 예외 후처리 흐름 정리
+- `SessionID` 1차 도입
 
 ### 구현 예정
 
-- `SessionID`
 - 로그 출력 형식 개선
 - ClientSession별 `send_mutex`
 - `ClientManager::Broadcast()`
 - broadcast 시 clients snapshot 복사 구조
 - nickname / message type 확장
 - broadcast 중 송신 실패 세션 정리 정책
+- `SessionID` 기반 로그 출력 및 세션 추적 개선
+- `SessionID` 기반 컨테이너 구조 검증
 
 ## 3. 핵심 설계 요약
 
@@ -99,12 +101,20 @@ closing
 
 RemoveClient()
   → ClientManager의 관리 목록에서 제거
+
+SessionID
+  → ClientManager가 세션을 식별하기 위한 서버 내부 ID
 ```
 
 이 구분은 이 프로젝트에서 가장 중요한 기준입니다.
 
 객체가 아직 살아있다는 것과,
 그 객체가 정상적인 송수신 대상으로 남아있다는 것은 서로 다른 문제입니다.
+
+또한 현재 구조에서는 `ClientManager`가 세션을 제거할 때
+`shared_ptr<ClientSession>` 대조가 아니라 `SessionID`를 key로 사용합니다.
+이를 위해 `ClientSession`은 자기 자신의 `session_id`를 값으로 저장하고,
+`ClientManager`는 `unordered_map<SessionID, shared_ptr<ClientSession>>`로 세션 목록을 관리합니다.
 
 ---
 

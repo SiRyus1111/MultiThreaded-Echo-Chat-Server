@@ -960,7 +960,7 @@ ClientSession 소멸
 ```cpp
 class ClientManager : public std::enable_shared_from_this<ClientManager> {
 private:
-    std::vector<std::shared_ptr<ClientSession>> clients;
+    std::unordered_map<SessionID, std::shared_ptr<ClientSession>> clients;
     std::mutex clients_mutex;
 
 public:

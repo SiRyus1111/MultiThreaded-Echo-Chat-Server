@@ -91,14 +91,30 @@
 - `weak_ptr<ClientManager>` 기반 Manager 비소유 참조
 - `enable_shared_from_this` 기반 `shared_from_this()` 사용 구조
 
+### Logging
+
+- LineLogger 공용 로깅 라이브러리 구현
+- 가변 인자 기반 로그 생성 구조 구현
+- 로그 한 줄 단위 출력 구조 구현
+- 출력 구간 최소 범위 mutex 보호 적용
+- SessionID 기반 표준 로그 형식 설계
+
 ---
 
 ## 3. 현재 기준 미구현
 
 현재 기준으로 다음 기능은 아직 구현되지 않았습니다.
 
+### Logging (미구현)
+
+- 기존 std::cout 출력 제거
+- ClientSession 로그의 LineLogger 적용
+- ClientManager 로그의 LineLogger 적용
+- 서버 전역 로그의 LineLogger 적용
+
+### Others
+
 - Broadcast Chat 기능
-- 로그 출력 형식 개선
 - nickname 기반 클라이언트 식별
 - 메시지 타입별 채팅 프로토콜 분기
 - ClientSession별 `send_mutex`

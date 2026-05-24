@@ -1226,9 +1226,163 @@ send_mutex
 
 ---
 
-# 8. Network Helper 함수
+# 8. LineLogger
 
-## 8-1. send_all()
+## 8-1. 역할
+
+LineLogger는 프로젝트 전반에서 사용하는 공용 로깅 컴포넌트입니다.
+
+근본적인 목적은 다음과 같습니다.
+
+```text
+멀티스레드 환경에서
+하나의 로그 메시지가
+다른 스레드의 출력과 섞이지 않도록 한다.
+````
+
+또한 로그 형식을 통일하고,
+출력 정책을 한 곳에서 관리할 수 있도록 합니다.
+
+---
+
+## 8-2. 설계 배경
+
+기존에는 다음과 같은 형태의 로그 출력이 사용되었습니다.
+
+```cpp
+// 예시
+std::cout << "[SessionID " << session_id << "]"
+          << "[RECV] "
+          << message
+          << '\n';
+```
+
+하지만 멀티스레드 환경에서는 여러 번의 `<<` 연산 사이에
+다른 스레드의 출력이 끼어들 수 있습니다.
+
+따라서 하나의 로그가 여러 조각으로 분리되어 출력될 수 있다.
+
+`LineLogger`는 이를 방지하기 위해
+
+```text
+로그 생성
+↓
+문자열 완성
+↓
+출력
+```
+
+구조를 사용합니다.
+
+---
+
+## 8-3. WriteLog()
+
+```cpp
+template<typename... Args>
+void WriteLog(Args&&... args);
+```
+
+WriteLog()는 전달받은 인자들을
+ostringstream로 하나의 문자열로 조립한 뒤 출력합니다.
+
+사용 예시:
+
+```cpp
+SessionID session_id = 3
+
+logger.WriteLog(
+    "Client ",
+    session_id,
+    " Connected"
+);
+```
+
+```text
+// 출력
+Client 3 Connected
+```
+
+---
+
+## 8-4. WriteSessionLog()
+
+```cpp
+template<typename... Args>
+void WriteSessionLog(
+    SessionID sessionId,
+    const std::string& ipaddr,
+    uint16_t port,
+    const std::string& logType,
+    Args&&... args
+);
+```
+
+`ClientSession` 관련 로그를 위한 편의 함수입니다.
+
+다음과 같은 요소들을 입력받아 정해진 형식으로 출력합니다.
+- `SessionID`
+- `IP`
+- `Port`
+- `LogType`
+- `message`
+
+예상 출력:
+
+```text
+[SessionID 3][127.0.0.1:53021][RECV] Hello
+```
+
+---
+
+## 8-5. 동기화 전략
+
+LineLogger는 문자열 생성 과정에는 락을 사용하지 않습니다.
+
+```cpp
+std::ostringstream oss;
+```
+
+를 통해 스레드 로컬 영역에서 문자열을 완성한 뒤,
+
+실제 출력 시점에만 락을 획득합니다.
+
+```cpp
+lock
+↓
+std::cout << 완성된 문자열
+↓
+unlock
+```
+
+이를 통해
+
+* 로그 단위 원자성 확보
+* 락 경합 최소화
+
+를 목표로 합니다.
+
+---
+
+## 8-6. 프로젝트 내 역할
+
+프로젝트의 콘솔 출력은
+가능한 한 모두 `LineLogger`를 통해 수행합니다.
+
+이를 통해
+
+- 출력 형식 통일
+- 로그 정책 중앙 관리
+- 추후 파일 로깅 확장
+- 로그 레벨 추가
+
+등의 기능을 한 위치에서 관리할 수 있도록 합니다.
+
+---
+
+# 9. Network Helper 함수
+
+## 9-1. send_all()
 
 ```cpp
 int send_all(SOCKET s, const char* buf, int len, ...);
@@ -1259,7 +1413,7 @@ TCP의 partial send 가능성을 호출자에게 숨기고,
 
 ---
 
-## 8-2. recv_all()
+## 9-2. recv_all()
 
 ```cpp
 int recv_all(SOCKET s, char* buf, int len, ...);
@@ -1295,9 +1449,9 @@ PacketHeader와 Payload를 각각 정해진 길이만큼 수신합니다.
 
 ---
 
-# 9. NetState
+# 10. NetState
 
-## 9-1. 역할
+## 10-1. 역할
 
 `NetState`는 송수신 과정에서 발생한 상태를 기록하는 구조체입니다.
 
@@ -1328,7 +1482,7 @@ payload까지 성공
 
 ---
 
-## 9-2. NetState를 사용하는 이유
+## 10-2. NetState를 사용하는 이유
 
 `NetState`를 사용하는 이유는
 통신 결과를 단순 `bool`보다 더 구체적으로 표현하기 위해서입니다.
@@ -1363,7 +1517,7 @@ HEADER_ERROR packet
 
 ---
 
-## 9-3. RecvPacket() / SendPacket()의 반환값으로 사용하는 이유
+## 10-3. RecvPacket() / SendPacket()의 반환값으로 사용하는 이유
 
 `RecvPacket()`과 `SendPacket()`이 `NetState`를 반환하는 이유는,
 각 함수가 수행한 송수신 작업의 결과를 `Run()`에게 명시적으로 전달하기 위해서입니다.
@@ -1409,9 +1563,9 @@ Run()
 
 ---
 
-# 10. PacketHeader와 PacketType
+# 11. PacketHeader와 PacketType
 
-## 10-1. PacketHeader::type
+## 11-1. PacketHeader::type
 
 ```cpp
 struct PacketHeader {
@@ -1434,7 +1588,7 @@ PacketHeader::type
 
 ---
 
-## 10-2. PacketType
+## 11-2. PacketType
 
 ```cpp
 enum class PacketType : int32_t {
@@ -1470,9 +1624,9 @@ send_net_header.type = htonl(static_cast<int32_t>(type));
 
 ---
 
-# 11. 추후 확장 지점
+# 12. 추후 확장 지점
 
-## 11-1. send_mutex
+## 12-1. send_mutex
 
 추후 Broadcast Chat Server 단계에서는 여러 thread가
 같은 `ClientSession`에 대해 `SendPacket()`을 호출할 수 있습니다.
@@ -1497,7 +1651,7 @@ send_mutex
 
 ---
 
-## 11-2. Broadcast()
+## 12-2. Broadcast()
 
 `Broadcast()`는 Chat Server 확장의 핵심 함수입니다.
 
@@ -1514,7 +1668,7 @@ send_mutex
 
 ---
 
-# 12. 정리
+# 13. 정리
 
 현재 컴포넌트 설계의 핵심은 다음과 같습니다.
 

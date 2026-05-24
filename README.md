@@ -60,10 +60,16 @@
 - payload length가 `0`이거나 `PAYLOAD_SIZE`를 초과하면 protocol error로 처리
 - `TransportExceptionHandling()`을 통해 통신 종료 / 예외 후처리 흐름 정리
 - `SessionID` 1차 도입
+- `LineLogger` 공용 로깅 라이브러리 구현
+- 가변 인자 템플릿(Fold Expression) 기반 로그 조립 기능 구현
+- 로그 한 줄 단위 출력 구조 구현
+- 출력 구간만 `std::mutex`로 보호하는 최소 범위 동기화 구조 적용
+- `SessionID` / `IP:Port` / `LogType` 기반 표준 로그 형식 설계
 
 ### 구현 예정
 
-- 로그 출력 형식 개선
+- LineLogger를 ClientSession / ClientManager / Server 전역 로그에 적용
+- SessionID 기반 표준 로그 형식 전면 적용
 - ClientSession별 `send_mutex`
 - `ClientManager::Broadcast()`
 - broadcast 시 clients snapshot 복사 구조
@@ -129,6 +135,7 @@ MultiThreaded Echo-Chat Server
 ├── include
 │   ├── Common.h
 │   ├── NetCommon.h
+│   ├── LineLogger.h
 │   └── socketRAII.h
 ├── README.md
 ├── IdeaScatch
@@ -234,6 +241,77 @@ ClientSession의 send_mutex
 `clients_mutex`를 해제하고 각 `ClientSession::SendPacket()`을 호출하는 구조를 목표로 합니다.
 
 자세한 내용은 [`docs/concurrency-design.md`](docs/concurrency-design.md)를 참고합니다.
+
+---
+
+## 8. Logging System 요약 (`LineLogger`)
+
+멀티클라이언트 / 멀티스레드 서버에서는 여러 스레드가 동시에 로그를 출력할 수 있습니다.
+
+기존의
+
+```cpp
+// 예시
+std::cout << a
+          << b
+          << c;
+```
+
+형태는 하나의 로그가 여러 번의 출력 연산으로 나뉘어 수행되므로,
+다른 스레드의 로그가 중간에 끼어들어
+한 줄의 의미가 깨질 수 있습니다.
+
+이를 줄이기 위해 프로젝트는 공용 로깅 라이브러리인 `LineLogger`를 사용합니다.
+
+설계 목표는 다음과 같습니다.
+
+```text
+로그 한 줄을 하나의 의미 단위로 취급한다.
+```
+
+### 동작 방식
+
+```text
+로그 조립
+↓
+문자열 완성
+↓
+출력 시 mutex 획득
+↓
+한 번에 출력
+↓
+mutex 해제
+```
+
+로그 문자열 생성은 각 스레드가 독립적으로 수행하며,
+공유 자원인 `std::cout`에 접근하는 구간만 보호합니다.
+
+이를 통해
+
+- 로그 단위 일관성 유지
+- 락 점유 시간 최소화
+- 멀티스레드 환경에서의 로그 가독성 향상
+
+을 목표로 합니다.
+
+### 사용 예시
+
+```cpp
+logger.WriteLog(
+    "Client ",
+    session_id,
+    " Connected"
+);
+```
+
+세션 관련 로그는 다음과 같은 형식으로 출력할 수 있습니다.
+
+```text
+[SessionID 3][127.0.0.1:53021][RECV] Hello
+```
+
+현재 `LineLogger` 라이브러리는 구현 완료 상태이며,
+향후 프로젝트 전체의 콘솔 출력을 `LineLogger` 기반으로 통합할 예정입니다.
 
 ---
 

@@ -36,6 +36,7 @@ Chat Server 단계는 아직 구현 전이며,
 main thread
   ├── WinsockGuard 생성
   ├── ListenSocket 생성
+  ├── LineLogger::GetInstance() 기반 콘솔 출력 사용
   ├── SessionID의 초기값 준비
   ├── accept() loop
   │     ├── ClientSocket 생성
@@ -91,6 +92,7 @@ while (true) {
 
 - `WinsockGuard` 생성
 - `ListenSocket` 생성
+- `LineLogger` 기반 서버 전역 로그 출력
 - `accept()` loop 실행
 - 새 클라이언트 연결 수락
 - `ClientSocket` 생성
@@ -346,7 +348,45 @@ Client A → Server → Client B
 
 ---
 
-## 9. 설계 핵심
+## 9. LineLogger와 콘솔 출력 책임
+
+`LineLogger`는 서버의 콘솔 출력 경로를 단일화하기 위한 공용 로깅 컴포넌트입니다.
+
+멀티스레드 서버에서는 `main thread`, 여러 `client_thread`, 추후 `ClientManager::Broadcast()` 흐름 등
+여러 실행 흐름이 동시에 로그를 출력할 수 있습니다.
+따라서 콘솔 출력은 하나의 공유 자원인 `std::cout`에 대한 동기화 정책을 가져야 합니다.
+
+`LineLogger`는 다음 책임을 가집니다.
+
+- 프로젝트의 콘솔 출력 경로 단일화
+- 전역 단일 `LineLogger` 객체 제공
+- 하나의 `output_mutex_`로 `std::cout` 보호
+- 로그 문자열을 먼저 조립한 뒤 출력
+- 완성된 로그 문자열 하나를 한 번의 `operator<<`로 출력
+- `SessionID` / `IP:Port` / `LogType` 기반 세션 로그 형식 제공
+- `LogType` enum class를 통한 로그 타입 제한
+
+구조적으로는 다음과 같습니다.
+
+```text
+main thread / client_thread / ClientManager
+  → LineLogger::GetInstance()
+  → WriteLog() 또는 WriteSessionLog()
+  → 하나의 output_mutex_로 std::cout 보호
+```
+
+세션 로그의 기본 형식은 다음을 목표로 합니다.
+
+```text
+[SessionID 3][127.0.0.1:53021][RECV_COMPLETE] payload received
+```
+
+현재 `LineLogger` 라이브러리는 구현 완료 상태이며,
+프로젝트 전체의 기존 `std::cout` 출력은 이후 `LineLogger` 기반으로 교체할 예정입니다.
+
+---
+
+## 10. 설계 핵심
 
 현재 구조에서 가장 중요한 기준은 다음입니다.
 

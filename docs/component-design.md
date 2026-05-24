@@ -1230,153 +1230,410 @@ send_mutex
 
 ## 8-1. 역할
 
-LineLogger는 프로젝트 전반에서 사용하는 공용 로깅 컴포넌트입니다.
+`LineLogger`는 프로젝트 전반의 콘솔 출력을 담당하는 공용 로깅 컴포넌트입니다.
 
-근본적인 목적은 다음과 같습니다.
+근본적인 목적은 다음입니다.
 
 ```text
 멀티스레드 환경에서
-하나의 로그 메시지가
-다른 스레드의 출력과 섞이지 않도록 한다.
-````
+로그 한 줄의 의미가
+다른 스레드의 출력과 섞여 깨지는 문제를 줄인다.
+```
 
-또한 로그 형식을 통일하고,
-출력 정책을 한 곳에서 관리할 수 있도록 합니다.
+또한 프로젝트의 모든 콘솔 출력 경로를 `LineLogger`로 단일화하여,
+로그 형식, 출력 정책, 동기화 방식을 한 곳에서 관리하는 것을 목표로 합니다.
 
 ---
 
 ## 8-2. 설계 배경
 
-기존에는 다음과 같은 형태의 로그 출력이 사용되었습니다.
+기존에는 다음과 같은 형태의 콘솔 출력이 사용될 수 있었습니다.
 
 ```cpp
-// 예시
 std::cout << "[SessionID " << session_id << "]"
           << "[RECV] "
           << message
           << '\n';
 ```
 
-하지만 멀티스레드 환경에서는 여러 번의 `<<` 연산 사이에
-다른 스레드의 출력이 끼어들 수 있습니다.
+하지만 이 방식은 하나의 로그를 여러 번의 `operator<<()` 호출로 출력합니다.
+멀티스레드 환경에서는 각 출력 조각 사이에 다른 스레드의 출력이 끼어들 수 있고,
+그 결과 하나의 로그 라인이 의미 단위로 보존되지 않을 수 있습니다.
 
-따라서 하나의 로그가 여러 조각으로 분리되어 출력될 수 있다.
-
-`LineLogger`는 이를 방지하기 위해
+`LineLogger`는 이 문제를 줄이기 위해 다음 구조를 사용합니다.
 
 ```text
-로그 생성
+로그 인자 전달
 ↓
 문자열 완성
 ↓
-출력
+출력 시점만 동기화
+↓
+완성된 문자열 출력
 ```
 
-구조를 사용합니다.
+## 8-3. 현재 구현 코드
+
+현재 `LineLogger`의 핵심 구현은 다음과 같습니다.
+
+```cpp
+#pragma once
+
+#include <iostream>
+#include <utility>
+#include <sstream>
+#include <stdint.h>
+#include <mutex>
+#include <string>
+
+class LineLogger {
+private:
+    std::mutex output_mutex_;
+    LineLogger() = default;
+
+public:
+    enum class LogType {
+        CONNECTED,
+        RECEIVING,
+        RECV_COMPLETE,
+        SENDING,
+        SEND_COMPLETE,
+        DISCONNECTED,
+        PROTOCOL_ERROR,
+        TRANSPORT_ERROR,
+        RECEIVE_ERROR_PACKET,
+        SEND_ERROR_PACKET
+    };
+
+    static const char* LogTypeToCstyleString(LogType l) {
+        switch (l) {
+            case LogType::CONNECTED: return "CONNECTED";
+            case LogType::RECEIVING: return "RECEIVING";
+            case LogType::RECV_COMPLETE: return "RECV_COMPLETE";
+            case LogType::SENDING: return "SENDING";
+            case LogType::SEND_COMPLETE: return "SEND_COMPLETE";
+            case LogType::DISCONNECTED: return "DISCONNECTED";
+            case LogType::PROTOCOL_ERROR: return "PROTOCOL_ERROR";
+            case LogType::TRANSPORT_ERROR: return "TRANSPORT_ERROR";
+            case LogType::RECEIVE_ERROR_PACKET: return "RECEIVE_ERROR_PACKET";
+            case LogType::SEND_ERROR_PACKET: return "SEND_ERROR_PACKET";
+            default: return "UNKNOWN_LOGTYPE";
+        }
+    }
+
+    LineLogger& operator=(const LineLogger&) = delete;
+    LineLogger(const LineLogger&) = delete;
+    LineLogger& operator=(LineLogger&&) = delete;
+    LineLogger(LineLogger&&) = delete;
+
+    static LineLogger& GetInstance() {
+        static LineLogger instance;
+        return instance;
+    }
+
+    template <typename... Args>
+    void WriteLog(Args&&... args) {
+        std::ostringstream oss;
+        (oss << ... << std::forward<Args>(args));
+        oss << '\n';
+
+        std::lock_guard<std::mutex> lock(output_mutex_);
+        std::cout << oss.str();
+    }
+
+    template <typename... Args>
+    void WriteSessionLog(
+        uint64_t sessionId,
+        const std::string& ipaddr,
+        uint16_t port,
+        LogType logType,
+        Args&&... args) {
+
+        WriteLog("[SessionID ", sessionId, "]",
+                 "[", ipaddr, ":", port, "]",
+                 "[", LogTypeToCstyleString(logType), "] ",
+                 std::forward<Args>(args)...);
+    }
+};
+```
 
 ---
 
-## 8-3. WriteLog()
+## 8-4. 싱글톤 구조
+
+`LineLogger`는 싱글톤 패턴을 사용합니다.
 
 ```cpp
-template<typename... Args>
+static LineLogger& GetInstance() {
+    static LineLogger instance;
+    return instance;
+}
+```
+
+이 구조를 사용하는 이유는 `std::cout`이 프로젝트 전체에서 공유되는 출력 자원이기 때문입니다.
+
+만약 `LineLogger` 객체가 여러 개 생성된다면,
+각 객체는 서로 다른 `std::mutex`를 가지게 됩니다.
+그러면 같은 `std::cout`을 서로 다른 mutex로 보호하는 상황이 생길 수 있습니다.
+
+따라서 프로젝트의 모든 콘솔 출력은 다음처럼 동일한 `LineLogger` 객체를 사용합니다.
+
+```cpp
+LineLogger::GetInstance().WriteLog("server started");
+```
+
+즉, `LineLogger`의 싱글톤 구조는 다음을 보장하기 위한 설계입니다.
+
+```text
+모든 콘솔 출력
+  → 같은 LineLogger 객체 사용
+  → 같은 output_mutex_ 사용
+  → 같은 std::cout 보호 정책 적용
+```
+
+---
+
+## 8-5. 복사 / 이동 금지
+
+`LineLogger`는 전역에서 하나의 객체만 존재해야 하므로 복사와 이동을 모두 금지합니다.
+
+```cpp
+LineLogger& operator=(const LineLogger&) = delete;
+LineLogger(const LineLogger&) = delete;
+LineLogger& operator=(LineLogger&&) = delete;
+LineLogger(LineLogger&&) = delete;
+```
+
+이 설계는 의도치 않게 새로운 `LineLogger` 객체가 만들어져
+서로 다른 mutex로 `std::cout`을 보호하는 상황을 막기 위한 것입니다.
+
+---
+
+## 8-6. LogType enum class
+
+`LineLogger`는 로그 타입을 문자열로 직접 받지 않고,
+`LogType` enum class로 제한합니다.
+
+```cpp
+enum class LogType {
+    CONNECTED,
+    RECEIVING,
+    RECV_COMPLETE,
+    SENDING,
+    SEND_COMPLETE,
+    DISCONNECTED,
+    PROTOCOL_ERROR,
+    TRANSPORT_ERROR,
+    RECEIVE_ERROR_PACKET,
+    SEND_ERROR_PACKET
+};
+```
+
+문자열로 로그 타입을 직접 넘기면 다음과 같은 실수로 인한 오타가 생길 수 있습니다.
+
+```cpp
+"RECV_COMPLTE"
+"TRANPORT_ERROR"
+```
+
+`enum class`를 사용하면 사용할 수 있는 로그 타입이 코드 레벨에서 제한됩니다.
+그리고 실제 출력 문자열은 `LogTypeToCstyleString()`에서 중앙 관리합니다.
+
+```cpp
+static const char* LogTypeToCstyleString(LogType l);
+```
+
+따라서 출력 이름을 바꾸고 싶다면 변환 함수만 수정하면 됩니다.
+
+---
+
+## 8-7. WriteLog()
+
+```cpp
+template <typename... Args>
 void WriteLog(Args&&... args);
 ```
 
-WriteLog()는 전달받은 인자들을
-ostringstream로 하나의 문자열로 조립한 뒤 출력합니다.
-
-사용 예시:
+`WriteLog()`는 전달받은 인자들을 `std::ostringstream`로 먼저 하나의 문자열로 조립합니다.
 
 ```cpp
-SessionID session_id = 3
+std::ostringstream oss;
+(oss << ... << std::forward<Args>(args));
+oss << '
+';
+```
 
-logger.WriteLog(
+그 다음 실제 출력 구간만 mutex로 보호합니다.
+
+```cpp
+std::lock_guard<std::mutex> lock(output_mutex_);
+std::cout << oss.str();
+```
+
+이 함수의 설계 의도는 다음입니다.
+
+```text
+출력할 값들을 먼저 하나의 문자열로 완성하고,
+std::cout에는 완성된 문자열 하나만 전달한다.
+```
+
+---
+
+## 8-8. 사용 편의성
+
+`WriteLog()`는 가변 인자 템플릿과 Fold Expression을 사용합니다.
+
+따라서 기존 `std::cout`과 비슷한 감각으로 여러 값을 순서대로 넘길 수 있습니다.
+
+기존 방식:
+
+```cpp
+std::cout 
+    << "Client " 
+    << session_id 
+    << " Connected" 
+    << '\n';
+```
+
+`LineLogger` 방식:
+
+```cpp
+LineLogger::GetInstance().WriteLog(
     "Client ",
     session_id,
     " Connected"
 );
 ```
 
+즉, 사용자는 `operator<<`를 반복해서 작성하지 않고,
+출력할 값을 콤마로 나열하기만 하면 됩니다.
+
 ```text
-// 출력
-Client 3 Connected
+값들을 콤마로 나열
+↓
+WriteLog()가 순서대로 문자열 조립
+↓
+LineLogger가 동기화된 출력 수행
 ```
+
+이 설계는 출력 경로를 `LineLogger`로 통일하면서도,
+기존 콘솔 출력 방식과 크게 다르지 않은 사용성을 제공하기 위한 것입니다.
 
 ---
 
-## 8-4. WriteSessionLog()
+## 8-9. 출력 연산 최소화
+
+기존 방식은 하나의 로그를 여러 번의 `operator<<()` 호출로 출력합니다.
 
 ```cpp
-template<typename... Args>
+std::cout << a
+          << b
+          << c
+          << d;
+```
+
+반면 `LineLogger`는 로그를 먼저 하나의 문자열로 조립한 뒤,
+출력 단계에서는 다음 한 번의 스트림 삽입 연산만 수행합니다.
+
+```cpp
+std::cout << oss.str();
+```
+
+이를 통해 다음 효과를 기대합니다.
+
+- 출력 연산 횟수 감소
+- 콘솔 출력 과정 단순화
+- 출력 구간 동기화 범위 축소
+- 로그 조각 사이에 다른 스레드 출력이 끼어들 가능성 감소
+
+정확히 말하면, `oss.str()`은 완성된 `std::string`을 생성하고,
+그 문자열 하나를 `std::cout`에 전달합니다.
+따라서 문서에서는 이를 “완성된 로그 문자열 하나를 한 번의 `operator<<`로 출력한다”라고 표현합니다.
+
+---
+
+## 8-10. 동기화 전략
+
+`LineLogger`는 문자열 생성 과정에는 락을 사용하지 않습니다.
+
+문자열 조립은 각 호출의 지역 객체인 `std::ostringstream`에서 이루어집니다.
+따라서 이 단계는 다른 스레드와 공유되지 않습니다.
+
+반면 `std::cout`은 모든 스레드가 공유하는 공유 출력 자원이므로,
+실제 출력 시점만 `std::mutex`로 보호합니다.
+
+```text
+문자열 조립
+↓
+mutex 획득
+↓
+std::cout << 완성된 문자열
+↓
+mutex 해제
+```
+
+이 구조의 목표는 다음입니다.
+
+- 로그 단위 일관성 유지
+- `std::cout` 보호 mutex 단일화
+- lock 점유 시간 최소화
+- 멀티스레드 환경에서 로그 가독성 확보
+
+---
+
+## 8-11. WriteSessionLog()
+
+```cpp
+template <typename... Args>
 void WriteSessionLog(
-    SessionID sessionId,
+    uint64_t sessionId,
     const std::string& ipaddr,
     uint16_t port,
-    const std::string& logType,
+    LogType logType,
     Args&&... args
 );
 ```
 
-`ClientSession` 관련 로그를 위한 편의 함수입니다.
+`WriteSessionLog()`는 `ClientSession` 관련 로그를 위한 편의 함수입니다.
 
-다음과 같은 요소들을 입력받아 정해진 형식으로 출력합니다.
+세션 로그는 다음 요소들을 포함합니다.
+
 - `SessionID`
-- `IP`
-- `Port`
+- 클라이언트 IP
+- 클라이언트 Port
 - `LogType`
-- `message`
+- 메시지 본문
 
-예상 출력:
+예상 출력 형식은 다음과 같습니다.
 
 ```text
-[SessionID 3][127.0.0.1:53021][RECV] Hello
+[SessionID 3][127.0.0.1:53021][RECV_COMPLETE] payload received
 ```
 
----
+이 형식은 멀티클라이언트 환경에서 다음 정보를 로그만 보고 추적하기 위한 것입니다.
 
-## 8-5. 동기화 전략
-
-LineLogger는 문자열 생성 과정에는 락을 사용하지 않습니다.
-
-```cpp
-std::ostringstream oss;
+```text
+어떤 세션이
+어떤 주소에서
+어떤 동작을 했는지
 ```
 
-를 통해 스레드 로컬 영역에서 문자열을 완성한 뒤,
+## 8-12. 프로젝트 내 역할
 
-실제 출력 시점에만 락을 획득합니다.
+프로젝트의 콘솔 출력은 가능한 한 모두 `LineLogger`를 통해 수행합니다.
 
-```cpp
-lock
-↓
-std::cout << 완성된 문자열
-↓
-unlock
-```
-
-이를 통해
-
-* 로그 단위 원자성 확보
-* 락 경합 최소화
-
-를 목표로 합니다.
-
----
-
-## 8-6. 프로젝트 내 역할
-
-프로젝트의 콘솔 출력은
-가능한 한 모두 `LineLogger`를 통해 수행합니다.
-
-이를 통해
+이를 통해 다음을 한 위치에서 관리할 수 있습니다.
 
 - 출력 형식 통일
-- 로그 정책 중앙 관리
+- 출력 정책 중앙 관리
+- 로그 타입 제한
+- 출력 동기화 정책 통일
 - 추후 파일 로깅 확장
-- 로그 레벨 추가
+- 추후 로그 레벨 추가
+- 추후 타임스탬프 / thread id 출력 추가
 
-등의 기능을 한 위치에서 관리할 수 있도록 합니다.
+현재 `LineLogger` 라이브러리는 구현 완료 상태이며,
+다음 단계에서는 기존 `std::cout` 기반 출력들을 `LineLogger` 기반으로 교체하는 작업이 필요합니다.
 
 ---
 

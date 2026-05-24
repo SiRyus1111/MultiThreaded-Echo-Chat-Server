@@ -119,6 +119,34 @@ SERVER_NOTICE
 ERROR_MESSAGE
 ```
 
+
+
+### PacketType과 LogType의 구분
+
+`PacketType`은 네트워크로 송수신되는 패킷의 의미를 나타냅니다.
+즉, 실제 `PacketHeader::type` 필드와 연결되는 애플리케이션 레벨 프로토콜 값입니다.
+
+반면 `LineLogger::LogType`은 콘솔 로그의 종류를 나타내기 위한 로깅 전용 타입입니다.
+
+```text
+PacketType
+  → 네트워크 패킷의 의미
+  → PacketHeader::type과 연결됨
+  → 송신 / 수신 데이터에 포함됨
+
+LineLogger::LogType
+  → 서버 내부 로그 출력의 의미
+  → 콘솔 출력 형식에 사용됨
+  → 네트워크 패킷에는 포함되지 않음
+```
+
+예를 들어 `PacketType::HEADER_ERROR`는 실제 에러 패킷을 나타내는 프로토콜 값이고,
+`LineLogger::LogType::PROTOCOL_ERROR`는 서버가 해당 상황을 로그로 기록하기 위한 출력 타입입니다.
+
+따라서 두 enum class는 목적이 다릅니다.
+`PacketType`은 프로토콜 문맥에서 관리하고,
+`LogType`은 로깅 문맥에서 관리합니다.
+
 ### length
 
 `length`는 payload 길이를 나타냅니다.

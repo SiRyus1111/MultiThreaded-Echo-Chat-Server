@@ -93,11 +93,18 @@
 
 ### Logging
 
-- LineLogger 공용 로깅 라이브러리 구현
+- `LineLogger` 공용 로깅 라이브러리 구현
+- 싱글톤 패턴 기반 전역 단일 로거 구조 적용
+- 전역 단일 `output_mutex_`로 `std::cout` 보호 정책 통일
+- `LogType` enum class 기반 로그 타입 제한 구조 구현
+- `LogTypeToCstyleString()` 기반 로그 타입 문자열 변환 중앙화
 - 가변 인자 기반 로그 생성 구조 구현
+- 기존 `std::cout`과 비슷한 사용성을 위한 `WriteLog(Args&&... args)` 구현
 - 로그 한 줄 단위 출력 구조 구현
+- `std::ostringstream` 기반 로그 문자열 선조립 구조 구현
+- 완성된 로그 문자열을 한 번의 `std::cout << oss.str()` 연산으로 출력하는 구조 구현
 - 출력 구간 최소 범위 mutex 보호 적용
-- SessionID 기반 표준 로그 형식 설계
+- `SessionID` / `IP:Port` / `LogType` 기반 표준 세션 로그 형식 설계
 
 ---
 
@@ -107,10 +114,15 @@
 
 ### Logging (미구현)
 
-- 기존 std::cout 출력 제거
-- ClientSession 로그의 LineLogger 적용
-- ClientManager 로그의 LineLogger 적용
-- 서버 전역 로그의 LineLogger 적용
+- 기존 `std::cout` 출력 제거
+- `ClientSession` 로그의 `LineLogger` 적용
+- `ClientManager` 로그의 `LineLogger` 적용
+- 서버 전역 로그의 `LineLogger` 적용
+- 연결 성공 로그 추가
+- 연결 종료 로그 추가
+- 수신 / 송신 완료 로그 위치 확정
+- transport error / protocol error / peer error 로그 점검
+- `LogType` 목록이 실제 로그 정책을 충분히 표현하는지 검증
 
 ### Others
 
@@ -172,22 +184,55 @@ ClientSession::RemoveThisClient()
 - `clients[id] = client` 대신 `emplace()`를 사용할지 검토
 - `unordered_map` 기반 broadcast snapshot 생성 방식 정리
 
-### 4-2. 로그 출력 개선
+### 4-2. LineLogger 프로젝트 적용
 
-현재 `ClientSession`은 생성 시점에 `ClientAddrStr`을 저장합니다.
-이를 기반으로 다음 단계에서는 로그 형식을 정리합니다.
+현재 `LineLogger` 라이브러리는 구현되었지만,
+프로젝트 전체의 기존 콘솔 출력이 아직 모두 `LineLogger` 기반으로 교체된 것은 아닙니다.
 
-예상 형식:
+현재 구현된 `LineLogger`의 핵심 구조는 다음과 같습니다.
 
 ```text
-[Session ?][127.0.0.1:53021][RecvPacket] header received
-[Session ?][127.0.0.1:53021][RecvPacket] payload received
-[Session ?][127.0.0.1:53021][SendPacket] packet sent
-[Session ?][127.0.0.1:53021][Close] peer exit
+LineLogger::GetInstance()
+  → 전역 단일 LineLogger 객체 반환
+  → 모든 콘솔 출력이 동일한 output_mutex_ 공유
 ```
 
-`SessionID`가 도입되면 로그에 `SessionID`도 함께 출력하여
-멀티클라이언트 상황에서 어떤 세션의 로그인지 쉽게 구분할 수 있게 합니다.
+또한 로그 타입은 문자열이 아니라 `LogType` enum class로 제한합니다.
+
+```cpp
+LineLogger::LogType::CONNECTED
+LineLogger::LogType::RECEIVING
+LineLogger::LogType::RECV_COMPLETE
+LineLogger::LogType::SENDING
+LineLogger::LogType::SEND_COMPLETE
+LineLogger::LogType::DISCONNECTED
+LineLogger::LogType::PROTOCOL_ERROR
+LineLogger::LogType::TRANSPORT_ERROR
+```
+
+단기 목표는 다음입니다.
+
+- 기존 `std::cout` 출력 지점 검색
+- 서버 전역 로그를 `LineLogger::GetInstance().WriteLog()`로 교체
+- 세션 관련 로그를 `WriteSessionLog()`로 교체
+- 연결 성공 시 `CONNECTED` 로그 추가
+- 수신 시작 / 수신 완료 로그 위치 정리
+- 송신 시작 / 송신 완료 로그 위치 정리
+- 정상 종료 시 `DISCONNECTED` 로그 추가
+- protocol error / transport error / peer error 로그 정리
+- 모든 콘솔 출력이 하나의 `LineLogger` 객체와 하나의 mutex를 공유하도록 통일
+
+예상 세션 로그 형식은 다음과 같습니다.
+
+```text
+[SessionID 3][127.0.0.1:53021][CONNECTED] client connected
+[SessionID 3][127.0.0.1:53021][RECV_COMPLETE] payload received
+[SessionID 3][127.0.0.1:53021][SEND_COMPLETE] payload sent
+[SessionID 3][127.0.0.1:53021][DISCONNECTED] peer disconnected
+```
+
+이 작업이 완료되면 README와 설계 문서에는 “LineLogger 라이브러리 구현 완료”가 아니라
+“프로젝트 콘솔 출력의 LineLogger 통합 완료”로 상태를 갱신할 수 있습니다.
 
 ---
 

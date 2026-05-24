@@ -61,15 +61,21 @@
 - `TransportExceptionHandling()`을 통해 통신 종료 / 예외 후처리 흐름 정리
 - `SessionID` 1차 도입
 - `LineLogger` 공용 로깅 라이브러리 구현
+- 싱글톤 패턴 기반 전역 단일 로거 구조 적용
+- 모든 콘솔 출력이 동일한 `std::mutex`를 공유하도록 설계
+- `LogType` enum class 기반 로그 타입 제한 구조 구현
 - 가변 인자 템플릿(Fold Expression) 기반 로그 조립 기능 구현
 - 로그 한 줄 단위 출력 구조 구현
+- 완성된 로그 문자열을 한 번의 `std::cout << oss.str()` 연산으로 출력하는 구조 구현
 - 출력 구간만 `std::mutex`로 보호하는 최소 범위 동기화 구조 적용
 - `SessionID` / `IP:Port` / `LogType` 기반 표준 로그 형식 설계
 
 ### 구현 예정
 
-- LineLogger를 ClientSession / ClientManager / Server 전역 로그에 적용
-- SessionID 기반 표준 로그 형식 전면 적용
+- 기존 `std::cout` 기반 콘솔 출력 제거
+- `LineLogger`를 `ClientSession` / `ClientManager` / `Server` 전역 로그에 적용
+- 연결 / 수신 / 송신 / 연결 종료 / 에러 상황 로그 보강
+- `SessionID` 기반 표준 로그 형식 전면 적용
 - ClientSession별 `send_mutex`
 - `ClientManager::Broadcast()`
 - broadcast 시 clients snapshot 복사 구조
@@ -158,6 +164,7 @@ MultiThreaded Echo-Chat Server
 | `Common.h` | 공통 오류 처리 함수 |
 | `NetCommon.h` | 패킷 구조, `NetState`, `send_all()`, `recv_all()` |
 | `socketRAII.h` | Winsock2 socket 자원 관리 RAII 객체 |
+| `LineLogger.h` | Logging을 전담하는 싱글톤 객체 |
 
 ---
 
@@ -246,76 +253,88 @@ ClientSession의 send_mutex
 
 ## 8. Logging System 요약 (`LineLogger`)
 
-멀티클라이언트 / 멀티스레드 서버에서는 여러 스레드가 동시에 로그를 출력할 수 있습니다.
+멀티클라이언트 / 멀티스레드 서버에서는 여러 스레드가 동시에 콘솔에 로그를 출력할 수 있습니다.
+기존의 `std::cout << a << b << c;` 방식은 하나의 로그가 여러 번의 출력 연산으로 나뉘기 때문에,
+다른 스레드의 출력이 중간에 끼어들면 로그 한 줄의 의미가 깨질 수 있습니다.
 
-기존의
+이를 줄이기 위해 프로젝트는 공용 로깅 컴포넌트인 `LineLogger`를 사용합니다.
 
-```cpp
-// 예시
-std::cout << a
-          << b
-          << c;
-```
-
-형태는 하나의 로그가 여러 번의 출력 연산으로 나뉘어 수행되므로,
-다른 스레드의 로그가 중간에 끼어들어
-한 줄의 의미가 깨질 수 있습니다.
-
-이를 줄이기 위해 프로젝트는 공용 로깅 라이브러리인 `LineLogger`를 사용합니다.
-
-설계 목표는 다음과 같습니다.
+핵심 목표는 다음입니다.
 
 ```text
-로그 한 줄을 하나의 의미 단위로 취급한다.
+프로젝트의 모든 콘솔 출력 경로를 LineLogger로 단일화하고,
+하나의 mutex로 std::cout을 보호하며,
+완성된 로그 문자열 하나를 한 번의 출력 연산으로 출력한다.
 ```
+
+### 설계 의도
+
+- 모든 콘솔 출력을 `LineLogger`를 통해 수행하여 출력 경로를 단일화한다.
+- 싱글톤 패턴을 사용해 전역에서 하나의 `LineLogger` 객체만 사용한다.
+- 모든 로그 출력이 동일한 `output_mutex_`를 공유하도록 한다.
+- 로그 한 줄을 하나의 의미 단위로 취급한다.
+- `std::ostringstream`로 로그 문자열을 먼저 완성한 뒤 출력한다.
+- 완성된 문자열 하나를 `std::cout << oss.str();` 형태로 한 번에 출력한다.
+- 문자열 조립은 lock 밖에서 수행하고, 실제 출력 구간만 lock으로 보호한다.
+- `LogType` enum class를 통해 사용할 수 있는 로그 타입을 제한한다.
+- `WriteLog()`가 가변 인자 템플릿을 받도록 하여 기존 `std::cout`과 비슷한 감각으로 사용할 수 있게 한다.
 
 ### 동작 방식
 
 ```text
-로그 조립
+로그 인자 전달
 ↓
-문자열 완성
+std::ostringstream로 문자열 조립
 ↓
-출력 시 mutex 획득
+mutex 획득
 ↓
-한 번에 출력
+std::cout << 완성된 문자열
 ↓
 mutex 해제
 ```
 
-로그 문자열 생성은 각 스레드가 독립적으로 수행하며,
-공유 자원인 `std::cout`에 접근하는 구간만 보호합니다.
-
-이를 통해
+이 구조는 다음 효과를 목표로 합니다.
 
 - 로그 단위 일관성 유지
-- 락 점유 시간 최소화
-- 멀티스레드 환경에서의 로그 가독성 향상
-
-을 목표로 합니다.
+- 출력 연산 횟수 감소
+- 콘솔 출력 구간 단순화
+- `std::cout` 보호 mutex 단일화
+- lock 점유 시간 최소화
+- 멀티스레드 환경에서 로그 가독성 향상
 
 ### 사용 예시
 
 ```cpp
-logger.WriteLog(
-    "Client ",
-    session_id,
-    " Connected"
+LineLogger::GetInstance().WriteLog(
+    "Server started on port ",
+    SERVER_PORT
 );
 ```
 
-세션 관련 로그는 다음과 같은 형식으로 출력할 수 있습니다.
+세션 관련 로그는 다음과 같은 형식으로 출력합니다.
+
+```cpp
+LineLogger::GetInstance().WriteSessionLog(
+    session_id,
+    ClientAddrStr,
+    ntohs(ClientAddr.sin_port),
+    LineLogger::LogType::RECV_COMPLETE,
+    "payload received"
+);
+```
+
+예상 출력 형식은 다음과 같습니다.
 
 ```text
-[SessionID 3][127.0.0.1:53021][RECV] Hello
+[SessionID 3][127.0.0.1:53021][RECV_COMPLETE] payload received
 ```
 
 현재 `LineLogger` 라이브러리는 구현 완료 상태이며,
-향후 프로젝트 전체의 콘솔 출력을 `LineLogger` 기반으로 통합할 예정입니다.
+다음 단계에서는 기존 `std::cout` 기반 콘솔 출력을 `LineLogger` 기반으로 교체할 예정입니다.
 
 ---
 
-## 8. 사용 환경
+## 9. 사용 환경
 
 - Windows
 - C++
@@ -324,7 +343,7 @@ logger.WriteLog(
 
 ---
 
-## 9. 실행 방법
+## 10. 실행 방법
 
 현재 프로젝트는 기존 Echo Server를 멀티클라이언트 / 멀티스레드 구조로 확장하는 단계입니다.
 
@@ -365,7 +384,7 @@ Client A → Server → Client B
 
 ---
 
-## 10. 향후 계획 요약
+## 11. 향후 계획 요약
 
 단기 목표:
 

@@ -12,6 +12,7 @@
 #include "socketRAII.h" // 기존의 에코 서버의 RAII 객체들
 #include <atomic>
 #include <algorithm>
+#include "LineLogger.h"
 
 #pragma comment(lib, "Ws2_32.lib")
 
@@ -27,7 +28,7 @@ const int HEADER_TYPE_SIZE = 4;
 const int HEADER_LENGTH_SIZE = 4;
 const SessionID INITIAL_SESSION_ID = 0;
 
-const char header_err_msg[] = "[SERVER]헤더의 최댓값 초과됨. 서버에서 연결을 종료합니다.\n";
+const char header_err_msg[] = "The maximum value of the header's length field has been exceeded. The server is terminating the connection.";
 uint32_t host_err_msg_len = static_cast<uint32_t>(strlen(header_err_msg));
 
 class ClientSession;
@@ -67,46 +68,44 @@ public:
 		closing(false), 
 		session_id(id) { // move로 ClientSocket unique_ptr 객체 옮기기, addr 소켓 주소 구조체는 간단한 구조체이므로 단순 복사
 		inet_ntop(AF_INET, &ClientAddr.sin_addr, ClientAddrStr, sizeof(ClientAddrStr));
+
+		LineLogger::GetInstance().WriteSessionLog(session_id, ClientAddrStr, ntohs(ClientAddr.sin_port), LineLogger::LogType::CONNECTED, "Client Connected.");
 	}
 
-	void TransportExceptionHandling() {
+	void TransportExceptionHandling(NetState State) {
 
-		if (ClientState.if_error) {
-			std::cout << "클라이언트와의 통신 과정에서 오류 발생 : ";
+		if (State.if_error) {
 
-			if (ClientState.header_recv) std::cout << "헤더 수신 과정에서 오류 발생\n";
+			if (State.header_recv) LineLogger::GetInstance().WriteSessionLog(session_id, ClientAddrStr, ntohs(ClientAddr.sin_port), LineLogger::LogType::TRANSPORT_ERROR, "Transport Error occured during Header Receiving.");
 
-			else if (ClientState.payload_recv) std::cout << "페이로드 수신 과정에서 오류 발생\n";
+			else if (State.payload_recv) LineLogger::GetInstance().WriteSessionLog(session_id, ClientAddrStr, ntohs(ClientAddr.sin_port), LineLogger::LogType::TRANSPORT_ERROR, "Transport Error occured during Payload Receiving.");
 
-			else if (ClientState.header_send) std::cout << "헤더 송신 과정에서 오류 발생\n";
+			else if (State.header_send) LineLogger::GetInstance().WriteSessionLog(session_id, ClientAddrStr, ntohs(ClientAddr.sin_port), LineLogger::LogType::TRANSPORT_ERROR, "Transport Error occured during Header Sending.");
 
-			else if (ClientState.payload_send) std::cout << "페이로드 송신 과정에서 오류 발생\n";
+			else if (State.payload_send) LineLogger::GetInstance().WriteSessionLog(session_id, ClientAddrStr, ntohs(ClientAddr.sin_port), LineLogger::LogType::TRANSPORT_ERROR, "Transport Error occured during Payload Sending.");
 
 		}
-		else if (ClientState.if_header_error) {
-
-			std::cout << "헤더의 값이 4096을 초과. 페이로드 수신 불가.\n";
+		else if (State.if_header_error) {
 
 			PacketHeader protocol_err_header;
 			protocol_err_header.type = htonl(static_cast<int32_t>(PacketType::HEADER_ERROR));
 			protocol_err_header.length = htonl(host_err_msg_len);
 
-			int header_err_send_res = ClientSock->ClientSockSend(ClientState, (char*)&protocol_err_header, HEADER_SIZE);
-			if (header_err_send_res == SOCKET_ERROR) {
-				std::cout << "헤더 오류 메시지 클라이언트에 전송 실패.\n";
-			}
-			else {
-				int err_send_res = ClientSock->ClientSockSend(ClientState, header_err_msg, host_err_msg_len);
-				if (err_send_res == SOCKET_ERROR) {
-					std::cout << "헤더 오류 메시지 클라이언트에 전송 실패.\n";
-				}
+			LineLogger::GetInstance().WriteSessionLog(session_id, ClientAddrStr, ntohs(ClientAddr.sin_port), LineLogger::LogType::SEND_ERROR_PACKET, "Transport Error occured during Payload Sending.");
+			NetState header_err_send_res = SendPacket(header_err_msg, host_err_msg_len, PacketType::HEADER_ERROR);
+			if (!(!header_err_send_res.if_error && !header_err_send_res.if_peer_exit && !header_err_send_res.if_header_error && !header_err_send_res.if_peer_error)) { // 드 모르간 적용해서 하나라도 false라면 AND 연산을 더이상 하지 않는 것을 이용해서 최적화. 
+				// 이 함수가 호출될 때는 if_header_error 플래그가 true가 될 수 없음. 
+				// send() 할 때도 recv()가 정상적으로 실행된 경우에만 해당 플래그가 true로 바뀔 수 있기 떄문에
+				// 현재 구조에서는 상대의 패킷을 recv() 했을 때만 해당 플래그가 true로 바뀔 수 있음.
+				// 이 함수는 호출될 때에 send() 한 후에 오류가 났을 때 결과를 출력함.
+				TransportExceptionHandling(header_err_send_res); 
 			}
 		}
-		else if (ClientState.if_peer_error) {
-			std::cout << "클라이언트에 보낸 헤더의 오류 수신.\n";
+		else if (State.if_peer_error) {
+			LineLogger::GetInstance().WriteSessionLog(session_id, ClientAddrStr, ntohs(ClientAddr.sin_port), LineLogger::LogType::RECEIVE_ERROR_PACKET, "Received an error packet from a Client.");
 		}
-		else if (ClientState.if_peer_exit) {
-			std::cout << "클라이언트에서 연결을 종료하였습니다.\n";
+		else if (State.if_peer_exit) {
+			LineLogger::GetInstance().WriteSessionLog(session_id, ClientAddrStr, ntohs(ClientAddr.sin_port), LineLogger::LogType::DISCONNECTED, "The client has successfully closed the connection.");
 		}
 
 		RemoveThisClient();
@@ -175,7 +174,7 @@ void ClientSession::Run() {
 			recv_state.if_peer_error ||
 			recv_state.if_peer_exit) {
 			MarkClosing();
-			TransportExceptionHandling();
+			TransportExceptionHandling(recv_state);
 
 			break;
 		}
@@ -187,14 +186,12 @@ void ClientSession::Run() {
 			send_state.if_peer_error ||
 			send_state.if_peer_exit) {
 			MarkClosing();
-			TransportExceptionHandling();
+			TransportExceptionHandling(send_state);
 
 			break;
 		}
 
 	}
-
-	
 
 	return;
 }
@@ -229,6 +226,8 @@ NetState ClientSession::SendPacket(const char* msg, uint32_t len, PacketType typ
 		return ClientState;
 	}
 	ClientState.payload_send = false;
+
+	LineLogger::GetInstance().WriteSessionLog(session_id, ClientAddrStr, ntohs(ClientAddr.sin_port), LineLogger::LogType::SEND_COMPLETE, "Message Sent : ", msg);
 
 	return ClientState;
 }
@@ -273,13 +272,12 @@ NetState ClientSession::RecvPacket(char* buf) {
 
 	buf[recv_host_header.length] = '\0';
 
-	std::cout << "송신한 클라이언트 : IP 주소 = " << ClientAddrStr << " 포트 번호 = " << ntohs(ClientAddr.sin_port) << '\n';
-	std::cout << "받은 총 바이트 수 : " << payload_recv_res + header_recv_res << " 받은 메시지 : " << buf << '\n';
-
 	if (recv_host_header.type == static_cast<int32_t>(PacketType::HEADER_ERROR)) {
 		ClientState.if_peer_error = true;
 		return ClientState;
 	}
+
+	LineLogger::GetInstance().WriteSessionLog(session_id, ClientAddrStr, ntohs(ClientAddr.sin_port), LineLogger::LogType::RECV_COMPLETE, "Message Received : ", buf);
 
 	return ClientState;
 }

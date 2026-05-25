@@ -5,6 +5,7 @@
 #include <ws2tcpip.h>
 #include "Common.h"
 #include <cstdint>
+#include "LineLogger.h"
 
 #pragma comment(lib, "ws2_32.lib")
 
@@ -14,6 +15,11 @@ enum class PacketType : int32_t {
     SAFE = -1
 };
 */
+
+enum class PacketType : int32_t {
+	HEADER_ERROR = 0,
+	SAFE = -1
+};
 
 #pragma pack(push, 1)
 struct PacketHeader {
@@ -60,12 +66,7 @@ inline int send_all(SOCKET sock, NetState& state, const char* msg, int len) {
 
         sent_byte += send_len;
 
-        if (sent_byte != len) {
-            std::cout << "부분적 송신 : " << send_len << '/' << len << "바이트 송신됨.\n";
-        }
     }
-
-    std::cout << "송신 완료 : 총 " << sent_byte << '/' << len << "바이트 송신됨\n";
 
     return sent_byte;
 }
@@ -90,13 +91,7 @@ inline int recv_all(SOCKET sock, NetState& state, char* buf, int len) {
 
         received_byte += recv_len;
 
-        if (received_byte != len) {
-            std::cout << "부분적 수신 : " << recv_len << '/' << len << "바이트 수신됨.\n";
-        }
     }
-
-
-    std::cout << "수신 완료 : 총 " << received_byte << '/' << len << "바이트 수신됨.\n";
 
     return received_byte;
 }

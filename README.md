@@ -69,12 +69,17 @@
 - 완성된 로그 문자열을 한 번의 `std::cout << oss.str()` 연산으로 출력하는 구조 구현
 - 출력 구간만 `std::mutex`로 보호하는 최소 범위 동기화 구조 적용
 - `SessionID` / `IP:Port` / `LogType` 기반 표준 로그 형식 설계
+- `ClientSession` 계층 로그를 `LineLogger` 기반으로 교체
+- `ClientSession` 생성 시 `CONNECTED` 로그 출력
+- `RecvPacket()` 수신 완료 시 `RECV_COMPLETE` 로그 출력
+- `SendPacket()` 송신 완료 시 `SEND_COMPLETE` 로그 출력
+- `TransportExceptionHandling(NetState)`에서 종료 / transport error / peer error / error packet 송신 로그 출력
 
 ### 구현 예정
 
-- 기존 `std::cout` 기반 콘솔 출력 제거
-- `LineLogger`를 `ClientSession` / `ClientManager` / `Server` 전역 로그에 적용
-- 연결 / 수신 / 송신 / 연결 종료 / 에러 상황 로그 보강
+- `ClientManager` 로그의 `LineLogger` 적용
+- `Server` 전역 로그의 `LineLogger` 적용
+- low-level transport 계층 로그 정책 검토
 - `SessionID` 기반 표준 로그 형식 전면 적용
 - ClientSession별 `send_mutex`
 - `ClientManager::Broadcast()`
@@ -330,7 +335,8 @@ LineLogger::GetInstance().WriteSessionLog(
 ```
 
 현재 `LineLogger` 라이브러리는 구현 완료 상태이며,
-다음 단계에서는 기존 `std::cout` 기반 콘솔 출력을 `LineLogger` 기반으로 교체할 예정입니다.
+우선 `ClientSession` 계층의 기존 `std::cout` 기반 콘솔 출력을 `LineLogger` 기반으로 교체하였습니다.
+추후 low-level Transport 계층의 `std::cout` 기반 콘솔 출력도 `LineLogger` 기반으로 고려하고 있습니다.
 
 ---
 

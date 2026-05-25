@@ -108,6 +108,41 @@ HEADER_ERROR
   → 프로토콜 에러 메시지
 ```
 
+### Protocol Error 처리 흐름
+
+현재 구조에서는 Header 검증 실패 시 즉시 연결을 종료하지 않습니다.
+
+예를 들어
+
+- payload length가 0인 경우
+- payload length가 허용 범위(4096)를 초과한 경우
+- 허용되지 않은 PacketType을 받은 경우
+
+에는 protocol error로 판단합니다.
+
+처리 흐름은 다음과 같습니다.
+
+```text
+잘못된 Header 수신
+↓
+if_header_error = true
+↓
+HEADER_ERROR 패킷 송신
+↓
+송신 결과 NetState 획득
+↓
+TransportExceptionHandling(header_err_send_res)
+```
+
+에러 패킷 송신 과정에서도 transport error가 발생할 수 있으므로,
+해당 결과를 다시 TransportExceptionHandling() 예외 처리 함수에 전달합니다.
+
+단, 에러 패킷 송신 결과는
+다시 `if_header_error == true`가 될 수 없으므로
+무한 재귀 구조는 발생하지 않습니다.
+
+### 추후 PacketType 확장
+
 추후 Chat Server 단계에서는 다음과 같은 확장도 가능합니다.
 
 ```text
@@ -118,8 +153,6 @@ NICKNAME_CHANGE
 SERVER_NOTICE
 ERROR_MESSAGE
 ```
-
-
 
 ### PacketType과 LogType의 구분
 

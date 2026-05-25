@@ -189,6 +189,9 @@ Client A → Server → Client B
 - `SendPacket()`으로 패킷 송신, 송신 후 상태(`NetState`) 반환
 - `TransportExceptionHandling()`으로 통신 종료 / 예외 후처리
 - 종료 시 `ClientManager`에 자기 `SessionID` 기반 제거 요청
+- `LineLogger::WriteSessionLog()` 기반 세션 로그 출력
+- `SessionID`, `IP:Port`, `LogType` 기반 표준 로그 기록
+- 연결, 수신 완료, 송신 완료, 종료, 예외 상황 로깅
 - 추후 nickname / 접속 상태 관리
 
 현재 구조는 다음과 같습니다.
@@ -214,7 +217,7 @@ public:
     NetState SendPacket(const char* msg, uint32_t len, PacketType type);
 
     void MarkClosing();
-    void TransportExceptionHandling();
+    void TransportExceptionHandling(Netstate state);
     void RemoveThisClient();
 };
 ```

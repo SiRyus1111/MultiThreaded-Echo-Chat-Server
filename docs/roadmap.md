@@ -114,13 +114,10 @@
 
 ### Logging (미구현)
 
-- 기존 `std::cout` 출력 제거
-- `ClientSession` 로그의 `LineLogger` 적용
 - `ClientManager` 로그의 `LineLogger` 적용
 - 서버 전역 로그의 `LineLogger` 적용
-- 연결 성공 로그 추가
-- 연결 종료 로그 추가
-- 수신 / 송신 완료 로그 위치 확정
+- low-level transport 계층 로그 정책 검토
+- `WriteTransportLog()` 확장 여부 검토
 - transport error / protocol error / peer error 로그 점검
 - `LogType` 목록이 실제 로그 정책을 충분히 표현하는지 검증
 

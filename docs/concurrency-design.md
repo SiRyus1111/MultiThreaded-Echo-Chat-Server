@@ -680,6 +680,48 @@ enum class LogType {
 멀티스레드 환경에서 로그가 섞이는 문제를 줄이는 것을 목표로 합니다.
 
 ---
+
+### 14-7. Logging 계층 분리
+
+현재 프로젝트는 로그 출력 계층을 다음과 같이 구분합니다.
+
+```text
+ClientSession
+  → Session 계층 로그
+
+send_all()
+recv_all()
+  → Transport 계층
+````
+
+현재 구현된 `WriteSessionLog()`는
+`SessionID`, `IP`, `Port`를 알고 있는 `ClientSession` 계층에서 사용합니다.
+
+반면 `send_all()`과 `recv_all()`은
+클라이언트 세션을 직접 알지 못하는 low-level transport 계층입니다.
+
+따라서 현재 구조에서는 transport 계층에서
+`SessionID` 기반 로그를 직접 출력하지 않습니다.
+
+필요하다면 추후
+
+```cpp
+WriteTransportLog(...)
+```
+
+형태의 별도 함수를 추가하여
+
+```text
+[TRANSPORT][SENDING]
+[TRANSPORT][RECEIVING]
+```
+
+형식의 로그를 출력하도록 확장할 수 있습니다.
+
+현재 단계에서는 아직 구현하지 않았으며,
+향후 확장 후보로 남겨둡니다.
+
+---
 ## 15. 아직 남은 정책 결정
 
 Broadcast 단계에서 아직 결정해야 할 정책은 다음과 같습니다.

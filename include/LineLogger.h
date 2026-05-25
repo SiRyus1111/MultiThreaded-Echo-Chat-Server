@@ -14,7 +14,7 @@ private:
 public:
 
     enum class LogType {
-        CONNECTED, // 클라이언트 연결됨(accept() 직후)
+        CONNECTED, // 클라이언트 연결됨(accept() 직후, 실제로는 ClientSession의 생성자에서 출력)
         RECEIVING, // 수신 중(recv_all() 내부에서 recv() 함수를 호출한 직후마다)
         RECV_COMPLETE, // 수신 완료(ClientSession::RecvPacket() 내부 or ClientSocket::ClientSockRecv() 함수 내부)(후자가 더 자연스럽긴 함..)
         SENDING, // 송신 중(send_all() 내부에서 send() 함수를 호출한 직후마다)
@@ -70,9 +70,9 @@ public:
     template <typename... Args>
     void WriteSessionLog(
         uint64_t sessionId, 
-        const std::string& ipaddr, 
+        const char* ipaddr, 
         uint16_t port, 
-        const LogType logType, 
+        LogType logType, 
         Args&&... args) {
     
         WriteLog("[SessionID ", sessionId, "]",

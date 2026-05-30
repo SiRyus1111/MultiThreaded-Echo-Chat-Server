@@ -91,7 +91,7 @@ public:
 			protocol_err_header.type = htonl(static_cast<int32_t>(PacketType::HEADER_ERROR));
 			protocol_err_header.length = htonl(host_err_msg_len);
 
-			LineLogger::GetInstance().WriteSessionLog(session_id, ClientAddrStr, ntohs(ClientAddr.sin_port), LineLogger::LogType::SEND_ERROR_PACKET, "Transport Error occured during Payload Sending.");
+			LineLogger::GetInstance().WriteSessionLog(session_id, ClientAddrStr, ntohs(ClientAddr.sin_port), LineLogger::LogType::SEND_ERROR_PACKET, "Sending an error packet...");
 			NetState header_err_send_res = SendPacket(header_err_msg, host_err_msg_len, PacketType::HEADER_ERROR);
 			if (!(!header_err_send_res.if_error && !header_err_send_res.if_peer_exit && !header_err_send_res.if_header_error && !header_err_send_res.if_peer_error)) { // 드 모르간 적용해서 하나라도 false라면 AND 연산을 더이상 하지 않는 것을 이용해서 최적화. 
 				// 이 함수가 호출될 때는 if_header_error 플래그가 true가 될 수 없음. 
@@ -129,7 +129,7 @@ public:
 	void MarkClosing() {
 		closing.store(true);
 	}
-	
+
 	void RemoveThisClient() {
 		if (auto locked = Manager_wp.lock()) {
 			locked->RemoveClient(session_id);
@@ -159,7 +159,7 @@ void ClientManager::AddClient(std::shared_ptr<ClientSession> client, SessionID i
 void ClientManager::RemoveClient(SessionID id) {
 	// 여기에 clients에서 해당 SessionID의 ClientSession만 지우는 로직의 코드
 	std::lock_guard<std::mutex> lock(clients_mutex);
-	clients.erase(id); 
+	clients.erase(id);
 }
 
 void ClientSession::Run() {
@@ -199,10 +199,21 @@ void ClientSession::Run() {
 // msg는 반드시 BUFFER_SIZE 이내의 크기여야 한다. len은 메시지의 크기를 나타낸다.
 NetState ClientSession::SendPacket(const char* msg, uint32_t len, PacketType type) {
 
+	NetState send_packet_state{};
+
 	// 메시지 길이 검사
-	if (len > PAYLOAD_SIZE) {
+	if (len > PAYLOAD_SIZE || len == 0) {
 		ClientState.if_header_error = true;
-		return ClientState;
+		send_packet_state.if_header_error = true;
+		return send_packet_state;
+	}
+
+	if (type != PacketType::SAFE &&
+		type != PacketType::HEADER_ERROR){
+		ClientState.if_header_error = true;
+		send_packet_state.if_header_error = true;
+
+		return send_packet_state;
 	}
 
 	// 헤더 송신
@@ -211,21 +222,27 @@ NetState ClientSession::SendPacket(const char* msg, uint32_t len, PacketType typ
 	send_net_header.type = htonl(static_cast<int32_t>(type));
 
 	ClientState.header_send = true;
+	send_packet_state.header_send = true;
 	int header_send_res = ClientSock->ClientSockSend(ClientState, (char*)&send_net_header, sizeof(PacketHeader)); // 해당 함수 내에서 transport error나 peer exit는 기록됨
 
 	if (header_send_res == SOCKET_ERROR) {
+		send_packet_state.if_error = true;
 		return ClientState;
 	}
 	ClientState.header_send = false;
+	send_packet_state.header_send = false;
 
 	// 페이로드 송신
 	ClientState.payload_send = true;
+	send_packet_state.payload_send = true;
 	int payload_send_res = ClientSock->ClientSockSend(ClientState, msg, len);
 
 	if (payload_send_res == SOCKET_ERROR) {
+		send_packet_state.if_error = true;
 		return ClientState;
 	}
 	ClientState.payload_send = false;
+	send_packet_state.payload_send = false;
 
 	LineLogger::GetInstance().WriteSessionLog(session_id, ClientAddrStr, ntohs(ClientAddr.sin_port), LineLogger::LogType::SEND_COMPLETE, "Message Sent : ", msg);
 
@@ -235,16 +252,25 @@ NetState ClientSession::SendPacket(const char* msg, uint32_t len, PacketType typ
 // buf는 반드시 BUFFER_SIZE 크기여야 한다.
 NetState ClientSession::RecvPacket(char* buf) {
 
+	NetState recv_packet_state{};
+
 	// 헤더 수신
 	PacketHeader recv_net_header{};
 
 	ClientState.header_recv = true;
+	recv_packet_state.header_recv = true;
 	int header_recv_res = ClientSock->ClientSockRecv(ClientState, (char*)&recv_net_header, sizeof(PacketHeader));
 
-	if (header_recv_res == SOCKET_ERROR || header_recv_res == 0) {
+	if (header_recv_res == SOCKET_ERROR) {
+		recv_packet_state.if_error = true;
 		return ClientState;
 	}
+	if (header_recv_res == 0) {
+		recv_packet_state.if_peer_exit = true;
+		return recv_packet_state;
+	}
 	ClientState.header_recv = false;
+	recv_packet_state.header_recv = false;
 
 	PacketHeader recv_host_header{};
 	recv_host_header.type = ntohl(static_cast<int32_t>(recv_net_header.type));
@@ -252,29 +278,39 @@ NetState ClientSession::RecvPacket(char* buf) {
 
 	if (recv_host_header.length > PAYLOAD_SIZE || recv_host_header.length == 0) { // length == 0이어도 protocol error로 처리
 		ClientState.if_header_error = true;
-		return ClientState;
+		recv_packet_state.if_header_error = true;
+		return recv_packet_state;
 	}
 
 	if (recv_host_header.type != static_cast<int32_t>(PacketType::SAFE) &&
 		recv_host_header.type != static_cast<int32_t>(PacketType::HEADER_ERROR)) {
 		ClientState.if_header_error = true;
+		recv_packet_state.if_header_error = true;
 		return ClientState;
 	}
 
 	// 페이로드 수신
 	ClientState.payload_recv = true;
+	recv_packet_state.payload_recv = true;
 	int payload_recv_res = ClientSock->ClientSockRecv(ClientState, (char*)buf, recv_host_header.length);
 
-	if (payload_recv_res == SOCKET_ERROR || payload_recv_res == 0) {
-		return ClientState;
+	if (payload_recv_res == SOCKET_ERROR) {
+		recv_packet_state.if_error = true;
+		return recv_packet_state;
+	}
+	if (payload_recv_res == 0) {
+		recv_packet_state.if_peer_exit = true;
+		return recv_packet_state;
 	}
 	ClientState.payload_recv = false;
+	recv_packet_state.payload_recv = false;
 
 	buf[recv_host_header.length] = '\0';
 
 	if (recv_host_header.type == static_cast<int32_t>(PacketType::HEADER_ERROR)) {
 		ClientState.if_peer_error = true;
-		return ClientState;
+		recv_packet_state.if_peer_error = true;
+		return recv_packet_state;
 	}
 
 	LineLogger::GetInstance().WriteSessionLog(session_id, ClientAddrStr, ntohs(ClientAddr.sin_port), LineLogger::LogType::RECV_COMPLETE, "Message Received : ", buf);

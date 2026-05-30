@@ -13,7 +13,7 @@
 
 ### Visual Studio에서 쉽게 볼 수 있는 로드맵
 1. SessionID 설계 + 구현 (1차 완료)
-2. 로그 출력 개선
+2. 로그 출력 개선 (완료)
 3. clients 컨테이너 임시 결정 (완료)
 4. std::mutex / std::lock_guard / std::unique_lock / std::atomic 기본 공부
 5. SendPacket / RecvPacket 분리 (완료)

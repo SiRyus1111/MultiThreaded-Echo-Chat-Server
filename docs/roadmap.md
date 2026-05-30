@@ -83,6 +83,9 @@
 - payload length가 `0`이거나 `PAYLOAD_SIZE`를 초과하면 protocol error로 처리
 - `TransportExceptionHandling()`을 통해 통신 오류 / peer exit / protocol error 후처리 흐름 정리
 - `ClientAddrStr`을 통해 클라이언트 IP 문자열을 세션 생성 시점에 저장
+- `SendPacket()` / `RecvPacket()` 각 함수의 지역 `NetState` 객체 (`send_packet_state` / `recv_packet_state`) 도입
+- `ClientState`는 세션 전체 상태, 지역 `NetState`는 해당 함수 호출의 결과 상태로 역할 분리
+- `SendPacket()` / `RecvPacket()`의 반환값을 `send_packet_state` / `recv_packet_state`로 재설정
 
 ### 객체 소유권
 

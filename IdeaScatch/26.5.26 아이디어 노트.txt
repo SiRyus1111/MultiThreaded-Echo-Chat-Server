@@ -1,0 +1,60 @@
+# RoadMap
+
+1. 이산수학 1-7부터 쭉 달려서 1챕터 - 논리와 증명 끝내기(BD)
+2. 닉네임 시스템 설계 및 구현하기(PD)
+3. CS:APP으로 넘길까 아니면 이산수학 2챕터 - 집합, 수열, 행렬 파트로 갈까?(BD)
+4. 그 다음에 동기화 라이브러리 공부, std::mutex / std::atomic 제대로 공부.(PD)
+5. 그 다음 책 데이, 3번이 결정되어야 하기 때문에 아직 미정(BD)
+6. 브로드캐스트 설계 시작, 레이스컨디션 문제 해결. TOCTOU - Time Of Check - Time Of Use 문제.(PD)
+
+# 개시발 좆같은 브로드캐스트 설계..
+
+## 1. 브로드캐스트의 목적.
+
+- 채팅 서버의 핵심 기능.
+- 채팅 서버의 모든 기능들의 설계적 뼈대.
+- 나중에 이 매커니즘을 기반으로 귓속말, 특정 상대로의 데이터 전송 등도 처리될 예정.
+- 그렇기 때문에 확실히 잡아놔야함..
+
+- 송신 정책 - 자신에게는 브로드캐스트 메시지 전송 안함.
+    - 하지만 송신 정책을 자신에게도 전송하는 것으로 바꿀려면 코드를 바로 바꿀 수 있도록 하는 설계 필요.
+
+## 2. 브로드캐스트의 단계
+
+1. ClientSession에서 패킷 RecvPacket() - Run() 함수
+2. manager_wp로 ClientManager::broadcast() 호출 - Run() 함수 
+    - broadcast() 함수가 논블로킹이어야함..
+    - 따로 브로드캐스트 해주는 스레드를 만들고 Manager에서 join? 모르겠다..
+3. broadcast() 함수는 clients를 snapshot으로 복사 후 각각의 ClientSession의 SendPacket() 호출 - Run() 함수와 별개
+    - closing == true 검사는 SendPacket() 내부?
+
+이 정도로 요약될 수 있겠네..
+
+## 3. 필요한 동기화
+
+스냅샷 복사할 때 clients_mutex 잡아야할 듯.
+온전히 해당 상태에서의 clients를 복사하는게 좋을 듯.
+어차피 ClientSession들은 shared_ptr로 생존 보장됨.
+
+각 ClientSession::SendPacket()을 실행할 때의 ClientSession별 send_mutex_를 잡아야함.
+병목 최소화. 패킷 뒤섞임 방지.
+하나의 패킷을 해당 ClientSession에 온전히 전달해야함.
+
+closing == true와 실제 전송 간의 레이스 컨디션..
+이건 시발 모르겠다. TOCTOU 문제..
+그러니까 closing == true 확인 시점과 실제 패킷 전송 시점이 달라서 생기는 문제인데,
+이거는 사실상 브로드캐스트의 최종 보스일 듯..
+SendPacket() 중 발생한 에러를 처리하는 방향으로 하자. 
+해당 에러 외에 SendPacket() 에서 다른 에러가 발생할 경우의 수가 있는가? 명제로 한번 보자..
+
+# 닉네임 기능 설계..
+
+## 1. 닉네임 설정 정책
+
+1. 유저가 닉네임을 입력하면 서버에 PacketType == NicknameAssign 타입의 패킷을 보내며 닉네임 설정을 알린다.
+2. 서버는 해당 패킷(PacketType == NicknameAssign)을 받았으면 ClientSession의 nickname 필드의 값을 해당 패킷의 페이로드의 값으로 갱신한다.
+3. 서버는 클라이언트에 닉네임 설정 완료 패킷을 보낸다.
+4. 만약 어떤 이유로든 실패했다면, 연결의 신뢰성이 보장될 경우 닉네임 설정 실패 패킷(NicknameAssignFail)을 보낸다. 
+    - ($(Current \land (\forall connection (IsReliable(conection)))) \to send(packet)$) 
+
+닉네임이 설정되었다면, 앞으로는 클라이언트에서 서버에서 받은 메시지를 출력할 때 닉네임도 함께 표시한다.

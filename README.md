@@ -74,9 +74,11 @@
 - `RecvPacket()` 수신 완료 시 `RECV_COMPLETE` 로그 출력
 - `SendPacket()` 송신 완료 시 `SEND_COMPLETE` 로그 출력
 - `TransportExceptionHandling(NetState)`에서 종료 / transport error / peer error / error packet 송신 로그 출력
+- `NetState` 구조체 / `PacketType` 구조체 이름 리팩토링
 
 ### 구현 예정
 
+- 클라이언트 리팩토링
 - `ClientManager` 로그의 `LineLogger` 적용
 - `Server` 전역 로그의 `LineLogger` 적용
 - low-level transport 계층 로그 정책 검토
@@ -216,8 +218,9 @@ struct PacketHeader {
 
 ```cpp
 enum class PacketType : int32_t {
-    SAFE = -1,
-    HEADER_ERROR = 0
+    CHAT_MESSAGE = 1,
+    NICKNAME_CHANGE = 2,
+    HEADER_ERROR = 3
 };
 ```
 

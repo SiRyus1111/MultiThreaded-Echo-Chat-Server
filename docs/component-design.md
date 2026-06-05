@@ -66,6 +66,9 @@ docs/component-design.md
 7. 송수신 결과는 bool 하나가 아니라 NetState로 표현한다.
 8. ClientSession의 물리적 생존, ClientSession의 논리적 종료, ClientSession에 대한 ClientManager의 관리 목록 제거를 분리한다.
 9. Logging은 로그의 의미가 훼손되는 것을 막기 위해 std::cout 대신 오직 LineLogger 객체로 처리한다.
+10. 클라이언트의 동작은 ClientApp 하나로 추상화한다.
+11. 사용자 입력 파싱 책임은 InputParser로 분리한다.
+12. InputParser는 파싱 결과만 반환하고, 실제 송신은 담당하지 않는다.
 ```
 
 특히 다음 구분이 중요합니다.
@@ -712,10 +715,10 @@ recv_packet_state
 ```cpp
 NetState recv_state = RecvPacket(buf);
 
-if (recv_state.if_error ||
-    recv_state.if_header_error ||
-    recv_state.if_peer_error ||
-    recv_state.if_peer_exit) {
+if (recv_state.transport_error ||
+    recv_state.protocol_error ||
+    recv_state.peer_protocol_error ||
+    recv_state.peer_closed) {
     MarkClosing();
     TransportExceptionHandling(recv_state);
 
@@ -1265,7 +1268,7 @@ ClientManager::Broadcast(SessionID session, const char* message, int len) {
             continue;
         }
 
-        pSession->SendPacket(message, len, PacketType::SAFE);
+        pSession->SendPacket(message, len, PacketType::CHAT_MESSAGE);
     }
 }
 ```
@@ -1936,8 +1939,9 @@ PacketHeader::type
 
 ```cpp
 enum class PacketType : int32_t {
-    SAFE = -1,
-    HEADER_ERROR = 0
+    CHAT_MESSAGE = 1,
+    NICKNAME_CHANGE = 2,
+    HEADER_ERROR = 3
 };
 ```
 
@@ -1968,9 +1972,121 @@ send_net_header.type = htonl(static_cast<int32_t>(type));
 
 ---
 
-# 12. 추후 확장 지점
+# 12. ClientApp
 
-## 12-1. send_mutex
+## 12-1. 역할
+
+`ClientApp`은 클라이언트 측의 최상위 객체입니다.
+
+서버의 `ClientSession`이 하나의 클라이언트 연결에 대한 socket, 상태, 송수신 흐름을 캡슐화하듯,
+`ClientApp`은 클라이언트 자신의 socket, 상태, 통신 흐름을 캡슐화합니다.
+
+```text
+ClientApp
+  → 해당 클라이언트의 자원과 동작을 모아놓은 객체
+
+InputParser
+  → 입력을 파싱해서 ParsedInput을 반환하는 객체
+
+ParsedInput
+  → 파싱된 입력, 즉 해당 입력으로 처리해야 하는 작업을 나타내는 객체
+```
+
+---
+
+## 12-2. 소유 관계
+
+```cpp
+class ClientApp {
+private:
+    ConnectSocket sock_;  // 서버와 TCP 연결로 통신하는 소켓
+    NetState state_;      // 클라이언트 전체 상태 (생애주기 추적용)
+    Nickname nick_;       // 추후 닉네임 시스템 연동 시 사용
+};
+```
+
+`ConnectSocket`은 복사가 불가능한 RAII 객체이므로,
+생성자에서 `std::move()`로 소유권을 받습니다.
+
+```text
+ClientApp
+  └── ConnectSocket sock_
+        └── SOCKET
+```
+
+`state_`는 `ClientSession`의 `ClientState`와 동일한 역할입니다.
+
+```text
+state_      → ClientApp 전체 누적 통신 상태
+send_state  → 이번 SendPacket() 호출의 결과만
+recv_state  → 이번 RecvPacket() 호출의 결과만
+```
+
+이 상태 기록 정책은 `ClientSession::SendPacket()` / `ClientSession::RecvPacket()`과 동일합니다.
+
+---
+
+## 12-3. Run()
+
+`Run()`은 클라이언트의 고수준 실행 루프를 담당합니다.
+
+```text
+while(true)
+  ├── 사용자 입력 받기
+  ├── InputParser::Parse() → ParsedInput
+  ├── valid == false → 에러 출력 → continue
+  ├── quit == true  → 루프 종료
+  ├── length 범위 초과 → 에러 출력 → continue
+  ├── SendPacket(payload, length, type)
+  ├── 송신 상태 확인 → 에러 시 루프 종료
+  ├── RecvPacket(buf)
+  ├── 수신 상태 확인 → 에러 시 루프 종료
+  └── 수신 메시지 출력
+```
+
+`Run()`은 입력 파싱의 세부 절차를 직접 알 필요가 없습니다.
+`InputParser::Parse()`가 반환한 `ParsedInput`을 보고
+어떤 패킷을 보낼지, 루프를 계속할지 결정합니다.
+
+## 12-4. InputParser / ParsedInput
+
+### InputParser
+
+`InputParser`는 사용자 입력을 받아 "이 입력으로 무엇을 해야 하는가"만 판단합니다.
+실제 송신은 전혀 관여하지 않습니다.
+
+상태를 가질 필요가 없으므로 `Parse()`를 `static` 함수로 구현합니다.
+
+```cpp
+class InputParser {
+public:
+    static ParsedInput Parse(std::string& input);
+};
+```
+
+### ParsedInput
+
+`ParsedInput`은 `Parse()`의 결과를 담아 송신 로직에 전달하는 데이터 전달 객체입니다.
+
+```cpp
+struct ParsedInput {
+    PacketType type;
+    uint32_t length;
+    std::string payload;
+
+    bool quit = false;
+    bool valid = true;
+};
+```
+
+`quit`와 `valid`는 `type`보다 먼저 검사합니다.
+`valid == false`이거나 `quit == true`인 경우 `type`과 `payload`는 의미가 없습니다.
+
+---
+
+# 13. 추후 확장 지점
+
+## 13-1. send_mutex
 
 추후 Broadcast Chat Server 단계에서는 여러 thread가
 같은 `ClientSession`에 대해 `SendPacket()`을 호출할 수 있습니다.
@@ -1995,7 +2111,7 @@ send_mutex
 
 ---
 
-## 12-2. Broadcast()
+## 13-2. Broadcast()
 
 `Broadcast()`는 Chat Server 확장의 핵심 함수입니다.
 
@@ -2012,7 +2128,7 @@ send_mutex
 
 ---
 
-# 13. 정리
+# 14. 정리
 
 현재 컴포넌트 설계의 핵심은 다음과 같습니다.
 
@@ -2040,6 +2156,16 @@ closing
 
 RemoveClient()
   → ClientManager의 관리 목록에서 세션을 제거한다.
+
+ClientApp
+  → 클라이언트의 자원과 동작을 캡슐화한다.
+
+InputParser
+  → 사용자 입력을 파싱하고 ParsedInput을 반환한다.
+  → 실제 송신은 담당하지 않는다.
+
+ParsedInput
+  → 파싱 결과를 담아 송신 로직에 전달한다.
 ```
 
 특히 `RecvPacket()`과 `SendPacket()`이 `NetState`를 반환하는 이유는

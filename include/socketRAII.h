@@ -133,6 +133,11 @@ public:
     ConnectSocket(const ConnectSocket& s) = delete;
     ConnectSocket& operator=(const ConnectSocket&) = delete;
 
+    // 이동 생성자
+    ConnectSocket(ConnectSocket&& other) noexcept : connect_sock(other.connect_sock) { // noexcept = 이 함수는 예외를 발생시키지 않는다고 컴파일러에게 알려주기. 그래서 이동 최적화.
+        other.connect_sock = INVALID_SOCKET;
+    }
+
     void ConnectSockConnect(sockaddr_in* addr) {
         if (connect(connect_sock, (sockaddr*)addr, sizeof(*addr)) == SOCKET_ERROR) {
             err_display("connect()");

@@ -109,6 +109,25 @@
 - 출력 구간 최소 범위 mutex 보호 적용
 - `SessionID` / `IP:Port` / `LogType` 기반 표준 세션 로그 형식 설계
 
+### PacketType 리팩토링
+
+- `PacketType::SAFE`를 `PacketType::CHAT_MESSAGE`로 변경
+- `PacketType::NICKNAME_CHANGE` 추가
+- `PacketType` 값 재정의 (`CHAT_MESSAGE = 1`, `NICKNAME_CHANGE = 2`, `HEADER_ERROR = 3`)
+- 서버 / 클라이언트 코드 전체에 적용 완료
+
+### 클라이언트 리팩토링
+
+- `ParsedInput` 구조체 구현
+- `InputParser` 클래스 및 `static Parse()` 함수 구현
+- `/nick`, `/quit`, 일반 메시지, 유효하지 않은 명령어 파싱 처리
+- `ClientApp` 클래스 구현 (`ConnectSocket` 캡슐화, `state_`, `nick_` 소유)
+- `ClientApp::SendPacket()` 구현 (`ClientSession::SendPacket()`과 동일한 상태 기록 정책 적용)
+- `ClientApp::RecvPacket()` 구현 (`ClientSession::RecvPacket()`과 동일한 상태 기록 정책 적용)
+- `ClientApp::Run()` 구현 (입력 → 파싱 → 송신 → 수신 → 출력 루프)
+- `main()`에서 `ClientApp` 기반 구조로 전환
+- 클라이언트에 `LineLogger::WriteLog()` 1차 적용
+
 ---
 
 ## 3. 현재 기준 미구현
@@ -123,6 +142,12 @@
 - `WriteTransportLog()` 확장 여부 검토
 - transport error / protocol error / peer error 로그 점검
 - `LogType` 목록이 실제 로그 정책을 충분히 표현하는지 검증
+
+### 클라이언트 (미구현)
+
+- `LineLogger` 클라이언트 전용 인터페이스 (`\n` 없는 프롬프트 출력용 함수)
+- `ClientApp::Run()` 종료 후 에러 처리 블록의 `std::cout` → `LineLogger` 교체
+- `ClientApp`에 닉네임 시스템 연동
 
 ### Others
 
@@ -320,6 +345,12 @@ Client A → Server → Client B
 
 ### 5-2. nickname 도입
 
+현재 진행 상태:
+
+- 클라이언트에서 `/nick` 명령어 파싱 구현 완료 (`InputParser`)
+- `PacketType::NICKNAME_CHANGE` 추가 완료
+- 서버 측 `ClientSession`의 닉네임 처리는 미구현
+
 채팅 서버로 확장하면 클라이언트 표시 이름이 필요합니다.
 
 예상 추가 필드:
@@ -341,6 +372,11 @@ private:
 ---
 
 ### 5-3. message type 확장
+
+현재 진행 상태:
+
+- `CHAT_MESSAGE`, `NICKNAME_CHANGE` 확정 및 구현 완료
+- `JOIN`, `LEAVE`, `SERVER_NOTICE` 등은 추후 확장 예정
 
 현재 `PacketHeader.type`은 일반 메시지 / 에러 메시지 구분에 사용됩니다.
 
@@ -476,13 +512,11 @@ docs/original-design-note.md
 현재 기준 우선순위는 다음과 같습니다.
 
 ```text
-1. Echo Server 멀티클라이언트 구조 안정화
-2. SessionID 도입
-3. 로그 출력 형식 개선
-4. send_mutex 추가
-5. Broadcast 구현
-6. nickname / message type 확장
-7. Chat Server로 확장
+1. LineLogger 클라이언트 전용 인터페이스 구현
+2. 서버 ClientSession 닉네임 시스템 구현
+3. send_mutex 추가
+4. Broadcast 구현
+5. Chat Server로 확장
 ```
 
 즉, 지금 당장 중요한 것은 화려한 채팅 기능이 아니라,

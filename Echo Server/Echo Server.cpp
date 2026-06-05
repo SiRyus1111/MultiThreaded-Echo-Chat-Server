@@ -74,7 +74,7 @@ public:
 
 	void TransportExceptionHandling(NetState State) {
 
-		if (State.if_error) {
+		if (State.transport_error) {
 
 			if (State.header_recv) LineLogger::GetInstance().WriteSessionLog(session_id, ClientAddrStr, ntohs(ClientAddr.sin_port), LineLogger::LogType::TRANSPORT_ERROR, "Transport Error occured during Header Receiving.");
 
@@ -85,7 +85,7 @@ public:
 			else if (State.payload_send) LineLogger::GetInstance().WriteSessionLog(session_id, ClientAddrStr, ntohs(ClientAddr.sin_port), LineLogger::LogType::TRANSPORT_ERROR, "Transport Error occured during Payload Sending.");
 
 		}
-		else if (State.if_header_error) {
+		else if (State.protocol_error) {
 
 			PacketHeader protocol_err_header;
 			protocol_err_header.type = htonl(static_cast<int32_t>(PacketType::HEADER_ERROR));
@@ -93,18 +93,19 @@ public:
 
 			LineLogger::GetInstance().WriteSessionLog(session_id, ClientAddrStr, ntohs(ClientAddr.sin_port), LineLogger::LogType::SEND_ERROR_PACKET, "Sending an error packet...");
 			NetState header_err_send_res = SendPacket(header_err_msg, host_err_msg_len, PacketType::HEADER_ERROR);
-			if (!(!header_err_send_res.if_error && !header_err_send_res.if_peer_exit && !header_err_send_res.if_header_error && !header_err_send_res.if_peer_error)) { // 드 모르간 적용해서 하나라도 false라면 AND 연산을 더이상 하지 않는 것을 이용해서 최적화. 
-				// 이 함수가 호출될 때는 if_header_error 플래그가 true가 될 수 없음. 
+
+			if (!(!header_err_send_res.transport_error && !header_err_send_res.peer_closed && !header_err_send_res.protocol_error && !header_err_send_res.peer_protocol_error)) { // 드 모르간 적용해서 하나라도 false라면 AND 연산을 더이상 하지 않는 것을 이용해서 최적화. 
+				// 이 함수가 호출될 때는 protocol_error 플래그가 true가 될 수 없음. 
 				// send() 할 때도 recv()가 정상적으로 실행된 경우에만 해당 플래그가 true로 바뀔 수 있기 떄문에
 				// 현재 구조에서는 상대의 패킷을 recv() 했을 때만 해당 플래그가 true로 바뀔 수 있음.
 				// 이 함수는 호출될 때에 send() 한 후에 오류가 났을 때 결과를 출력함.
-				TransportExceptionHandling(header_err_send_res); 
+				TransportExceptionHandling(header_err_send_res);
 			}
 		}
-		else if (State.if_peer_error) {
+		else if (State.peer_protocol_error) {
 			LineLogger::GetInstance().WriteSessionLog(session_id, ClientAddrStr, ntohs(ClientAddr.sin_port), LineLogger::LogType::RECEIVE_ERROR_PACKET, "Received an error packet from a Client.");
 		}
-		else if (State.if_peer_exit) {
+		else if (State.peer_closed) {
 			LineLogger::GetInstance().WriteSessionLog(session_id, ClientAddrStr, ntohs(ClientAddr.sin_port), LineLogger::LogType::DISCONNECTED, "The client has successfully closed the connection.");
 		}
 
@@ -169,22 +170,22 @@ void ClientSession::Run() {
 
 		NetState recv_state = RecvPacket(buf);
 
-		if (recv_state.if_error ||
-			recv_state.if_header_error ||
-			recv_state.if_peer_error ||
-			recv_state.if_peer_exit) {
+		if (recv_state.transport_error ||
+			recv_state.protocol_error ||
+			recv_state.peer_protocol_error ||
+			recv_state.peer_closed) {
 			MarkClosing();
 			TransportExceptionHandling(recv_state);
 
 			break;
 		}
 
-		NetState send_state = SendPacket(buf, (uint32_t)strlen(buf), PacketType::SAFE);
+		NetState send_state = SendPacket(buf, (uint32_t)strlen(buf), PacketType::CHAT_MESSAGE);
 
-		if (send_state.if_error ||
-			send_state.if_header_error ||
-			send_state.if_peer_error ||
-			send_state.if_peer_exit) {
+		if (send_state.transport_error ||
+			send_state.protocol_error ||
+			send_state.peer_protocol_error ||
+			send_state.peer_closed) {
 			MarkClosing();
 			TransportExceptionHandling(send_state);
 
@@ -203,15 +204,15 @@ NetState ClientSession::SendPacket(const char* msg, uint32_t len, PacketType typ
 
 	// 메시지 길이 검사
 	if (len > PAYLOAD_SIZE || len == 0) {
-		ClientState.if_header_error = true;
-		send_packet_state.if_header_error = true;
+		ClientState.protocol_error = true;
+		send_packet_state.protocol_error = true;
 		return send_packet_state;
 	}
 
-	if (type != PacketType::SAFE &&
+	if (type != PacketType::CHAT_MESSAGE &&
 		type != PacketType::HEADER_ERROR){
-		ClientState.if_header_error = true;
-		send_packet_state.if_header_error = true;
+		ClientState.protocol_error = true;
+		send_packet_state.protocol_error = true;
 
 		return send_packet_state;
 	}
@@ -226,7 +227,7 @@ NetState ClientSession::SendPacket(const char* msg, uint32_t len, PacketType typ
 	int header_send_res = ClientSock->ClientSockSend(ClientState, (char*)&send_net_header, sizeof(PacketHeader)); // 해당 함수 내에서 transport error나 peer exit는 기록됨
 
 	if (header_send_res == SOCKET_ERROR) {
-		send_packet_state.if_error = true;
+		send_packet_state.transport_error = true;
 		return ClientState;
 	}
 	ClientState.header_send = false;
@@ -238,7 +239,7 @@ NetState ClientSession::SendPacket(const char* msg, uint32_t len, PacketType typ
 	int payload_send_res = ClientSock->ClientSockSend(ClientState, msg, len);
 
 	if (payload_send_res == SOCKET_ERROR) {
-		send_packet_state.if_error = true;
+		send_packet_state.transport_error = true;
 		return ClientState;
 	}
 	ClientState.payload_send = false;
@@ -262,11 +263,11 @@ NetState ClientSession::RecvPacket(char* buf) {
 	int header_recv_res = ClientSock->ClientSockRecv(ClientState, (char*)&recv_net_header, sizeof(PacketHeader));
 
 	if (header_recv_res == SOCKET_ERROR) {
-		recv_packet_state.if_error = true;
+		recv_packet_state.transport_error = true;
 		return ClientState;
 	}
 	if (header_recv_res == 0) {
-		recv_packet_state.if_peer_exit = true;
+		recv_packet_state.peer_closed = true;
 		return recv_packet_state;
 	}
 	ClientState.header_recv = false;
@@ -277,15 +278,15 @@ NetState ClientSession::RecvPacket(char* buf) {
 	recv_host_header.length = ntohl(recv_net_header.length);
 
 	if (recv_host_header.length > PAYLOAD_SIZE || recv_host_header.length == 0) { // length == 0이어도 protocol error로 처리
-		ClientState.if_header_error = true;
-		recv_packet_state.if_header_error = true;
+		ClientState.protocol_error = true;
+		recv_packet_state.protocol_error = true;
 		return recv_packet_state;
 	}
 
-	if (recv_host_header.type != static_cast<int32_t>(PacketType::SAFE) &&
+	if (recv_host_header.type != static_cast<int32_t>(PacketType::CHAT_MESSAGE) &&
 		recv_host_header.type != static_cast<int32_t>(PacketType::HEADER_ERROR)) {
-		ClientState.if_header_error = true;
-		recv_packet_state.if_header_error = true;
+		ClientState.protocol_error = true;
+		recv_packet_state.protocol_error = true;
 		return ClientState;
 	}
 
@@ -295,11 +296,11 @@ NetState ClientSession::RecvPacket(char* buf) {
 	int payload_recv_res = ClientSock->ClientSockRecv(ClientState, (char*)buf, recv_host_header.length);
 
 	if (payload_recv_res == SOCKET_ERROR) {
-		recv_packet_state.if_error = true;
+		recv_packet_state.transport_error = true;
 		return recv_packet_state;
 	}
 	if (payload_recv_res == 0) {
-		recv_packet_state.if_peer_exit = true;
+		recv_packet_state.peer_closed = true;
 		return recv_packet_state;
 	}
 	ClientState.payload_recv = false;
@@ -308,8 +309,8 @@ NetState ClientSession::RecvPacket(char* buf) {
 	buf[recv_host_header.length] = '\0';
 
 	if (recv_host_header.type == static_cast<int32_t>(PacketType::HEADER_ERROR)) {
-		ClientState.if_peer_error = true;
-		recv_packet_state.if_peer_error = true;
+		ClientState.peer_protocol_error = true;
+		recv_packet_state.peer_protocol_error = true;
 		return recv_packet_state;
 	}
 

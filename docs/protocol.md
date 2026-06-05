@@ -59,14 +59,15 @@ struct PacketHeader {
 
 `type`은 패킷 타입을 나타냅니다.
 
-현재는 일반 메시지와 에러 메시지 구분에 사용합니다.
+현재는 일반 메시지와 에러 메시지, 닉네임 변경 메시지 구분을 위해 사용합니다.
 
 현재 코드에서는 패킷 타입의 의미를 표현하기 위해 `PacketType` enum class를 사용합니다.
 
 ```cpp
 enum class PacketType : int32_t {
-    SAFE = -1,
-    HEADER_ERROR = 0
+    CHAT_MESSAGE = 1,
+    NICKNAME_CHANGE = 2,
+    HEADER_ERROR = 3
 };
 ```
 
@@ -92,7 +93,8 @@ send_net_header.type = htonl(static_cast<int32_t>(type));
 ```cpp
 recv_host_header.type = ntohl(recv_net_header.type);
 
-if (recv_host_header.type != static_cast<int32_t>(PacketType::SAFE) &&
+if (recv_host_header.type != static_cast<int32_t>(PacketType::CHAT_MESSAGE) &&
+    recv_host_header.type != static_cast<int32_t>(PacketType::NICKNAME_CHANGE) &&
     recv_host_header.type != static_cast<int32_t>(PacketType::HEADER_ERROR)) {
     // protocol error
 }
@@ -101,8 +103,11 @@ if (recv_host_header.type != static_cast<int32_t>(PacketType::SAFE) &&
 현재 타입:
 
 ```text
-SAFE
-  → 정상 메시지
+CHAT_MESSAGE
+  → 일반 메시지
+
+NICKNAME_CHANGE
+  → 닉네임 변경 메시지
 
 HEADER_ERROR
   → 프로토콜 에러 메시지
@@ -125,7 +130,7 @@ HEADER_ERROR
 ```text
 잘못된 Header 수신
 ↓
-if_header_error = true
+protocol_error = true
 ↓
 HEADER_ERROR 패킷 송신
 ↓
@@ -138,7 +143,7 @@ TransportExceptionHandling(header_err_send_res)
 해당 결과를 다시 TransportExceptionHandling() 예외 처리 함수에 전달합니다.
 
 단, 에러 패킷 송신 결과는
-다시 `if_header_error == true`가 될 수 없으므로
+다시 `protocol_error == true`가 될 수 없으므로
 무한 재귀 구조는 발생하지 않습니다.
 
 ### 추후 PacketType 확장
@@ -146,12 +151,14 @@ TransportExceptionHandling(header_err_send_res)
 추후 Chat Server 단계에서는 다음과 같은 확장도 가능합니다.
 
 ```text
-CHAT_MESSAGE
 JOIN
+  → 입장 알림
+
 LEAVE
-NICKNAME_CHANGE
+  → 퇴장 알림
+
 SERVER_NOTICE
-ERROR_MESSAGE
+  → 서버 공지
 ```
 
 ### PacketType과 LogType의 구분
@@ -450,12 +457,19 @@ struct PacketHeader {
 
 현재 `PacketHeader`의 `type` 필드는 추후 Chat Server 단계에서 확장할 수 있습니다.
 
+현재 확장 결과:
+
+```text
+CHAT_MESSAGE
+  → 일반 채팅 메시지
+
+NICKNAME_CHANGE
+  → 닉네임 변경 메시지
+```
+
 예상 확장 방향:
 
 ```text
-MESSAGE_TYPE_CHAT
-  → 일반 채팅 메시지
-
 MESSAGE_TYPE_JOIN
   → 입장 알림
 
@@ -470,7 +484,7 @@ MESSAGE_TYPE_NICKNAME
 ```
 
 현재 단계에서는 Echo Server 로직을 안정화하는 것이 우선이며,
-message type 확장은 Broadcast Chat 단계에서 진행할 예정입니다.
+message type 확장은 Broadcast Chat 단계에서 본격적으로 진행할 예정입니다.
 
 ---
 

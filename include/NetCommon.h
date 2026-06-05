@@ -12,13 +12,14 @@
 /*
 enum class PacketType : int32_t {
     HEADER_ERROR = 0,
-    SAFE = -1
+    CHAT_MESSAGE = -1
 };
 */
 
 enum class PacketType : int32_t {
-	HEADER_ERROR = 0,
-	SAFE = -1
+	CHAT_MESSAGE = 1,
+    NICKNAME_CHANGE = 2,
+    HEADER_ERROR = 3
 };
 
 #pragma pack(push, 1)
@@ -29,7 +30,7 @@ struct PacketHeader {
 #pragma pack(pop)
 
 const int32_t HEADER_ERROR = 0;
-const int32_t SAFE = -1;
+const int32_t CHAT_MESSAGE = -1;
 
 struct NetState {
     // 진행
@@ -39,17 +40,17 @@ struct NetState {
     bool payload_send = false;
 
     // 예외
-    bool if_error = false;
-    bool if_peer_exit = false;
-    bool if_header_error = false;
-    bool if_peer_error = false;
+    bool transport_error = false;
+    bool peer_closed = false;
+    bool protocol_error = false;
+    bool peer_protocol_error = false;
 };
 
 // 헤더 규칙
 // 첫 4바이트 = int32_t 패킷 타입
 // 다음 4바이트 = uint32_t 페이로드 길이
 // 만약 패킷 타입의 값이 SERVER_HEADER_ERROR(0)이라면 protocol(Application Layer) error.
-// 만약 패킷 타입의 값이 SAFE(-1)이라면 일반적인 메시지.
+// 만약 패킷 타입의 값이 CHAT_MESSAGE(-1)이라면 일반적인 메시지.
 
 inline int send_all(SOCKET sock, NetState& state, const char* msg, int len) {
 
@@ -60,7 +61,7 @@ inline int send_all(SOCKET sock, NetState& state, const char* msg, int len) {
 
         if (send_len == SOCKET_ERROR) {
             err_display("send()");
-            state.if_error = true;
+            state.transport_error = true;
             return SOCKET_ERROR;
         }
 
@@ -81,11 +82,11 @@ inline int recv_all(SOCKET sock, NetState& state, char* buf, int len) {
 
         if (recv_len == SOCKET_ERROR) {
             err_display("recv()");
-            state.if_error = true;
+            state.transport_error = true;
             return SOCKET_ERROR;
         }
         else if (recv_len == 0) {
-            state.if_peer_exit = true;
+            state.peer_closed = true;
             return 0;
         }
 

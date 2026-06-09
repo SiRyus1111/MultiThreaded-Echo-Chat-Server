@@ -136,11 +136,11 @@ HEADER_ERROR 패킷 송신
 ↓
 송신 결과 NetState 획득
 ↓
-TransportExceptionHandling(header_err_send_res)
+HandleTransportException(header_err_send_res)
 ```
 
 에러 패킷 송신 과정에서도 transport error가 발생할 수 있으므로,
-해당 결과를 다시 TransportExceptionHandling() 예외 처리 함수에 전달합니다.
+해당 결과를 다시 HandleTransportException() 예외 처리 함수에 전달합니다.
 
 단, 에러 패킷 송신 결과는
 다시 `protocol_error == true`가 될 수 없으므로
@@ -291,8 +291,15 @@ while 이미 받은 길이 < 전체 길이:
 4. type 검사
 5. payload 길이만큼 payload 수신
 6. 문자열 출력용 null 문자 추가
-7. HEADER_ERROR 패킷이면 peer error로 기록
+7. 수신 결과를 RecvResult로 반환
 ```
+
+`RecvPacket()`은
+수신 과정의 성공/실패를 나타내는 `NetState`와 정상 수신된 패킷의 타입 / 페이로드를 함께 담은 `RecvResult`를 반환합니다.
+
+`HEADER_ERROR` 타입의 패킷은 수신 실패가 아닌 **정상 수신된 에러 알림 패킷**입니다.
+따라서 `RecvPacket()` 내부에서 `NetState`에 기록하지 않고,
+`RecvResult`의 `type` 필드를 통해 호출자에게 전달합니다.
 
 현재 기본 송신 흐름은 `ClientSession::SendPacket()`으로 분리되어 있습니다.
 
@@ -308,13 +315,31 @@ while 이미 받은 길이 < 전체 길이:
 
 ```text
 Run()
-  → RecvPacket()
-  → 상태 확인
-  → SendPacket()
-  → 상태 확인
+  → RecvPacket()        → RecvResult 반환
+  → 수신 상태 확인       → 문제 있으면 HandleTransportException(state)
+  → HandleRecvPacket()  → 패킷 타입별 처리 (echo, 세션 종료 등)
+  → closing 확인        → true이면 루프 종료
 ```
 
-중요한 점은 Header와 Payload가 논리적으로 하나의 패킷이라는 것입니다.
+수신 결과 처리는 두 경로로 분리됩니다.
+
+```text
+RecvResult.state에 문제가 있는 경우
+  → HandleTransportException(state)
+  → transport error / protocol error / peer closed 처리
+
+RecvResult.state가 정상인 경우
+  → HandleRecvPacket(res)
+  → PacketType별 처리
+    CHAT_MESSAGE   → SendPacket() (echo)
+    HEADER_ERROR   → MarkClosing() (정상 수신된 에러 알림 패킷)
+    NICKNAME_CHANGE → 미구현 stub
+```
+
+이 분리를 통해 `HandleTransportException()`은 수신 과정 자체의 실패만 담당하고,
+수신된 패킷의 의미에 따른 처리는 `HandleRecvPacket()`이 담당합니다.
+
+동시성 면에서 중요한 점은 Header와 Payload가 논리적으로 하나의 패킷이라는 것입니다.
 
 따라서 추후 멀티스레드 broadcast 구조에서는
 같은 클라이언트에게 다음과 같은 송신 순서가 발생하면 안 됩니다.
@@ -391,7 +416,11 @@ ClientSock->ClientSockRecv(ClientState, buf, len);
 
 - header의 `length`가 허용 범위를 벗어남
 - 정의되지 않은 `type` 수신
-- explicit `HEADER_ERROR` 패킷 수신
+
+`HEADER_ERROR` 타입의 패킷은 여기에 해당하지 않습니다.
+상대가 `HEADER_ERROR` 타입을 올바른 형식으로 보낸 경우는 **정상 수신된 에러 알림 패킷**이므로,
+`NetState`의 protocol error로 기록하지 않고 `RecvResult.type`을 통해 반환합니다.
+이후 `HandleRecvPacket()`이 해당 타입을 보고 세션 종료 처리를 수행합니다.
 
 ### transport error
 
@@ -475,12 +504,6 @@ MESSAGE_TYPE_JOIN
 
 MESSAGE_TYPE_LEAVE
   → 퇴장 알림
-
-MESSAGE_TYPE_ERROR
-  → 서버 또는 프로토콜 에러
-
-MESSAGE_TYPE_NICKNAME
-  → 닉네임 설정 / 변경
 ```
 
 현재 단계에서는 Echo Server 로직을 안정화하는 것이 우선이며,

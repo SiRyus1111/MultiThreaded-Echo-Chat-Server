@@ -244,6 +244,14 @@ client thread의 종료 여부를 직접 관측할 수 없습니다.
 - transport error
 - peer exit
 - protocol error
+- `HEADER_ERROR` 타입의 패킷 수신 (`HandleRecvPacket()` 내부에서 `MarkClosing()` 호출)
+
+마지막 항목은 수신 자체의 실패가 아니라, **수신된 패킷의 내용에 의한 종료**입니다.
+하지만 "이 세션은 더 이상 정상적인 송수신 대상이 아니다"라는 `closing`의 의미에 부합하므로,
+동일한 플래그와 `MarkClosing()` 함수를 통해 표현합니다.
+
+즉, `closing = true`의 기준은 **"해당 세션을 종료해야 하는 상황인가"** 로 일관되게 유지됩니다.
+트리거가 transport 계층의 실패이든, 수신된 패킷의 의미이든 관계없이 동일한 기준을 적용합니다.
 
 `closing`은 여러 스레드에서 읽고 쓸 수 있으므로 `std::atomic<bool>`을 사용합니다.
 
@@ -302,16 +310,27 @@ RemoveClient()
 전체 종료 흐름은 다음과 같습니다.
 
 ```text
-1. client_thread가 transport error / peer exit / protocol error를 감지한다.
-2. ClientSession::closing을 true로 변경한다.
-3. 이후 ClientManager의 broadcast는 해당 세션을 send 대상에서 제외한다.
-4. client_thread는 Run() 종료 전에 RemoveThisClient()를 호출한다.
-5. RemoveThisClient()는 Manager_wp.lock()으로 ClientManager에 접근한다.
-6. RemoveThisClient()는 자기 자신의 session_id를 넘겨 RemoveClient(session_id)를 호출한다.
-7. ClientManager::RemoveClient(SessionID)가 clients unordered_map에서 해당 key를 제거한다.
-8. Run()이 return되면 client_thread가 들고 있던 shared_ptr도 해제된다.
-9. 마지막 shared_ptr이 사라지면 ClientSession이 소멸한다.
-10. ClientSession이 소유하던 ClientSocket도 소멸하면서 raw SOCKET이 closesocket()으로 정리된다.
+종료 흐름은 두 경로로 발생합니다.
+
+[경로 A] 수신 과정 자체에서 예외 발생 (transport error / peer exit / protocol error)
+1. RecvPacket()이 RecvResult.state에 예외 상태를 기록하여 반환한다.
+2. Run()이 state를 확인하고 MarkClosing() → HandleTransportException(state) 호출 후 break한다.
+
+[경로 B] 정상 수신된 패킷의 내용에 의한 종료 (HEADER_ERROR 수신 등)
+1. RecvPacket()이 type = HEADER_ERROR인 RecvResult를 반환한다.
+2. Run()이 HandleRecvPacket(res)를 호출한다.
+3. HandleRecvPacket() 내부에서 MarkClosing()을 호출한다.
+4. Run()이 HandleRecvPacket() 이후 closing 상태를 확인하고 break한다.
+
+[공통 경로]
+5. 이후 ClientManager의 broadcast는 해당 세션을 send 대상에서 제외한다.
+6. client_thread는 Run() 종료 전에 RemoveThisClient()를 호출한다.
+7. RemoveThisClient()는 Manager_wp.lock()으로 ClientManager에 접근한다.
+8. RemoveThisClient()는 자기 자신의 session_id를 넘겨 RemoveClient(session_id)를 호출한다.
+9. ClientManager::RemoveClient(SessionID)가 clients unordered_map에서 해당 key를 제거한다.
+10. Run()이 return되면 client_thread가 들고 있던 shared_ptr도 해제된다.
+11. 마지막 shared_ptr이 사라지면 ClientSession이 소멸한다.
+12. ClientSession이 소유하던 ClientSocket도 소멸하면서 raw SOCKET이 closesocket()으로 정리된다.
 ```
 
 이 흐름에서 중요한 점은 `closing = true`가 객체 소멸을 의미하지 않는다는 것입니다.

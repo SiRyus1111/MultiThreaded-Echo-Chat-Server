@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #include <iostream>
 #include <utility>
@@ -6,6 +6,7 @@
 #include <stdint.h>
 #include <mutex>
 #include <string>
+#include "NetCommon.h"
 
 class LineLogger{
 private:
@@ -19,11 +20,11 @@ public:
         RECV_COMPLETE, // 수신 완료(ClientSession::RecvPacket() 내부 or ClientSocket::ClientSockRecv() 함수 내부)(후자가 더 자연스럽긴 함..)
         SENDING, // 송신 중(send_all() 내부에서 send() 함수를 호출한 직후마다)
         SEND_COMPLETE, // 송신 완료(ClientSession::SendPacket() 내부 or ClientSocket::ClientSockSend() 함수 내부)(이것도 후자가 더 자연스럽긴 함..)
-        DISCONNECTED, // 정상 종료(TransportExceptionHandling() 함수 내부의 정상 종료 부분에서)
-        PROTOCOL_ERROR, // 사용자 정의 애플리케이션 레벨 프로토콜 에러(이것도 TransportExceptionHandling() 함수 내부의 Protocol Error 처리 부분에서)
-        TRANSPORT_ERROR, // L4 에러, 송수신 중 에러, 즉 SOCKET_ERROR가 반환되었을 때(이것도 TransportExceptionHandling() 함수 내부의 Transport Error 처리 부분에서)
-        RECEIVE_ERROR_PACKET, // header.type == PacketType::HEADER_ERROR인 패킷을 받은 경우(이것도 TransportExceptionHandling() 함수 내부의 Peer Error 처리 부분에서)
-        SEND_ERROR_PACKET // header.type == PacketType::HEADER_ERROR인 패킷을 송신하는 경우(이것도 TransportExceptionHandling() 함수 내부의 Protocol Error 처리 부분에서)
+        DISCONNECTED, // 정상 종료(HandleTransportException() 함수 내부의 정상 종료 부분에서)
+        PROTOCOL_ERROR, // 사용자 정의 애플리케이션 레벨 프로토콜 에러(이것도 HandleTransportException() 함수 내부의 Protocol Error 처리 부분에서)
+        TRANSPORT_ERROR, // L4 에러, 송수신 중 에러, 즉 SOCKET_ERROR가 반환되었을 때(이것도 HandleTransportException() 함수 내부의 Transport Error 처리 부분에서)
+        RECEIVE_ERROR_PACKET, // header.type == PacketType::HEADER_ERROR인 패킷을 받은 경우(이것도 HandleTransportException() 함수 내부의 Peer Error 처리 부분에서)
+        SEND_ERROR_PACKET // header.type == PacketType::HEADER_ERROR인 패킷을 송신하는 경우(이것도 HandleTransportException() 함수 내부의 Protocol Error 처리 부분에서)
     };
 
     static const char* LogTypeToCstyleString(LogType l) {
@@ -63,6 +64,15 @@ public:
         oss << '\n';
 
         std::lock_guard<std::mutex> lock(output_mutex_); // 락을 잡는 시간을 최소화해서 락 경합 최소화 및 데드락 가능성 감소
+        std::cout << oss.str();
+    }
+
+    template <typename... Args>
+    void WriteInputLog(Args&&... args) {
+        std::ostringstream oss;
+        (oss << ... << std::forward<Args>(args));
+        
+        std::lock_guard<std::mutex> lock(output_mutex_);
         std::cout << oss.str();
     }
 

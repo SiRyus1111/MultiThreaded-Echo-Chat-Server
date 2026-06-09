@@ -163,7 +163,7 @@ void client_thread(std::shared_ptr<ClientSession> session) {
 - 해당 클라이언트의 송 / 수신 루프 수행
 - transport error / peer exit / protocol error 감지
 - 종료 상황 발생 시 `closing = true` 설정
-- 종료 후 `TransportExceptionHandling()`을 통해 상태별 후처리 수행
+- 종료 후 `HandleTransportException()`을 통해 상태별 후처리 수행
 - 종료 전 `ClientManager`에 자기 세션 제거 요청
 
 현재 Echo Server 단계에서는 수신한 메시지를 같은 클라이언트에게 다시 돌려보냅니다.
@@ -176,13 +176,14 @@ Client A → Server → Client A
 
 ```text
 Run()
-  ├── RecvPacket()
-  ├── 수신 상태 확인
-  ├── SendPacket()
-  ├── 송신 상태 확인
-  └── transport error / peer exit / protocol error 감지
-        ├── MarkClosing()
-        └── TransportExceptionHandling()
+  ├── RecvPacket()              → RecvResult 반환
+  ├── 수신 상태 확인 (state)
+  │     └── 예외 발생 시 MarkClosing() → HandleTransportException(state)
+  ├── HandleRecvPacket(res)     → 패킷 타입별 처리
+  │     ├── CHAT_MESSAGE        → SendPacket() (echo)
+  │     ├── HEADER_ERROR        → MarkClosing()
+  │     └── NICKNAME_CHANGE     → 미구현 stub
+  └── closing 확인 → true이면 루프 종료
 ```
 
 추후 Chat Server 단계에서는 수신한 메시지를 그대로 echo하지 않고,
@@ -213,9 +214,10 @@ Client A → Server → Client B
 - 클라이언트별 `NetState` 저장
 - 클라이언트별 논리적 종료 상태 `closing` 관리
 - Echo Server 단계의 고수준 실행 흐름 `Run()` 구현
-- `RecvPacket()`으로 패킷 수신, 수신 후 상태(`NetState`) 반환
+- `RecvPacket()`으로 패킷 수신, 수신 후 상태(`RecvResult`) 반환
 - `SendPacket()`으로 패킷 송신, 송신 후 상태(`NetState`) 반환
-- `TransportExceptionHandling()`으로 통신 종료 / 예외 후처리
+- `HandleTransportException()`으로 통신 종료 / 예외 후처리
+- `HandleRecvPacket()`으로 송신한 패킷 타입에 맞는 처리
 - 종료 시 `ClientManager`에 자기 `SessionID` 기반 제거 요청
 - `LineLogger::WriteSessionLog()` 기반 세션 로그 출력
 - `SessionID`, `IP:Port`, `LogType` 기반 표준 로그 기록
@@ -241,11 +243,12 @@ public:
     void AddToManager(std::shared_ptr<ClientManager> manager_sp);
     void Run();
 
-    NetState RecvPacket(char* buf);
+    RecvResult RecvPacket();
     NetState SendPacket(const char* msg, uint32_t len, PacketType type);
 
+    void HandleRecvPacket(const RecvResult& res);
+    void HandleTransportException(NetState state);
     void MarkClosing();
-    void TransportExceptionHandling(Netstate state);
     void RemoveThisClient();
 };
 ```
@@ -282,8 +285,11 @@ RecvPacket()
 SendPacket()
   → PacketHeader + Payload 송신
 
-TransportExceptionHandling()
+HandleTransportException()
   → 오류 / 종료 상태별 후처리
+
+HandleRecvpacket()
+  → 수신한 패킷에 대한 패킷 타입별 처리
 ```
 
 따라서 나중에 Chat Server로 확장할 때는 `Run()`의 메시지 처리 부분을 `Broadcast()` 호출로 바꾸더라도,
@@ -431,7 +437,8 @@ main thread / client_thread / ClientManager
 - `Nickname nick_` 소유 (추후 닉네임 시스템 연동 시 사용)
 - `SendPacket()` / `RecvPacket()`으로 패킷 송수신 추상화
 - `Run()`으로 입력 → 파싱 → 송신 → 수신 → 출력의 고수준 루프 관리
-- 종료 / 에러 상황 후처리
+- `HandleTransportException()`으로종료 / 에러 상황 후처리
+- `HandleRecvPacket()`으로 수신한 패킷 처리
 
 현재 구조는 다음과 같습니다.
 
@@ -441,6 +448,7 @@ private:
     ConnectSocket sock_;
     NetState state_;
     Nickname nick_;
+    std::atomic<bool> closing = false;
 
 public:
     ClientApp(ConnectSocket s);
@@ -448,9 +456,24 @@ public:
     void Run();
 
     NetState SendPacket(const char* msg, uint32_t len, PacketType type);
-    NetState RecvPacket(char* buf);
+    RecvResult RecvPacket();
+
+    void HandleRecvPacket(const RecvResult& res);
+    void HandleTransportException(const NetState& state);
+    void MarkClosing();
 };
 ```
+
+`ClientApp::closing`은 `ClientSession::closing`과 동일한, **논리적 종료 상태**의 의미입니다.
+
+```text
+closing == true
+  → 이 클라이언트 세션은 논리적 종료 상태다
+  → Run()의 while 루프를 종료한다
+```
+
+`HandleRecvPacket()`에서 `HEADER_ERROR` 패킷 수신 시 `MarkClosing()`을 호출하며,
+`Run()`은 `HandleRecvPacket()` 호출 이후 `closing` 상태를 확인하여 루프를 종료합니다.
 
 `ConnectSocket`은 복사할 수 없으므로, 생성자에서 `std::move()`로 소유권을 받습니다.
 

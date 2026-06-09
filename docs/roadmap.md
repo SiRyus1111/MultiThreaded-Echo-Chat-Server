@@ -81,7 +81,7 @@
 - `PacketType` enum class 도입
 - `PacketHeader::type`은 `int32_t` 전송 필드로 유지하고, `PacketType`은 코드 내부 의미 표현용으로 사용
 - payload length가 `0`이거나 `PAYLOAD_SIZE`를 초과하면 protocol error로 처리
-- `TransportExceptionHandling()`을 통해 통신 오류 / peer exit / protocol error 후처리 흐름 정리
+- `HandleTransportException()`을 통해 통신 오류 / peer exit / protocol error 후처리 흐름 정리
 - `ClientAddrStr`을 통해 클라이언트 IP 문자열을 세션 생성 시점에 저장
 - `SendPacket()` / `RecvPacket()` 각 함수의 지역 `NetState` 객체 (`send_packet_state` / `recv_packet_state`) 도입
 - `ClientState`는 세션 전체 상태, 지역 `NetState`는 해당 함수 호출의 결과 상태로 역할 분리
@@ -127,6 +127,18 @@
 - `ClientApp::Run()` 구현 (입력 → 파싱 → 송신 → 수신 → 출력 루프)
 - `main()`에서 `ClientApp` 기반 구조로 전환
 - 클라이언트에 `LineLogger::WriteLog()` 1차 적용
+- `LineLogger::WriteInputLog()` 추가 — 줄바꿈 없는 프롬프트 출력 전용 함수
+- `ClientSession`에 `Nickname` 멤버 추가 및 기본값(`user_{session_id}`) 설정
+
+
+### RecvResult 도입 및 패킷 핸들러 구조 추가
+
+- `RecvResult` 구조체 구현 (서버 / 클라이언트 공통) — `NetState`, `PacketType`, `length`, `payload` 포함
+- `RecvPacket()` 반환값을 `RecvResult`로 변경 — 수신 과정의 성공/실패(`NetState`)와 수신된 패킷의 타입(`PacketType`)을 분리하여 반환
+- `HandleRecvPacket()` 구현 (서버 / 클라이언트 공통) — 정상 수신된 패킷을 타입별로 처리하는 패킷 핸들러
+- `HandleTransportException()` 책임 재정의 — 수신 과정 자체의 실패만 처리, `HEADER_ERROR` 수신은 `HandleRecvPacket()`으로 이관
+- `TransportExceptionHandling()` → `HandleTransportException()` 이름 변경
+- `ClientApp`에 `closing` / `MarkClosing()` 추가
 
 ---
 
@@ -145,9 +157,8 @@
 
 ### 클라이언트 (미구현)
 
-- `LineLogger` 클라이언트 전용 인터페이스 (`\n` 없는 프롬프트 출력용 함수)
-- `ClientApp::Run()` 종료 후 에러 처리 블록의 `std::cout` → `LineLogger` 교체
-- `ClientApp`에 닉네임 시스템 연동
+- `ClientApp`에 닉네임 시스템 연동 (서버 측 `NICKNAME_CHANGE` 처리와 함께 구현 예정)
+- `HandleTransportException()` 내부 `std::cout` 출력을 `LineLogger` 기반으로 교체
 
 ### Others
 

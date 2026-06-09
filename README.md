@@ -58,7 +58,7 @@
 - `PacketType` enum class 도입
 - `PacketHeader::type`은 실제 전송 필드로 `int32_t`를 유지하고, `PacketType`은 코드 내부 의미 표현용으로 사용
 - payload length가 `0`이거나 `PAYLOAD_SIZE`를 초과하면 protocol error로 처리
-- `TransportExceptionHandling()`을 통해 통신 종료 / 예외 후처리 흐름 정리
+- `HandleTransportException()`을 통해 통신 종료 / 예외 후처리 흐름 정리
 - `SessionID` 1차 도입
 - `LineLogger` 공용 로깅 라이브러리 구현
 - 싱글톤 패턴 기반 전역 단일 로거 구조 적용
@@ -73,12 +73,18 @@
 - `ClientSession` 생성 시 `CONNECTED` 로그 출력
 - `RecvPacket()` 수신 완료 시 `RECV_COMPLETE` 로그 출력
 - `SendPacket()` 송신 완료 시 `SEND_COMPLETE` 로그 출력
-- `TransportExceptionHandling(NetState)`에서 종료 / transport error / peer error / error packet 송신 로그 출력
+- `HandleTransportException(NetState)`에서 종료 / transport error / error packet 송신 로그 출력
 - `NetState` 구조체 / `PacketType` 구조체 이름 리팩토링
+- `RecvResult` 구조체 추가 (서버 / 클라이언트 공통)
+- `RecvPacket()`의 반환값을 `RecvResult`로 변경 — 수신 상태(`NetState`)와 수신된 패킷 타입(`PacketType`) / 페이로드를 분리하여 반환
+- `HandleRecvPacket()` 추가 — 정상 수신된 패킷을 타입별로 처리하는 패킷 핸들러
+- `ClientApp` 클래스 구현 (`ConnectSocket` 캡슐화, `NetState`, `Nickname`, `closing` 소유)
+- `ClientApp::HandleRecvPacket()` / `ClientApp::HandleTransportException()` 구현
+- `InputParser` / `ParsedInput` 구현
+- `LineLogger::WriteInputLog()` 추가 — 줄바꿈 없이 프롬프트를 출력하기 위한 전용 인터페이스 함수
 
 ### 구현 예정
 
-- 클라이언트 리팩토링
 - `ClientManager` 로그의 `LineLogger` 적용
 - `Server` 전역 로그의 `LineLogger` 적용
 - low-level transport 계층 로그 정책 검토

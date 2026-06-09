@@ -13,12 +13,14 @@
 #include <atomic>
 #include <algorithm>
 #include "LineLogger.h"
+#include <sstream>
 
 #pragma comment(lib, "Ws2_32.lib")
 
 // OOP 싫어... RAII 싫어.. 근데 왜 재밌냐 시발
 
 using SessionID = uint64_t;
+using Nickname = std::string;
 
 const int SERVER_PORT = 9000;
 const int PAYLOAD_SIZE = 4096;
@@ -30,6 +32,13 @@ const SessionID INITIAL_SESSION_ID = 0;
 
 const char header_err_msg[] = "The maximum value of the header's length field has been exceeded. The server is terminating the connection.";
 uint32_t host_err_msg_len = static_cast<uint32_t>(strlen(header_err_msg));
+
+struct RecvResult {
+	NetState state{};
+	PacketType type = PacketType::CHAT_MESSAGE;
+	uint32_t length = 0;
+	std::string payload;
+};
 
 class ClientSession;
 
@@ -59,6 +68,7 @@ private:
 	NetState ClientState; // 단순 값 복사
 	std::atomic<bool> closing = false; // alignas(64) 가급적 필요할 듯. false sharing 고려해야함.
 	SessionID session_id;
+	Nickname nickname;
 public:	
 	ClientSession(std::unique_ptr<ClientSocket> s, sockaddr_in addr, SessionID id) 
 		: ClientSock(std::move(s)), 
@@ -69,10 +79,54 @@ public:
 		session_id(id) { // move로 ClientSocket unique_ptr 객체 옮기기, addr 소켓 주소 구조체는 간단한 구조체이므로 단순 복사
 		inet_ntop(AF_INET, &ClientAddr.sin_addr, ClientAddrStr, sizeof(ClientAddrStr));
 
+		// 기본 닉네임 설정(임시 코드)
+		std::ostringstream oss;
+		oss << "user_" << session_id;
+		nickname = oss.str();
 		LineLogger::GetInstance().WriteSessionLog(session_id, ClientAddrStr, ntohs(ClientAddr.sin_port), LineLogger::LogType::CONNECTED, "Client Connected.");
 	}
 
-	void TransportExceptionHandling(NetState State) {
+
+	void HandleRecvPacket(const RecvResult& res) {
+		bool quit = false;
+
+		switch (res.type) {
+	    	case PacketType::CHAT_MESSAGE:
+    		{
+    			const char* buf = res.payload.c_str();
+
+		    	// 수신한 패킷의 타입이 CHAT_MESSAGE일 때 실행할 코드
+	    		// 이 함수 부분은 HandlePacket() 안으로 넣어야할 듯.. (넣었음)
+    			NetState send_state = SendPacket(buf, (uint32_t)strlen(buf), PacketType::CHAT_MESSAGE);
+
+			    if (send_state.transport_error ||
+				    send_state.protocol_error ||
+			    	send_state.peer_closed) {
+		    		MarkClosing();
+	    			HandleTransportException(send_state);
+
+    			}
+
+			    break;
+		    }
+			case PacketType::HEADER_ERROR:
+				// 수신한 패킷의 타입이 HEADER_ERROR일 때 실행할 코드
+				LineLogger::GetInstance().WriteSessionLog(session_id, ClientAddrStr, ntohs(ClientAddr.sin_port), LineLogger::LogType::RECEIVE_ERROR_PACKET, "Received an error packet from a Client.");
+				MarkClosing();
+
+				break;
+
+			case PacketType::NICKNAME_CHANGE:
+				// 수신한 패킷의 타입이 NICKNAME_CHANGE일 때 실행할 코드
+				// 아직 미정
+				break;
+
+			// 유효하지 않은 패킷 타입은 이미 RecvPacket() / HandleTransportException()에서 판별 및 처리해줌
+		}
+		
+	}
+
+	void HandleTransportException(NetState State) {
 
 		if (State.transport_error) {
 
@@ -99,12 +153,14 @@ public:
 				// send() 할 때도 recv()가 정상적으로 실행된 경우에만 해당 플래그가 true로 바뀔 수 있기 떄문에
 				// 현재 구조에서는 상대의 패킷을 recv() 했을 때만 해당 플래그가 true로 바뀔 수 있음.
 				// 이 함수는 호출될 때에 send() 한 후에 오류가 났을 때 결과를 출력함.
-				TransportExceptionHandling(header_err_send_res);
+				HandleTransportException(header_err_send_res);
 			}
 		}
-		else if (State.peer_protocol_error) {
+		/*
+		else if (State.peer_protocol_error) { // 이거 뺴버리자. 따로 HEADER_ERROR인 패킷을 받았을 때 처리하는 함수를 만들어야겠다..
 			LineLogger::GetInstance().WriteSessionLog(session_id, ClientAddrStr, ntohs(ClientAddr.sin_port), LineLogger::LogType::RECEIVE_ERROR_PACKET, "Received an error packet from a Client.");
 		}
+		*/
 		else if (State.peer_closed) {
 			LineLogger::GetInstance().WriteSessionLog(session_id, ClientAddrStr, ntohs(ClientAddr.sin_port), LineLogger::LogType::DISCONNECTED, "The client has successfully closed the connection.");
 		}
@@ -125,7 +181,7 @@ public:
 
 	NetState SendPacket(const char* msg, uint32_t len, PacketType type);
 
-	NetState RecvPacket(char* buf);
+	RecvResult RecvPacket();
 
 	void MarkClosing() {
 		closing.store(true);
@@ -168,27 +224,23 @@ void ClientSession::Run() {
 
 	while (true) {
 
-		NetState recv_state = RecvPacket(buf);
+		RecvResult recv_res = RecvPacket();
 
-		if (recv_state.transport_error ||
-			recv_state.protocol_error ||
-			recv_state.peer_protocol_error ||
-			recv_state.peer_closed) {
+		if (recv_res.state.transport_error ||
+			recv_res.state.protocol_error ||
+			recv_res.state.peer_protocol_error || // 이건 일단 남겨놓음. 추후에 NetState 구조체 갈아엎으면서 수정할 예정
+			recv_res.state.peer_closed) {
 			MarkClosing();
-			TransportExceptionHandling(recv_state);
+			HandleTransportException(recv_res.state);
 
 			break;
 		}
 
-		NetState send_state = SendPacket(buf, (uint32_t)strlen(buf), PacketType::CHAT_MESSAGE);
+		// 대충 여기다가 HandleRecvPacket() 함수 (아직 HandlePacket() 함수는 미구현이기에 주석만 남겨놓음)
+		HandleRecvPacket(recv_res);
 
-		if (send_state.transport_error ||
-			send_state.protocol_error ||
-			send_state.peer_protocol_error ||
-			send_state.peer_closed) {
-			MarkClosing();
-			TransportExceptionHandling(send_state);
-
+		// 여기에다 closing == true 체크 추가
+		if (closing == true) {
 			break;
 		}
 
@@ -198,6 +250,7 @@ void ClientSession::Run() {
 }
 
 // msg는 반드시 BUFFER_SIZE 이내의 크기여야 한다. len은 메시지의 크기를 나타낸다.
+// 여긴 나중에 수정하자. 일단 RecvPacket() 우선으로..
 NetState ClientSession::SendPacket(const char* msg, uint32_t len, PacketType type) {
 
 	NetState send_packet_state{};
@@ -245,15 +298,18 @@ NetState ClientSession::SendPacket(const char* msg, uint32_t len, PacketType typ
 	ClientState.payload_send = false;
 	send_packet_state.payload_send = false;
 
-	LineLogger::GetInstance().WriteSessionLog(session_id, ClientAddrStr, ntohs(ClientAddr.sin_port), LineLogger::LogType::SEND_COMPLETE, "Message Sent : ", msg);
+	// 수정 : 무조건 메시지만 송신한게 아니라 패킷을 송신했다는 것을 나타내기 위해서 Message Sent : msg가 아닌 Packet Sent.로 로그 메시지 수정
+	LineLogger::GetInstance().WriteSessionLog(session_id, ClientAddrStr, ntohs(ClientAddr.sin_port), LineLogger::LogType::SEND_COMPLETE, "Packet Sent.");
 
 	return ClientState;
 }
 
-// buf는 반드시 BUFFER_SIZE 크기여야 한다.
-NetState ClientSession::RecvPacket(char* buf) {
+RecvResult ClientSession::RecvPacket() {
+	char buf[BUFFER_SIZE]{};
 
 	NetState recv_packet_state{};
+
+	RecvResult result{};
 
 	// 헤더 수신
 	PacketHeader recv_net_header{};
@@ -264,11 +320,15 @@ NetState ClientSession::RecvPacket(char* buf) {
 
 	if (header_recv_res == SOCKET_ERROR) {
 		recv_packet_state.transport_error = true;
-		return ClientState;
+		result.state = recv_packet_state;
+
+		return result;
 	}
 	if (header_recv_res == 0) {
 		recv_packet_state.peer_closed = true;
-		return recv_packet_state;
+		result.state = recv_packet_state;
+
+		return result;
 	}
 	ClientState.header_recv = false;
 	recv_packet_state.header_recv = false;
@@ -280,15 +340,22 @@ NetState ClientSession::RecvPacket(char* buf) {
 	if (recv_host_header.length > PAYLOAD_SIZE || recv_host_header.length == 0) { // length == 0이어도 protocol error로 처리
 		ClientState.protocol_error = true;
 		recv_packet_state.protocol_error = true;
-		return recv_packet_state;
+		result.state = recv_packet_state;
+		
+		return result;
 	}
 
+	// NICKNAME_CHANGE는 닉네임 시스템 구현과 함께 추가할 예정
 	if (recv_host_header.type != static_cast<int32_t>(PacketType::CHAT_MESSAGE) &&
 		recv_host_header.type != static_cast<int32_t>(PacketType::HEADER_ERROR)) {
 		ClientState.protocol_error = true;
 		recv_packet_state.protocol_error = true;
-		return ClientState;
+		result.state = recv_packet_state;
+
+		return result;
 	}
+
+	result.type = static_cast<PacketType>(recv_host_header.type);
 
 	// 페이로드 수신
 	ClientState.payload_recv = true;
@@ -297,26 +364,36 @@ NetState ClientSession::RecvPacket(char* buf) {
 
 	if (payload_recv_res == SOCKET_ERROR) {
 		recv_packet_state.transport_error = true;
-		return recv_packet_state;
+		result.state = recv_packet_state;
+
+		return result;
 	}
 	if (payload_recv_res == 0) {
 		recv_packet_state.peer_closed = true;
-		return recv_packet_state;
+		result.state = recv_packet_state;
+
+		return result;
 	}
 	ClientState.payload_recv = false;
 	recv_packet_state.payload_recv = false;
 
+	// 문자열로 사용하는지 여부와는 상관없이 해당 바이트열의 끝을 알려주기 위해서 널문자 삽입. 
 	buf[recv_host_header.length] = '\0';
 
+	/*
 	if (recv_host_header.type == static_cast<int32_t>(PacketType::HEADER_ERROR)) {
 		ClientState.peer_protocol_error = true;
 		recv_packet_state.peer_protocol_error = true;
 		return recv_packet_state;
 	}
+	*/
 
-	LineLogger::GetInstance().WriteSessionLog(session_id, ClientAddrStr, ntohs(ClientAddr.sin_port), LineLogger::LogType::RECV_COMPLETE, "Message Received : ", buf);
+	result.payload = buf;
 
-	return ClientState;
+	// 수정 : 무조건 메시지만 수신한게 아니라 패킷을 수신했다는 것을 나타내기 위해서 Message Received : buf가 아닌 Packet Receved.로 로그 메시지 수정
+	LineLogger::GetInstance().WriteSessionLog(session_id, ClientAddrStr, ntohs(ClientAddr.sin_port), LineLogger::LogType::RECV_COMPLETE, "Packet Received.");
+
+	return result;
 }
 
 

@@ -663,9 +663,24 @@ PacketType (RecvResult.type)
 수신 로그는 low-level `recv_all()` 계층이 아니라,
 세션 단위의 의미 있는 이벤트가 발생한 시점에 기록합니다.
 
-### RecvPacket()이 NetState를 반환하는 이유
+### RecvPacket()이 RecvResult를 반환하는 이유
 
-`RecvPacket()`은 단순히 수신한 패킷의 정보만 반환하는 함수가 아닙니다.
+`RecvPacket()`은 `RecvResult`를 반환합니다.
+
+`RecvResult`는 `NetState`와 `PacketType`, 페이로드를 함께 담는 구조체입니다.
+
+`NetState`만으로는 "수신 과정에서 문제가 있었는가"만 알 수 있고,
+"어떤 타입의 패킷이 정상 수신됐는가"를 Run()에 전달할 수 없었습니다.
+
+패킷 핸들러(`HandleRecvPacket()`)를 도입하려면
+수신된 `PacketType`을 호출자에게 명확히 전달해야 하기 때문에
+`RecvPacket()`의 반환 타입을 `RecvResult`로 확장했습니다.
+
+단, `RecvResult` 안에도 `NetState`가 포함되어 있습니다.
+`Run()`은 `RecvResult.state`를 보고 수신 실패 여부를 판단하고,
+`RecvResult.type`을 보고 `HandleRecvPacket()`에서 타입별 처리를 수행합니다.
+
+### RecvPacket()이 RecvResult에 NetState를 포함해서 반환하는 이유
 
 패킷 수신 과정에서는 다음과 같은 상태가 함께 발생할 수 있습니다.
 
@@ -1956,56 +1971,51 @@ HEADER_ERROR packet
 
 ## 10-3. RecvPacket() / SendPacket()의 반환값으로 사용하는 이유
 
-`RecvPacket()`과 `SendPacket()`이 `NetState`를 반환하는 이유는,
-각 함수가 수행한 송수신 작업의 결과를 `Run()`과 `HandleTransportException()`에게 명시적으로 전달하기 위해서입니다.
+`SendPacket()`은 `NetState`를 반환합니다.
+`RecvPacket()`은 `RecvResult`를 반환하지만, `RecvResult` 안에 `NetState`가 포함되어 있습니다.
 
-```text
-RecvPacket()
-  → 이번 수신 작업의 상태 반환
-
-SendPacket()
-  → 이번 송신 작업의 상태 반환
-
-Run()
-  → 반환된 상태를 보고 흐름 결정
-
-HandleTransportException()
-  → 통신 종료 / 예외 상황 발생 후처리
+```cpp
+struct RecvResult {
+    NetState state{};  // 수신 과정의 성공/실패 상태
+    PacketType type = PacketType::CHAT_MESSAGE;
+    uint32_t length = 0;
+    std::string payload;
+};
 ```
 
-이 구조에서는 `Run()`과 `HandleTransportException()`이 송수신 세부 구현을 몰라도 됩니다.
+즉, 두 함수 모두 `NetState`를 통해 송수신 과정의 상태를 호출자에게 전달합니다.
 
-대신 다음처럼 상태를 바탕으로 흐름만 판단합니다.
+이 구조에서 `Run()`과 `HandleTransportException()`은 송수신 세부 구현을 몰라도 됩니다.
+대신 `NetState`를 바탕으로 흐름만 판단합니다.
 
 ```text
-상태가 정상
-  → Run() 함수가 다음 단계 진행
+NetState에 이상 없음
+  → Run()이 다음 단계 진행
 
 transport error
-  → Run() 함수가 HandleTransportException() 함수를 호출
-  → HandleTransportException() 함수가 closing 표시 후 종료 처리
+  → Run()이 HandleTransportException() 호출
+  → HandleTransportException()이 MarkClosing() 후 종료 처리
 
 peer exit
-  → Run() 함수가 HandleTransportException() 함수를 호출
-  → HandleTransportException() 함수가 closing 표시 후 제거 처리
+  → Run()이 HandleTransportException() 호출
+  → HandleTransportException()이 MarkClosing() 후 제거 처리
 
 protocol error
-  → 
-  → Run() 함수가 HandleTransportException() 함수를 호출
-  → HandleTransportException() 함수가 closing closing 표시 및 에러 응답 처리
+  → Run()이 HandleTransportException() 호출
+  → HandleTransportException()이 MarkClosing() 및 에러 응답 처리
 ```
 
-즉, `NetState` 반환은 함수 간 책임 분리를 위한 장치입니다.
+즉, `NetState`는 함수 간 책임 분리를 위한 장치입니다.
 
 ```text
 RecvPacket() / SendPacket()
-  → 송수신 세부 절차와 상태 생성
+  → 송수신 세부 절차 수행 + NetState 생성
 
 Run()
-  → 상태 기반 고수준 흐름 제어
+  → NetState 기반 고수준 흐름 제어
 
 HandleTransportException()
-  → 종료 / 예외 상황 발생시 상태별 후처리
+  → NetState 기반 종료 / 예외 상황 후처리
 ```
 
 ---

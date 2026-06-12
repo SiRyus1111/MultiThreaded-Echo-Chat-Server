@@ -233,3 +233,46 @@ IP:Port만으로는 부족해.
   - 기존에는 `NetState` `ClientState`를 참조해서 예외처리를 해서 어떤 과정의 후처리를 담당하는지 명확하지 않고, 예외 상황 발생과 해당 함수의 호출 시점이 달랐기 때문에 그 사이에 `ClientState`가 갱신된다면 후처리에 문제가 발생할 수 있었음
   - 기존의 `SendPacket()` / `RecvPacket()`도 그 당시의 `ClientSession` 객체를 반환했지만, 위와 같은 이유로 명확히 예외 상태가 기록되지 않을 위험이 있었음. 
 	- 그래서 내부 지역 객체인 `send_packet_state` / `recv_packet_state`에 해당 함수들의 송 / 수신 상태를 기록하고, 해당 객체를 반환함으로써 `TransportExceptionHandling()` 함수의 목적인 "어떤 과정의 후처리를 담당하는지 명확히 한다"라는 의도와 일치시킴.
+
+### 26.06.07
+
+- (밀린 로그 작성)
+- `InputParser` / `ParsedInput` 추가
+  - 핵심 목적 : 클라이언트가 입력을 받을 때 해당 입력으로 어떤 처리를 해야하는지 입력을 파싱 (기존 구조에서는 일반 채팅 메시지로밖에 처리 못했음)
+  - `InputParser::Parse()` 함수로 입력 파싱, `ParsedInput` 구조체 반환 : `static`으로 객체를 생성하지 않고 해당 함수를 호출할 수 있게 해서 편의성 챙김
+	- `ParsedInput`에는 어떤 동작을 해야하는지 기록되어있으므로 `ParsedInput`을 보고 동작 처리
+	  - `valid` -> `quit` -> (기타 패킷을 전송하지 않는 명령어) -> `type` 순으로 검사해야함.
+  - 자세한건 [링크](./IdeaScatch/26.06.04 Inputparser 구조체 설계.md)
+- `ClientApp` 클라이언트 객체 추가
+  - 핵심 목적 : 클라이언트의 정보 / 동작을 한 객체에 묶어놓아서 정보 관리의 편의성 / 안전성, 동작의 편의성을 챙기기
+  - `ConnectSock` / `NetState` / `Nickname` 해당 객체가 소유
+  - `SendPacket()` / `RecvPacket()` / `Run()` / `HandleTransportException()` 함수 제공
+  - 자세한건 [링크](./IdeaScatch/26.06.05 ClientApp 설계.md) 참조
+	- 다시 쓰기 귀찮음..
+
+### 26.06.12
+
+- (밀린 로그 작성)
+- 패킷 처리 정책 명확화
+  - 핵심 목적 : 기존의 `HEADER_ERROR`도 `NetState`에 기록해서 
+  후처리 함수(`HandleTransportException()`)에서 처리했기 때문에 
+  패킷 처리의 책임 경계가 애매해서 패킷 핸들러 설계가 어려워서
+  명확히 패킷 처리의 책임을 분리해야했음
+	- 기존의 "종료해야 하는 패킷 / 종료하지 않는 패킷" 기준 대신,
+    "수신 과정에서 예외가 발생한 경우"와
+    "정상적으로 수신된 패킷"을 기준으로
+    패킷 처리 책임을 분리함
+	- 기존의 `RecvPacket()` 함수는 오직 `NetState`와 페이로드만 반환했기에, 패킷 타입까지 제대로 알기 위해서 `RecvResult` 구조체를 반환하도록 개편
+	- 패킷 수신 과정에서 예외 상황 발생
+ 	  - `NetState`에 기록 및 `NetState`만 보고 처리
+	  - `HandleTransportException()`에서 처리
+	  - `peer closed` 상태(`recv() == 0`)도 패킷 수신 과정에서의 예외 상황이니 여기서 처리
+	- 정상적으로 패킷 수신
+	  - `RecvResult` 전체를 봄
+	  - `HandleRecvPacket()`에서 처리
+	  - `PacketType::HEADER_ERROR`도 종료해야하는 상황이긴 하지만 정상적인 패킷이니 여기서 처리
+  - 자세한건 [여기서](./IdeaScatch/26.06.09 대개편.md)
+- 패킷 핸들러 도입
+  - 패킷 타입을 보고 해당 패킷 타입에 알맞는 처리를 하는 `HandleRecvPacket()` 함수 추가
+  - 자세한건 [여기서](./IdeaScatch/26.06.09 패킷 핸들러 설계.md)
+- 이 변경 사항들은 서버와 클라이언트 모두에 적용됨

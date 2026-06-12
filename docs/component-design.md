@@ -1056,6 +1056,20 @@ HEADER_ERROR 패킷
 종료의 원인이 transport 계층의 실패이든, 수신된 패킷의 내용이든,
 **"종료해야 하는 상황인가"** 라는 기준은 동일하게 유지됩니다.
 
+### HandleTransportException()과의 차이점
+
+`HandleTransportException()`은 수신한 패킷이 정상적이지 않은 패킷일 때,
+즉 수신 과정에서 예외 상황이 발생했을 때 후처리를 담당하는 함수입니다.
+이 "수신 과정에서의 예외 상황"은 peer exit도 포함합니다.
+
+하지만 `HandleRecvPacket()`은 수신한 패킷이 정상적인 패킷일 때
+수신한 패킷 타입에 맞는 처리를 담당하는 함수입니다.
+
+이런 차이점이 있기 때문에,
+`HandleTransportException()`은 수신 과정의 예외 상황을 기록한 `NetState` 구조체만을 인자로 받아 처리하지만,
+`HandleRecvPacket()`은 패킷 타입에 맞는 처리를 해야하기 때문에 `NetState`와 `PacketType` / `payload`까지 포함되어있는
+`RecvResult` 구조체를 인자로 받습니다.
+
 ---
 
 ## 5-9. RemoveThisClient()

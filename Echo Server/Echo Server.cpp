@@ -281,7 +281,7 @@ NetState ClientSession::SendPacket(const char* msg, uint32_t len, PacketType typ
 
 	if (header_send_res == SOCKET_ERROR) {
 		send_packet_state.transport_error = true;
-		return ClientState;
+		return send_packet_state;
 	}
 	ClientState.header_send = false;
 	send_packet_state.header_send = false;
@@ -293,7 +293,7 @@ NetState ClientSession::SendPacket(const char* msg, uint32_t len, PacketType typ
 
 	if (payload_send_res == SOCKET_ERROR) {
 		send_packet_state.transport_error = true;
-		return ClientState;
+		return send_packet_state;
 	}
 	ClientState.payload_send = false;
 	send_packet_state.payload_send = false;
@@ -301,7 +301,7 @@ NetState ClientSession::SendPacket(const char* msg, uint32_t len, PacketType typ
 	// 수정 : 무조건 메시지만 송신한게 아니라 패킷을 송신했다는 것을 나타내기 위해서 Message Sent : msg가 아닌 Packet Sent.로 로그 메시지 수정
 	LineLogger::GetInstance().WriteSessionLog(session_id, ClientAddrStr, ntohs(ClientAddr.sin_port), LineLogger::LogType::SEND_COMPLETE, "Packet Sent.");
 
-	return ClientState;
+	return send_packet_state;
 }
 
 RecvResult ClientSession::RecvPacket() {

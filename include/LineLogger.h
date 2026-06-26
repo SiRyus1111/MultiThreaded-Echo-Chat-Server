@@ -80,15 +80,25 @@ public:
     template <typename... Args>
     void WriteSessionLog(
         uint64_t sessionId, 
+        std::string nickname,
         const char* ipaddr, 
         uint16_t port, 
         LogType logType, 
         Args&&... args) {
     
         WriteLog("[SessionID ", sessionId, "]",
+                "[Nickname ", nickname, "]",
                 "[", ipaddr, ":", port, "]",
                 "[", LogTypeToCstyleString(logType), "] ",
                 std::forward<Args>(args)...);
+    }
+
+    template <typename... Args>
+    void WriteChatLog(
+        std::string nickname,
+        Args&&... args) {
+        WriteLog('[', nickname, ']', 
+                 std::forward<Args>(args)...);
     }
 
 };

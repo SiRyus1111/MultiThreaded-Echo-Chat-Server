@@ -17,15 +17,18 @@ enum class PacketType : int32_t {
 */
 
 enum class PacketType : int32_t {
-	CHAT_MESSAGE = 1,
+    CHAT_MESSAGE = 1,
     NICKNAME_CHANGE = 2,
-    HEADER_ERROR = 3
+    HEADER_ERROR = 3,
+    NICKNAME_CHANGE_FAILED = 4,
+    NICKNAME_CHANGE_SUCESS = 5
 };
 
 #pragma pack(push, 1)
 struct PacketHeader {
     int32_t type;
     uint32_t length;
+    char nickname[32];
 };
 #pragma pack(pop)
 

@@ -94,16 +94,29 @@ main()
   ├── 서버 주소 설정 및 ConnectSockConnect() 호출
   ├── ClientApp 생성 (ConnectSocket을 move로 소유권 이전)
   └── ClientApp::Run()
-        ├── 사용자 입력 받기
-        ├── InputParser::Parse() → ParsedInput
-        ├── valid == false → 에러 출력 → 루프 재시작
-        ├── quit == true  → 루프 종료
-        ├── length 범위 검사 → 초과 시 에러 출력 → 루프 재시작
-        ├── ClientApp::SendPacket()
-        ├── 송신 상태 확인 → 에러 시 루프 종료
-        ├── ClientApp::RecvPacket()
-        ├── 수신 상태 확인 → 에러 시 루프 종료
-        └── 수신 메시지 출력
+        │
+        ├── [초기 닉네임 설정 루프 — 메인 루프 진입 전]
+        │     ├── 닉네임 입력 받기
+        │     ├── InputParser::Parse() → ParsedInput
+        │     ├── NICKNAME_CHANGE 타입이 아니면 안내 메시지 → 루프 재시작
+        │     ├── ClientApp::SendPacket() (NICKNAME_CHANGE)
+        │     ├── 송신 상태 확인 → 에러 시 종료
+        │     ├── ClientApp::RecvPacket()
+        │     ├── 수신 상태 확인 → 에러 시 종료
+        │     ├── NICKNAME_CHANGE_SUCESS → nick_ 갱신 → break (메인 루프 진입)
+        │     └── NICKNAME_CHANGE_FAILED → 실패 원인 출력 → 루프 재시작
+        │
+        └── [메인 루프]
+              ├── 사용자 입력 받기
+              ├── InputParser::Parse() → ParsedInput
+              ├── valid == false → 에러 출력 → 루프 재시작
+              ├── quit == true  → 루프 종료
+              ├── length 범위 검사 → 초과 시 에러 출력 → 루프 재시작
+              ├── ClientApp::SendPacket() (nick_ 포함)
+              ├── 송신 상태 확인 → 에러 시 루프 종료
+              ├── ClientApp::RecvPacket()
+              ├── 수신 상태 확인 → 에러 시 루프 종료
+              └── HandleRecvPacket() → 수신 메시지 출력 또는 닉네임 처리
 ```
 
 핵심은 `main()`은 소켓 생성과 서버 연결의 구현만 담당하고,
@@ -180,9 +193,11 @@ Run()
   ├── 수신 상태 확인 (state)
   │     └── 예외 발생 시 MarkClosing() → HandleTransportException(state)
   ├── HandleRecvPacket(res)     → 패킷 타입별 처리
-  │     ├── CHAT_MESSAGE        → SendPacket() (echo)
+  │     ├── CHAT_MESSAGE        → SendPacket() (echo, 헤더에 ECHO_NICK 포함)
   │     ├── HEADER_ERROR        → MarkClosing()
-  │     └── NICKNAME_CHANGE     → 미구현 stub
+  │     └── NICKNAME_CHANGE     → 길이 검사 → GetClients() 중복 검사
+  │                               → 통과 시 nickname 갱신 + NICKNAME_CHANGE_SUCESS 송신
+  │                               → 실패 시 NICKNAME_CHANGE_FAILED 송신
   └── closing 확인 → true이면 루프 종료
 ```
 
@@ -220,9 +235,11 @@ Client A → Server → Client B
 - `HandleRecvPacket()`으로 송신한 패킷 타입에 맞는 처리
 - 종료 시 `ClientManager`에 자기 `SessionID` 기반 제거 요청
 - `LineLogger::WriteSessionLog()` 기반 세션 로그 출력
-- `SessionID`, `IP:Port`, `LogType` 기반 표준 로그 기록
+- `SessionID`, `Nickname`, `IP:Port`, `LogType` 기반 표준 로그 기록
 - 연결, 수신 완료, 송신 완료, 종료, 예외 상황 로깅
-- 추후 nickname / 접속 상태 관리
+- `nickname` 멤버 소유 및 관리
+- 연결 즉시 `user_(session_id)` 형태의 기본 닉네임 자동 설정
+- 복사 가능하고 외부 접근이 필요한 멤버에 대한 getter 함수 제공
 
 현재 구조는 다음과 같습니다.
 
@@ -236,6 +253,7 @@ private:
     NetState ClientState;
     std::atomic<bool> closing = false;
     SessionID session_id;
+    Nickname nickname;
 
 public:
     ClientSession(std::unique_ptr<ClientSocket> s, sockaddr_in addr, SessionID id);
@@ -244,12 +262,19 @@ public:
     void Run();
 
     RecvResult RecvPacket();
-    NetState SendPacket(const char* msg, uint32_t len, PacketType type);
+    NetState SendPacket(const char* msg, uint32_t len, PacketType type, Nickname nick);
 
     void HandleRecvPacket(const RecvResult& res);
     void HandleTransportException(NetState state);
     void MarkClosing();
     void RemoveThisClient();
+
+    NetState GetState() const;
+    bool GetClosing() const;
+    SessionID GetSessionID() const;
+    Nickname GetNickname() const;
+    sockaddr_in GetBinaryAddr() const;
+    std::string GetStrAddr() const;
 };
 ```
 
@@ -266,11 +291,20 @@ ClientSession
 모두 세션 내부에 위치하는 것이 자연스럽습니다.
 
 `SessionID`는 `ClientManager`가 세션을 빠르게 식별하기 위한 서버 내부 ID입니다.
+
 IP:Port만으로는 세션 관리가 애매할 수 있고,
 `shared_ptr<ClientSession>` 대조 기반 제거는 컨테이너 구조가 커질수록 불편해질 수 있습니다.
 
 따라서 현재 구조에서는 `ClientSession`이 자기 자신의 `session_id`를 값으로 보관하고,
 종료 시 `ClientManager::RemoveClient(session_id)`를 호출하도록 설계합니다.
+
+기본 닉네임으로 `user_(session_id)` 형태를 사용하는 이유는 다음과 같습니다.
+
+```text
+user_(session_id)
+  → session_id는 연결마다 고유하게 부여되므로, 중복 확인 없이 즉시 기본 닉네임으로 사용할 수 있다.
+  → 연결 직후부터 로그에서 식별 가능한 이름이 있어야 하므로, 빈 닉네임 대신 즉시 사용 가능한 기본값이 필요하다.
+```
 
 그리고 26.05.20(수) 리팩토링으로 `Run()`은 더 이상 Header / Payload 송수신 세부 절차를 직접 담당하지 않습니다.
 `Run()`은 Echo Server의 실행 흐름을 제어하고, 실제 패킷 송수신은 `RecvPacket()` / `SendPacket()`이 담당합니다.
@@ -306,6 +340,7 @@ HandleRecvpacket()
 - 현재 접속 중인 클라이언트 목록 관리
 - `SessionID` 기반 세션 식별
 - clients 컨테이너 동기화
+- clients snapshot 반환 (`GetClients()`)
 - 추후 broadcast 수행
 
 현재 구조는 다음과 같습니다.
@@ -319,6 +354,7 @@ private:
 public:
     void AddClient(std::shared_ptr<ClientSession> client, SessionID id);
     void RemoveClient(SessionID id);
+    std::unordered_map<SessionID, std::shared_ptr<ClientSession>> GetClients();
 };
 ```
 
@@ -400,8 +436,9 @@ Client A → Server → Client B
 - 하나의 `output_mutex_`로 `std::cout` 보호
 - 로그 문자열을 먼저 조립한 뒤 출력
 - 완성된 로그 문자열 하나를 한 번의 `operator<<`로 출력
-- `SessionID` / `IP:Port` / `LogType` 기반 세션 로그 형식 제공
+- `SessionID` / `Nickname` / `IP:Port` / `LogType` 기반 세션 로그 형식 제공
 - `LogType` enum class를 통한 로그 타입 제한
+- `WriteChatLog()` — 클라이언트 수신 메시지 전용 출력 (`[nickname] message` 형식)
 
 구조적으로는 다음과 같습니다.
 
@@ -415,7 +452,7 @@ main thread / client_thread / ClientManager
 세션 로그의 기본 형식은 다음을 목표로 합니다.
 
 ```text
-[SessionID 3][127.0.0.1:53021][RECV_COMPLETE] payload received
+[SessionID 3][Nickname maple][127.0.0.1:53021][RECV_COMPLETE] payload received
 ```
 
 현재 `LineLogger` 라이브러리는 구현 완료 상태이며,
@@ -434,11 +471,12 @@ main thread / client_thread / ClientManager
 
 - `ConnectSocket` 소유 (move로 받음)
 - `NetState state_` 소유 (클라이언트 전체 통신 상태 추적)
-- `Nickname nick_` 소유 (추후 닉네임 시스템 연동 시 사용)
+- `Nickname nick_` 소유 — 생성자에서 32바이트 `'\0'`으로 초기화 (서버 기본 닉네임과 불일치 상태로 시작, 초기 설정 루프에서 동기화)
 - `SendPacket()` / `RecvPacket()`으로 패킷 송수신 추상화
-- `Run()`으로 입력 → 파싱 → 송신 → 수신 → 출력의 고수준 루프 관리
-- `HandleTransportException()`으로종료 / 에러 상황 후처리
-- `HandleRecvPacket()`으로 수신한 패킷 처리
+- 메인 루프 진입 전 초기 닉네임 설정 루프 실행 — 서버로부터 `NICKNAME_CHANGE_SUCESS` 응답을 받기 전까지 메인 루프에 진입하지 않음
+- `Run()`으로 닉네임 설정 → 메인 루프 (입력 → 파싱 → 송신 → 수신 → 처리)의 고수준 흐름 관리
+- `HandleTransportException()`으로 종료 / 에러 상황 후처리
+- `HandleRecvPacket()`으로 수신한 패킷 처리 (`NICKNAME_CHANGE_SUCESS` / `NICKNAME_CHANGE_FAILED` 포함)
 
 현재 구조는 다음과 같습니다.
 
@@ -474,6 +512,19 @@ closing == true
 
 `HandleRecvPacket()`에서 `HEADER_ERROR` 패킷 수신 시 `MarkClosing()`을 호출하며,
 `Run()`은 `HandleRecvPacket()` 호출 이후 `closing` 상태를 확인하여 루프를 종료합니다.
+
+초기 닉네임 설정 루프가 필요한 이유는 다음과 같습니다.
+
+```text
+클라이언트가 연결한 시점에 서버는 user_(session_id) 기반의 기본 닉네임을 부여하지만,
+클라이언트의 nick_은 '\0' × 32로 초기화된 빈 닉네임입니다.
+
+이 상태에서 메인 루프로 진입하면, 클라이언트가 패킷을 보낼 때
+헤더의 nickname 필드에 빈 닉네임이 담기게 됩니다.
+
+따라서 연결 직후 닉네임 설정 루프를 통해 서버로부터 NICKNAME_CHANGE_SUCESS를 수신해야만
+서버-클라이언트 간 닉네임이 동기화된 상태에서 메인 루프를 시작합니다.
+```
 
 `ConnectSocket`은 복사할 수 없으므로, 생성자에서 `std::move()`로 소유권을 받습니다.
 
@@ -540,6 +591,7 @@ ClientApp::SendPacket()
 '/'가 없으면 → CHAT_MESSAGE
 '/'가 있으면 이후 문자열로 2차 분기
   "/nick " → NICKNAME_CHANGE, payload = prefix 절삭 후 문자열
+             단, payload가 32바이트를 초과하면 valid = false
   "/quit"  → quit = true
   "(정의되지 않은 식별자 / 공백)" → valid = false
 ```
@@ -565,11 +617,12 @@ struct ParsedInput {
 입력별 `ParsedInput` 결과는 다음과 같습니다.
 
 ```text
-"hello"          → type=CHAT_MESSAGE,    payload="hello", quit=false, valid=true
-"/nick maple"    → type=NICKNAME_CHANGE, payload="maple", quit=false, valid=true
-"/quit"          → quit=true
-""               → valid=false
-"/(정의되지 않은 식별자)"  → valid=false
+"hello"                 → type=CHAT_MESSAGE,    payload="hello", quit=false, valid=true
+"/nick maple"           → type=NICKNAME_CHANGE, payload="maple", quit=false, valid=true
+"/nick (32바이트 초과)" → valid=false
+"/quit"                 → quit=true
+""                      → valid=false
+"/(정의되지 않은 식별자)" → valid=false
 ```
 
 `Run()` 내부에서는 반환된 `ParsedInput`을 다음 순서로 검사합니다.

@@ -51,6 +51,7 @@ recv() → "rld"
 struct PacketHeader {
     int32_t type;
     uint32_t length;
+    char nickname[32];
 };
 #pragma pack(pop)
 ```
@@ -67,7 +68,9 @@ struct PacketHeader {
 enum class PacketType : int32_t {
     CHAT_MESSAGE = 1,
     NICKNAME_CHANGE = 2,
-    HEADER_ERROR = 3
+    HEADER_ERROR = 3,
+    NICKNAME_CHANGE_FAILED = 4,
+    NICKNAME_CHANGE_SUCESS = 5
 };
 ```
 
@@ -93,11 +96,14 @@ send_net_header.type = htonl(static_cast<int32_t>(type));
 ```cpp
 recv_host_header.type = ntohl(recv_net_header.type);
 
+// 서버가 수신할 수 있는 타입: CHAT_MESSAGE, NICKNAME_CHANGE, HEADER_ERROR
 if (recv_host_header.type != static_cast<int32_t>(PacketType::CHAT_MESSAGE) &&
     recv_host_header.type != static_cast<int32_t>(PacketType::NICKNAME_CHANGE) &&
     recv_host_header.type != static_cast<int32_t>(PacketType::HEADER_ERROR)) {
     // protocol error
 }
+
+// 클라이언트가 수신할 수 있는 타입: CHAT_MESSAGE, HEADER_ERROR, NICKNAME_CHANGE_FAILED, NICKNAME_CHANGE_SUCESS
 ```
 
 현재 타입:
@@ -107,10 +113,18 @@ CHAT_MESSAGE
   → 일반 메시지
 
 NICKNAME_CHANGE
-  → 닉네임 변경 메시지
+  → 닉네임 변경 요청 메시지 (클라이언트 → 서버)
 
 HEADER_ERROR
   → 프로토콜 에러 메시지
+
+NICKNAME_CHANGE_FAILED
+  → 닉네임 변경 실패 응답 (서버 → 클라이언트)
+  → 이유: 길이 초과 또는 중복 닉네임
+
+NICKNAME_CHANGE_SUCESS
+  → 닉네임 변경 성공 응답 (서버 → 클라이언트)
+  → payload에 새 닉네임 포함
 ```
 
 ### Protocol Error 처리 흐름
@@ -209,6 +223,86 @@ length > PAYLOAD_SIZE
 
 `length`가 허용 범위를 벗어나면 payload를 수신하지 않고 protocol error로 판단합니다.
 
+### nickname
+
+`nickname`은 송신자의 닉네임을 담는 고정 32바이트 필드입니다.
+
+`PacketHeader::nickname`은 항상 **이 패킷을 보낸 측의 현재 닉네임**입니다.
+
+```text
+PacketHeader::nickname
+  → 송신자의 현재 닉네임
+
+NICKNAME_CHANGE 패킷의 payload
+  → 설정하려는 새 닉네임 (변경 요청값)
+```
+
+이 두 값의 의미가 다르다는 점이 중요합니다.
+예를 들어 닉네임이 `"alice"`인 클라이언트가 `"bob"`으로 변경을 요청한다면:
+
+```text
+PacketHeader::nickname = "alice"  ← 현재 닉네임 (송신자 식별용)
+payload               = "bob"    ← 설정하려는 닉네임 (변경 요청값)
+```
+
+#### 패딩 / 파싱 메커니즘
+
+32바이트 고정 필드에 가변 길이 닉네임을 담기 위해 다음 방식을 사용합니다.
+
+**송신 측 (패딩):**
+
+```text
+1. 32바이트 버퍼를 '\0'으로 초기화 (memset)
+2. 닉네임 바이트를 버퍼 앞부분에 복사 (memcpy)
+3. 나머지 바이트는 '\0'으로 유지
+```
+
+```cpp
+char nick_buf[HEADER_NICKNAME_SIZE] = {};
+memset(nick_buf, '\0', HEADER_NICKNAME_SIZE);
+memcpy(nick_buf, nick.c_str(), nick.size());
+```
+
+**수신 측 (파싱):**
+
+```text
+1. 33바이트 임시 버퍼 생성 (32 + null terminator 1)
+2. 헤더에서 32바이트 복사
+3. [32] 위치에 '\0' 강제 추가
+4. std::string으로 변환
+```
+
+```cpp
+char nick_buf[MAX_NICKNAME_LENGTH + 1] = {};
+memcpy(nick_buf, recv_net_header.nickname, MAX_NICKNAME_LENGTH);
+nick_buf[MAX_NICKNAME_LENGTH] = '\0';
+result.nick = nick_buf;
+```
+
+33번째 바이트(`[32]`)에 `'\0'`을 강제 추가하는 이유는 다음과 같습니다.
+
+닉네임이 정확히 32바이트인 경우, `memcpy`로 32바이트를 복사하면 null terminator가 없는 상태가 됩니다.
+이 상태에서 `char*`를 `std::string`으로 변환하면 버퍼를 넘어 읽는 undefined behavior가 발생할 수 있습니다.
+따라서 수신 측은 반드시 33바이트 버퍼를 만들고 `[32]`에 `'\0'`을 강제로 씁니다.
+
+### 특수 닉네임 상수
+
+서버가 직접 생성하는 패킷에는 클라이언트 닉네임 대신 예약된 특수 상수를 사용합니다.
+
+```text
+ECHO_NICK = "EchoFromServer"
+  → 클라이언트 메시지를 echo할 때 서버가 사용하는 닉네임
+  → CHAT_MESSAGE 타입의 echo 패킷 헤더에 포함
+
+SERVER_NICK = "ServerMessage"
+  → 서버가 직접 생성하는 알림 패킷(닉네임 변경 결과 등)에 사용하는 닉네임
+  → NICKNAME_CHANGE_SUCESS / NICKNAME_CHANGE_FAILED 패킷 헤더에 포함
+```
+
+이 상수들은 클라이언트가 사용할 수 없는 예약어 역할을 합니다.
+클라이언트 닉네임으로는 이 값을 설정할 수 없으며,
+서버는 이 값을 통해 "이 패킷은 서버가 직접 생성한 것"임을 수신자가 식별할 수 있게 합니다.
+
 ## 3. Payload
 
 Payload는 실제 메시지 데이터입니다.
@@ -287,11 +381,12 @@ while 이미 받은 길이 < 전체 길이:
 ```text
 1. PacketHeader 수신
 2. network byte order → host byte order 변환
-3. length 검사
-4. type 검사
-5. payload 길이만큼 payload 수신
-6. 문자열 출력용 null 문자 추가
-7. 수신 결과를 RecvResult로 반환
+3. nickname 필드 파싱 (상세는 2. PacketHeader - nickname 참조)
+4. length 검사
+5. type 검사
+6. payload 길이만큼 payload 수신
+7. 문자열 출력용 null 문자 추가
+8. 수신 결과를 RecvResult로 반환
 ```
 
 `RecvPacket()`은
@@ -305,7 +400,7 @@ while 이미 받은 길이 < 전체 길이:
 
 ```text
 1. payload 길이 검사
-2. PacketHeader 구성
+2. PacketHeader 구성 (nickname 필드 패딩 포함, 상세는 2. PacketHeader - nickname 참조)
 3. host byte order → network byte order 변환
 4. PacketHeader 송신
 5. Payload 송신
@@ -330,10 +425,16 @@ RecvResult.state에 문제가 있는 경우
 
 RecvResult.state가 정상인 경우
   → HandleRecvPacket(res)
-  → PacketType별 처리
-    CHAT_MESSAGE   → SendPacket() (echo)
-    HEADER_ERROR   → MarkClosing() (정상 수신된 에러 알림 패킷)
-    NICKNAME_CHANGE → 미구현 stub
+  → PacketType별 처리 (서버 기준)
+    CHAT_MESSAGE          → SendPacket() (echo, 헤더에 ECHO_NICK 포함)
+    HEADER_ERROR          → MarkClosing() (정상 수신된 에러 알림 패킷)
+    NICKNAME_CHANGE       → 길이 검사 → 중복 검사 → 닉네임 갱신 → 성공/실패 패킷 송신
+
+  → PacketType별 처리 (클라이언트 기준)
+    CHAT_MESSAGE          → WriteChatLog()로 수신 메시지 출력
+    HEADER_ERROR          → WriteChatLog() 후 MarkClosing()
+    NICKNAME_CHANGE_SUCESS  → nick_ 갱신 (res.payload), 성공 메시지 출력
+    NICKNAME_CHANGE_FAILED  → 실패 원인 메시지 출력
 ```
 
 이 분리를 통해 `HandleTransportException()`은 수신 과정 자체의 실패만 담당하고,
@@ -493,7 +594,13 @@ CHAT_MESSAGE
   → 일반 채팅 메시지
 
 NICKNAME_CHANGE
-  → 닉네임 변경 메시지
+  → 닉네임 변경 요청 메시지 (클라이언트 → 서버)
+
+NICKNAME_CHANGE_FAILED
+  → 닉네임 변경 실패 응답 (서버 → 클라이언트)
+
+NICKNAME_CHANGE_SUCESS
+  → 닉네임 변경 성공 응답 (서버 → 클라이언트)
 ```
 
 예상 확장 방향:

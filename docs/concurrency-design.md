@@ -352,9 +352,11 @@ std::mutex clients_mutex;
 
 따라서 다음 작업은 mutex로 보호해야 합니다.
 
+따라서 다음 작업은 mutex로 보호해야 합니다.
+
 - 새 client 추가
 - 기존 client 제거
-- client 목록 snapshot 생성
+- client 목록 snapshot 생성 (`GetClients()`)
 - 추후 특정 SessionID 기반 조회
 
 예상 구조:
@@ -384,6 +386,34 @@ void ClientManager::RemoveClient(SessionID id) {
 추후 중복 ID 삽입을 더 엄격히 검사하고 싶다면
 `clients[id] = client` 대신 `clients.emplace(id, client)`를 사용하고
 삽입 성공 여부를 확인하는 구조도 검토할 수 있습니다.
+
+`GetClients()`는 `clients` snapshot을 반환하는 함수입니다.
+
+```cpp
+std::unordered_map<SessionID, std::shared_ptr<ClientSession>> ClientManager::GetClients() {
+    std::lock_guard<std::mutex> lock(clients_mutex);
+    return clients;
+}
+```
+
+이 함수를 사용하는 주요 시나리오는 닉네임 중복 검사, 추후의 브로드캐스트입니다.
+
+```text
+닉네임 중복 검사 흐름:
+
+1. ClientSession이 Manager_wp.lock()으로 ClientManager에 접근
+2. GetClients()를 호출하여 clients snapshot 획득 (clients_mutex 내부에서 복사 후 lock 해제)
+3. snapshot을 순회하며 res.payload(설정하려는 닉네임)와 기존 세션의 nickname 비교
+4. 중복 발견 시 NICKNAME_CHANGE_FAILED 송신; 없으면 닉네임 갱신 후 NICKNAME_CHANGE_SUCESS 송신
+```
+
+이 구조의 핵심은 `clients_mutex`를 잡은 상태에서 snapshot만 복사하고 즉시 lock을 해제한 뒤,
+lock 없이 snapshot을 순회하는 점입니다.
+`send()`처럼 block될 수 있는 작업을 `clients_mutex` 보호 구간 안에서 수행하지 않습니다.
+
+중복 검사 시 비교 대상은 `res.nick`(송신자의 현재 헤더 닉네임)이 아닌
+`res.payload`(설정하려는 새 닉네임)임에 유의합니다.
+`res.nick`으로 비교하면 두 번째 이후 닉네임 변경이 항상 실패합니다.
 
 ## 11. Broadcast 전체 lock 방식의 문제
 

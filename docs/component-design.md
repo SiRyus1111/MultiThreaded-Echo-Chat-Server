@@ -130,6 +130,7 @@ private:
     NetState ClientState;
     std::atomic<bool> closing = false;
     SessionID session_id;
+    Nickname nickname;
 
 public:
     ClientSession(std::unique_ptr<ClientSocket> s, sockaddr_in addr, SessionID id);
@@ -138,12 +139,19 @@ public:
     void Run();
 
     RecvResult RecvPacket();
-    NetState SendPacket(const char* msg, uint32_t len, PacketType type);
+    NetState SendPacket(const char* msg, uint32_t len, PacketType type, Nickname nick);
 
     void HandleRecvPacket(const RecvResult& res);
     void HandleTransportException(NetState state);
     void MarkClosing();
     void RemoveThisClient();
+
+    NetState GetState() const;
+    bool GetClosing() const;
+    SessionID GetSessionID() const;
+    Nickname GetNickname() const;
+    sockaddr_in GetBinaryAddr() const;
+    std::string GetStrAddr() const;
 };
 ```
 
@@ -441,6 +449,36 @@ while (true) {
 여러 위치에서 세션 ID를 발급하는 구조가 된다면
 `next_session_id`는 `std::atomic<SessionID>` 또는 별도 mutex로 보호해야 합니다.
 
+## 4-8. nickname
+
+```cpp
+Nickname nickname;
+```
+
+`nickname`은 이 클라이언트 세션의 현재 닉네임을 저장하는 멤버입니다.
+
+연결 직후 생성자에서 `user_(session_id)` 형태의 기본 닉네임을 자동으로 설정합니다.
+
+```text
+기본 닉네임 = "user_" + session_id
+
+예: session_id = 3이면 → nickname = "user_3"
+```
+
+`session_id`는 연결마다 고유하게 부여되므로, 별도 중복 확인 없이 즉시 기본 닉네임으로 사용할 수 있습니다.
+
+`PacketHeader::nickname` 필드와의 관계는 다음과 같습니다.
+
+```text
+ClientSession::nickname
+  → 서버 내부에서 해당 세션의 현재 닉네임을 관리하는 값
+
+PacketHeader::nickname
+  → 모든 패킷 헤더에 포함되는 송신자 닉네임 필드
+  → SendPacket() 호출 시 이 멤버 값으로 채워짐
+```
+
+즉, `SendPacket()`이 헤더의 `nickname` 필드를 채울 때 `ClientSession::nickname`을 기준으로 사용합니다.
 
 # 5. ClientSession 핵심 함수 설계
 
@@ -476,7 +514,11 @@ ClientSession::ClientSession(std::unique_ptr<ClientSocket> s, sockaddr_in addr, 
       session_id(id) {
     inet_ntop(AF_INET, &ClientAddr.sin_addr, ClientAddrStr, sizeof(ClientAddrStr));
     
-    LineLogger::GetInstance().WriteSessionLog(session_id, ClientAddrStr, ntohs(ClientAddr.sin_port), LineLogger::LogType::CONNECTED, "Client Connected.");
+    std::ostringstream oss;
+    oss << "user_" << session_id;
+    nickname = oss.str();
+    
+    LineLogger::GetInstance().WriteSessionLog(session_id, nickname, ClientAddrStr, ntohs(ClientAddr.sin_port), LineLogger::LogType::CONNECTED, "Client Connected.");
 }
 ```
 
@@ -490,7 +532,8 @@ accept()로 얻은 client socket
   → ClientSocket RAII 객체로 감싼다
   → unique_ptr<ClientSocket>으로 ClientSession에게 소유권을 넘긴다
   → main thread가 부여한 SessionID를 ClientSession에 저장한다
-  → 이후 해당 socket과 SessionID는 ClientSession에 속한다
+  → ostringstream으로 "user_" + session_id 형태의 기본 닉네임을 생성하고 저장한다
+  → 이후 해당 socket, SessionID, 닉네임은 ClientSession에 속한다
 ```
 
 `SessionID`는 socket 자원이 아니라 값 데이터입니다.
@@ -543,10 +586,10 @@ Run()
   ├── RecvResult.state 확인
   │     └── 예외 발생 시 MarkClosing() → HandleTransportException(state) → break
   ├── HandleRecvPacket(res)     → 패킷 타입별 처리
-  │     ├── CHAT_MESSAGE        → SendPacket() 호출
+  │     ├── CHAT_MESSAGE        → SendPacket() 호출 (헤더에 ECHO_NICK 포함)
   │     │     └── 송신 실패 시 MarkClosing() → HandleTransportException(send_state)
   │     ├── HEADER_ERROR        → MarkClosing()
-  │     └── NICKNAME_CHANGE     → 미구현 stub
+  │     └── NICKNAME_CHANGE     → 길이 검사 → 중복 검사 → 닉네임 갱신(닉네임 유효 시) → 성공/실패 패킷 송신
   └── closing 확인 → true이면 break
 ```
 
@@ -618,8 +661,9 @@ RecvResult RecvPacket();
 4. type 검사
 5. payload 길이만큼 payload 수신
 6. 문자열 출력용 null 문자 추가
-7. 수신이 정상적으로 완료되었다면 RECV_COMPLETE 로그 Logging
-8. 수신 결과를 RecvResult로 반환
+7. nickname 필드 파싱 (33바이트 버퍼, [32]에 '\0' 강제 추가 — 상세는 protocol.md §2 nickname 참조)
+8. 수신이 정상적으로 완료되었다면 RECV_COMPLETE 로그 Logging (nickname 파라미터 포함)
+9. 수신 결과를 RecvResult로 반환
 ```
 
 반환 타입이 기존의 `NetState`에서 현재의 `RecvResult`로 변경된 이유는 다음과 같습니다.
@@ -641,6 +685,7 @@ struct RecvResult {
     PacketType type = PacketType::CHAT_MESSAGE; // 정상 수신된 패킷의 타입
     uint32_t length = 0;
     std::string payload;
+    Nickname nick;                              // 수신 패킷의 송신자 닉네임 (PacketHeader::nickname)
 };
 ```
 
@@ -780,7 +825,7 @@ if (recv_res.state.transport_error ||
 ## 5-5. SendPacket()
 
 ```cpp
-NetState SendPacket(const char* msg, uint32_t len, PacketType type);
+NetState SendPacket(const char* msg, uint32_t len, PacketType type, Nickname nick);
 ```
 
 `SendPacket()`은 하나의 완전한 패킷을 송신하는 함수입니다.
@@ -789,11 +834,11 @@ NetState SendPacket(const char* msg, uint32_t len, PacketType type);
 
 ```text
 1. payload 길이 검사
-2. PacketHeader 구성
+2. PacketHeader 구성 (nickname 패딩 포함 — memset 후 memcpy, 상세는 protocol.md §2 nickname 참조)
 3. host byte order → network byte order 변환
 4. PacketHeader 송신
 5. Payload 송신
-6. 송신이 정상적으로 완료되었다면 SEND_COMPLETE 로그 Logging
+6. 송신이 정상적으로 완료되었다면 SEND_COMPLETE 로그 Logging (nickname 파라미터 포함)
 7. 송신 과정에서 발생한 상태를 NetState로 반환
 ```
 
@@ -1026,7 +1071,7 @@ void HandleRecvPacket(const RecvResult& res);
 ```text
 switch (res.type)
   CHAT_MESSAGE
-    → SendPacket()으로 echo
+    → SendPacket()으로 echo (헤더에 ECHO_NICK 포함)
     → 송신 실패 시 MarkClosing() → HandleTransportException(send_state)
 
   HEADER_ERROR
@@ -1034,7 +1079,12 @@ switch (res.type)
     → 정상 수신된 에러 알림 패킷이므로 HandleTransportException()을 거치지 않음
 
   NICKNAME_CHANGE
-    → 미구현 stub (추후 닉네임 시스템과 함께 구현 예정)
+    → 길이 검사: res.length가 MAX_NICKNAME_LENGTH(32) 초과 시 NICKNAME_CHANGE_FAILED 송신
+    → 중복 검사: GetClients() snapshot 순회, res.payload와 기존 세션 nickname 비교
+      → 비교 대상은 res.nick(현재 헤더 닉네임)이 아닌 res.payload(설정하려는 닉네임)
+      → 중복 시 NICKNAME_CHANGE_FAILED 송신
+    → 검사 통과 시 nickname = res.payload 갱신
+    → NICKNAME_CHANGE_SUCESS 송신 (payload에 새 닉네임 포함, 헤더에 SERVER_NICK 포함)
 ```
 
 `HEADER_ERROR` 처리에서 중요한 점은 다음입니다.
@@ -1055,6 +1105,27 @@ HEADER_ERROR 패킷
 이는 `closing`의 의미인 **"이 세션은 논리적 종료 상태다"** 와 일관됩니다.
 종료의 원인이 transport 계층의 실패이든, 수신된 패킷의 내용이든,
 **"종료해야 하는 상황인가"** 라는 기준은 동일하게 유지됩니다.
+
+### 서버-클라이언트 닉네임 동기화
+
+닉네임 변경은 서버와 클라이언트가 다음 순서로 동기화합니다.
+
+```text
+클라이언트
+  → NICKNAME_CHANGE 패킷 송신 (payload = 원하는 닉네임)
+
+서버 HandleRecvPacket()
+  → 길이 검사 + 중복 검사
+  → 실패 시: NICKNAME_CHANGE_FAILED 송신 (payload = 실패 원인, SERVER_NICK 헤더 포함)
+  → 성공 시: nickname 갱신 후 NICKNAME_CHANGE_SUCESS 송신 (payload = 새 닉네임, SERVER_NICK 헤더 포함)
+
+클라이언트 HandleRecvPacket()
+  → NICKNAME_CHANGE_SUCESS 수신 시: nick_ = res.payload 로 갱신
+  → NICKNAME_CHANGE_FAILED 수신 시: 실패 원인(res.payload) 출력, 재시도
+```
+
+클라이언트는 서버의 응답을 받기 전까지 `nick_`을 갱신하지 않습니다.
+따라서 서버가 거부한 닉네임이 클라이언트에 반영되는 일은 없습니다.
 
 ### HandleTransportException()과의 차이점
 
@@ -1135,6 +1206,43 @@ ClientSession 소멸
 따라서 만약 `ClientSession` 내부의 다른 함수에서도 `shared_from_this()`를 사용하지 않는다면,
 장기적으로는 `ClientSession`의 `std::enable_shared_from_this<ClientSession>` 상속 필요성도 다시 검토할 수 있습니다.
 
+## 5-10. getter 함수
+
+`ClientSession`은 다음 6종의 getter 함수를 제공합니다.
+
+```cpp
+NetState GetState() const;
+bool GetClosing() const;
+SessionID GetSessionID() const;
+Nickname GetNickname() const;
+sockaddr_in GetBinaryAddr() const;
+std::string GetStrAddr() const;
+```
+
+#### 설계 의도
+
+getter를 제공하는 기준은 다음과 같습니다.
+
+```text
+getter 제공
+  → 외부에서 값 복사가 필요한 멤버
+  → 단순 값 타입 또는 값으로 복사 가능한 타입
+
+getter 미제공
+  → 복사 불가능한 RAII 객체 (ClientSock, Manager_wp 등)
+  → 외부에서 직접 접근할 필요가 없는 멤버
+```
+
+예를 들어 `ClientSock`(`unique_ptr<ClientSocket>`)은 복사할 수 없고,
+`Manager_wp`(`weak_ptr<ClientManager>`)는 외부에서 직접 접근할 이유가 없습니다.
+따라서 두 멤버에는 getter를 제공하지 않습니다.
+
+#### 현재 상태
+
+현재 getter 함수들은 아직 사용되지 않습니다.
+
+추후 `pair.second->nickname`처럼 멤버에 직접 접근하는 구조를 정리할 때 적용할 예정입니다.
+
 # 6. ClientManager
 
 ## 6-1. 역할
@@ -1150,6 +1258,7 @@ ClientSession 소멸
 - 종료된 `ClientSession` 제거
 - 현재 접속 중인 클라이언트 목록 관리
 - clients 컨테이너 동기화
+- clients snapshot 반환 (`GetClients()`) — `clients_mutex` 보호 하에 복사 후 반환
 - 추후 broadcast 수행
 - 추후 `SessionID` 기반 세션 조회
 
@@ -1164,6 +1273,7 @@ private:
 public:
     void AddClient(std::shared_ptr<ClientSession> client, SessionID id);
     void RemoveClient(SessionID id);
+    std::unordered_map<SessionID, std::shared_ptr<ClientSession>> GetClients();
 };
 ```
 
@@ -1353,7 +1463,42 @@ SessionID 기반 제거 구조의 장점은 다음과 같습니다.
 - `ClientSession::RemoveThisClient()`가 `shared_from_this()`에 의존하지 않아도 된다.
 - 로그와 세션 관리 기준을 동일하게 가져갈 수 있다.
 
-## 7-3. Broadcast() [Planned]
+## 7-3. GetClients()
+
+```cpp
+std::unordered_map<SessionID, std::shared_ptr<ClientSession>> GetClients();
+```
+
+`GetClients()`는 현재 `clients` 컨테이너의 snapshot을 반환하는 함수입니다.
+
+```cpp
+std::unordered_map<SessionID, std::shared_ptr<ClientSession>> ClientManager::GetClients() {
+    std::lock_guard<std::mutex> lock(clients_mutex);
+    return clients;
+}
+```
+
+#### 설계 의도
+
+`ClientSession`은 `ClientManager`의 `clients`에 직접 접근할 수 없습니다.
+`ClientSession`은 `Manager_wp`(`weak_ptr<ClientManager>`)로 `ClientManager`를 참조하기 때문입니다.
+
+닉네임 중복 검사처럼 세션 목록 전체를 순회해야 하는 상황에서,
+`ClientSession`이 `clients`에 직접 접근하는 대신 `GetClients()`를 통해 snapshot을 받는 구조를 사용합니다.
+
+```text
+ClientSession 내부 흐름:
+
+if (auto manager = Manager_wp.lock()) {
+    auto snapshot = manager->GetClients();
+    // snapshot 순회 (clients_mutex 해제된 상태)
+}
+```
+
+핵심은 `clients_mutex`를 잡은 상태에서 snapshot만 복사하고 즉시 해제하는 것입니다.
+이렇게 하면 중복 검사 중 다른 세션의 lock 대기를 최소화할 수 있습니다.
+
+## 7-4. Broadcast() [Planned]
 
 ```cpp
 void Broadcast(...);
@@ -1543,19 +1688,27 @@ public:
         std::cout << oss.str();
     }
 
-    // [SessionID ID][IP:Port][LogType] Message
+    // [SessionID ID][Nickname name][IP:Port][LogType] Message
     template <typename... Args>
     void WriteSessionLog(
-        uint64_t sessionId, 
-        const char* ipaddr, 
-        uint16_t port, 
-        LogType logType, 
+        uint64_t sessionId,
+        std::string nickname,
+        const char* ipaddr,
+        uint16_t port,
+        LogType logType,
         Args&&... args) {
-    
+
         WriteLog("[SessionID ", sessionId, "]",
+                "[Nickname ", nickname, "]",
                 "[", ipaddr, ":", port, "]",
                 "[", LogTypeToCstyleString(logType), "] ",
                 std::forward<Args>(args)...);
+    }
+
+    // [nickname] message (클라이언트 수신 메시지 전용)
+    template <typename... Args>
+    void WriteChatLog(std::string nickname, Args&&... args) {
+        WriteLog("[", nickname, "] ", std::forward<Args>(args)...);
     }
 
 };
@@ -1792,7 +1945,8 @@ mutex 해제
 template <typename... Args>
 void WriteSessionLog(
     uint64_t sessionId,
-    const std::string& ipaddr,
+    std::string nickname,
+    const char* ipaddr,
     uint16_t port,
     LogType logType,
     Args&&... args
@@ -1804,6 +1958,7 @@ void WriteSessionLog(
 세션 로그는 다음 요소들을 포함합니다.
 
 - `SessionID`
+- 송신자 닉네임
 - 클라이언트 IP
 - 클라이언트 Port
 - `LogType`
@@ -1812,20 +1967,50 @@ void WriteSessionLog(
 예상 출력 형식은 다음과 같습니다.
 
 ```text
-[SessionID 3][127.0.0.1:53021][RECV_COMPLETE] payload received
+[SessionID 3][Nickname maple][127.0.0.1:53021][RECV_COMPLETE] payload received
 ```
 
 이 형식은 멀티클라이언트 환경에서 다음 정보를 로그만 보고 추적하기 위한 것입니다.
 
 ```text
 어떤 세션이
+어떤 닉네임으로
 어떤 주소에서
 어떤 동작을 했는지
 ```
 
 추후에는 `WriteSessionLog()` 이외의, `ClientSession` 이외의 계층에서 사용하는 편의 함수도 고려할 수 있습니다.
 
-## 8-12. 프로젝트 내 역할
+## 8-12. WriteChatLog()
+
+```cpp
+template<typename... Args>
+void WriteChatLog(std::string nickname, Args&&... args);
+```
+
+`WriteChatLog()`는 클라이언트가 수신한 메시지를 콘솔에 출력하기 위한 전용 함수입니다.
+
+출력 형식은 다음과 같습니다.
+
+```text
+[maple] hello world
+[EchoFromServer] hello world
+```
+
+서버 세션 로그(`WriteSessionLog()`)와 달리 `SessionID`, `IP:Port`, `LogType`이 없습니다.
+이 함수는 서버 로그가 아닌 **클라이언트가 사용자에게 보여주는 채팅 메시지 출력**에만 사용합니다.
+
+사용 예시는 다음과 같습니다.
+
+```cpp
+// CHAT_MESSAGE 수신 시
+LineLogger::GetInstance().WriteChatLog(res.nick, res.payload);
+
+// HEADER_ERROR 수신 시 (서버 알림 메시지)
+LineLogger::GetInstance().WriteChatLog(res.nick, "서버가 연결을 종료합니다.");
+```
+
+## 8-13. 프로젝트 내 역할
 
 프로젝트의 콘솔 출력은 가능한 한 모두 `LineLogger`를 통해 수행합니다.
 
@@ -2039,10 +2224,13 @@ HandleTransportException()
 ## 11-1. PacketHeader::type
 
 ```cpp
+#pragma pack(push, 1)
 struct PacketHeader {
     int32_t type;
     uint32_t length;
+    char nickname[32];  // 송신자 닉네임 (가변 길이, 0패딩으로 32바이트 고정)
 };
+#pragma pack(pop)
 ```
 
 `PacketHeader::type`은 실제 네트워크 패킷에 저장되는 전송 필드입니다.
@@ -2057,6 +2245,9 @@ PacketHeader::type
 `PacketHeader`의 멤버들은 송신 시 `htonl()`을 적용하고,
 수신 시 `ntohl()`을 적용하여 host byte order로 변환합니다.
 
+`nickname` 필드의 패딩 / 파싱 메커니즘은 
+`protocol.md` 2. `PacketHeader` - `nickname` 서브섹션을 참조합니다.
+
 ---
 
 ## 11-2. PacketType
@@ -2065,7 +2256,9 @@ PacketHeader::type
 enum class PacketType : int32_t {
     CHAT_MESSAGE = 1,
     NICKNAME_CHANGE = 2,
-    HEADER_ERROR = 3
+    HEADER_ERROR = 3,
+    NICKNAME_CHANGE_FAILED = 4,
+    NICKNAME_CHANGE_SUCESS = 5
 };
 ```
 
@@ -2093,6 +2286,32 @@ send_net_header.type = htonl(static_cast<int32_t>(type));
 
 이 구조를 사용하면 전송 형식은 명확하게 유지하면서도,
 코드 내부에서는 패킷 타입의 의미를 더 안전하고 읽기 쉽게 표현할 수 있습니다.
+
+타입별 역할은 다음과 같습니다.
+
+```text
+CHAT_MESSAGE (1)
+  → 일반 채팅 메시지
+
+NICKNAME_CHANGE (2)
+  → 닉네임 변경 요청 (클라이언트 → 서버)
+  → payload에 설정하려는 닉네임 포함
+
+HEADER_ERROR (3)
+  → 프로토콜 에러 알림 패킷
+
+NICKNAME_CHANGE_FAILED (4)
+  → 닉네임 변경 실패 응답 (서버 → 클라이언트)
+  → 이유: 길이 초과 또는 중복 닉네임
+
+NICKNAME_CHANGE_SUCESS (5)
+  → 닉네임 변경 성공 응답 (서버 → 클라이언트)
+  → payload에 새 닉네임 포함
+  → SUCESS는 코드에서 사용하는 오타이며, 그대로 유지
+```
+
+서버가 수신할 수 있는 타입: `CHAT_MESSAGE`, `NICKNAME_CHANGE`, `HEADER_ERROR`
+클라이언트가 수신할 수 있는 타입: `CHAT_MESSAGE`, `HEADER_ERROR`, `NICKNAME_CHANGE_FAILED`, `NICKNAME_CHANGE_SUCESS`
 
 ---
 
@@ -2156,24 +2375,92 @@ recv_state  → 이번 RecvPacket() 호출의 결과만
 `Run()`은 클라이언트의 고수준 실행 루프를 담당합니다.
 
 ```text
+[초기 닉네임 설정 루프 — 메인 루프 진입 전]
+while(true)
+  ├── 닉네임 입력 받기
+  ├── 닉네임을 입력하지 않았거나 32바이트를 초과한다면 안내 메시지 → continue
+  ├── SendPacket(payload, length, NICKNAME_CHANGE, nick_)
+  ├── 송신 상태 확인 → 에러 시 종료
+  ├── RecvPacket()
+  ├── 수신 상태 확인 → 에러 시 종료
+  ├── HandleRecvPacket()
+  │     ├── NICKNAME_CHANGE_SUCESS → nick_ = res.payload → break
+  │     └── NICKNAME_CHANGE_FAILED → 실패 원인 출력 → continue
+  └── (break 발생 시 메인 루프 진입)
+
+[메인 루프]
 while(true)
   ├── 사용자 입력 받기
   ├── InputParser::Parse() → ParsedInput
   ├── valid == false → 에러 출력 → continue
   ├── quit == true  → 루프 종료
   ├── length 범위 초과 → 에러 출력 → continue
-  ├── SendPacket(payload, length, type)
+  ├── SendPacket(payload, length, type, nick_)
   ├── 송신 상태 확인 → 에러 시 루프 종료
   ├── RecvPacket()
   ├── 수신 상태 확인 → 에러 시 루프 종료
-  └── 수신 메시지 출력
+  └── HandleRecvPacket() → 수신 메시지 출력 또는 닉네임 처리
 ```
 
 `Run()`은 입력 파싱의 세부 절차를 직접 알 필요가 없습니다.
 `InputParser::Parse()`가 반환한 `ParsedInput`을 보고
 어떤 패킷을 보낼지, 루프를 계속할지 결정합니다.
 
-## 12-4. InputParser / ParsedInput
+## 12-4. HandleRecvPacket()
+
+```cpp
+void HandleRecvPacket(const RecvResult& res);
+```
+
+`ClientApp::HandleRecvPacket()`은 `RecvPacket()`이 정상적으로 수신한 패킷을
+타입별로 처리하는 패킷 핸들러입니다.
+
+이 함수는 `RecvResult.state`에 이상이 없는 경우, 즉 수신 자체가 성공한 경우에만 호출됩니다.
+
+```text
+switch (res.type)
+  CHAT_MESSAGE
+    → WriteChatLog(res.nick, res.payload)로 수신 메시지 출력
+
+  HEADER_ERROR
+    → WriteChatLog(res.nick, 서버 종료 알림 메시지)
+    → MarkClosing()
+
+  NICKNAME_CHANGE_SUCESS
+    → nick_ = res.payload (서버가 응답한 payload에 새 닉네임 포함)
+    → WriteChatLog()로 성공 메시지 출력
+
+  NICKNAME_CHANGE_FAILED
+    → WriteChatLog()로 실패 원인 메시지 출력
+```
+
+#### ClientSession::HandleRecvPacket()과의 차이점
+
+서버의 `ClientSession::HandleRecvPacket()`과 이 함수는 구조는 동일하지만,
+수신할 수 있는 `PacketType`이 다릅니다.
+
+```text
+ClientSession (서버)
+  → CHAT_MESSAGE, HEADER_ERROR, NICKNAME_CHANGE 처리
+
+ClientApp (클라이언트)
+  → CHAT_MESSAGE, HEADER_ERROR, NICKNAME_CHANGE_SUCESS, NICKNAME_CHANGE_FAILED 처리
+```
+
+클라이언트는 서버에 `NICKNAME_CHANGE`를 보내는 측이므로 `NICKNAME_CHANGE`를 수신하지 않습니다.
+대신 서버의 처리 결과인 `NICKNAME_CHANGE_SUCESS` / `NICKNAME_CHANGE_FAILED`를 수신합니다.
+
+`HandleTransportException()`과의 책임 구분은 `ClientSession`과 동일합니다.
+
+```text
+HandleTransportException()
+  → 수신 과정 자체의 실패 처리 (transport error / peer exit / protocol error)
+
+HandleRecvPacket()
+  → 정상 수신된 패킷의 타입별 처리
+```
+
+## 12-5. InputParser / ParsedInput
 
 ### InputParser
 
@@ -2187,6 +2474,17 @@ class InputParser {
 public:
     static ParsedInput Parse(std::string& input);
 };
+```
+
+`InputParser::Parse()` 함수의 결과 예시 : 
+
+```text
+"hello"                 → type=CHAT_MESSAGE,    payload="hello", quit=false, valid=true
+"/nick maple"           → type=NICKNAME_CHANGE, payload="maple", quit=false, valid=true
+"/nick (32바이트 초과 문자열)" → valid=false
+"/quit"                 → quit=true
+""                      → valid=false
+"/(정의되지 않은 식별자)" → valid=false
 ```
 
 ### ParsedInput

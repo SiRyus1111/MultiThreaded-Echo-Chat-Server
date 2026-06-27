@@ -75,13 +75,23 @@
 - `SendPacket()` 송신 완료 시 `SEND_COMPLETE` 로그 출력
 - `HandleTransportException(NetState)`에서 종료 / transport error / error packet 송신 로그 출력
 - `NetState` 구조체 / `PacketType` 구조체 이름 리팩토링
-- `RecvResult` 구조체 추가 (서버 / 클라이언트 공통)
-- `RecvPacket()`의 반환값을 `RecvResult`로 변경 — 수신 상태(`NetState`)와 수신된 패킷 타입(`PacketType`) / 페이로드를 분리하여 반환
-- `HandleRecvPacket()` 추가 — 정상 수신된 패킷을 타입별로 처리하는 패킷 핸들러
+- `RecvResult` 구조체 구현 (서버 / 클라이언트 공통) — `NetState`, `PacketType`, `length`, `payload` 포함
+- `RecvPacket()` 반환값을 `RecvResult`로 변경 — 수신 과정의 성공/실패(`NetState`)와 수신된 패킷의 타입(`PacketType`)을 분리하여 반환
+- `HandleRecvPacket()` 구현 (서버 / 클라이언트 공통) — 정상 수신된 패킷을 타입별로 처리하는 패킷 핸들러
+- `HandleTransportException()` 책임 재정의 — 수신 과정 자체의 실패만 처리, `HEADER_ERROR` 수신은 `HandleRecvPacket()`으로 이관
 - `ClientApp` 클래스 구현 (`ConnectSocket` 캡슐화, `NetState`, `Nickname`, `closing` 소유)
 - `ClientApp::HandleRecvPacket()` / `ClientApp::HandleTransportException()` 구현
 - `InputParser` / `ParsedInput` 구현
 - `LineLogger::WriteInputLog()` 추가 — 줄바꿈 없이 프롬프트를 출력하기 위한 전용 인터페이스 함수
+- 닉네임 시스템 도입 - `PacketType` 추가, - `PacketHeader`에 `char nickname[32]` 필드 추가
+- 닉네임 시스템 도입에 맞춰 기존 로직 수정 - `RecvPacket()` / `SendPacket()` / `HandleRecvPacket()` `InputParser::Parse()` 수정
+- `ECHO_NICK = "EchoFromServer"` 상수 추가 — echo 패킷 헤더 닉네임용
+- `SERVER_NICK = "ServerMessage"` 상수 추가 — 서버 알림 패킷 헤더 닉네임용
+- `RecvResult`에 `Nickname nick` 필드 추가 — 수신된 패킷의 송신자 닉네임 저장
+- `ClientSession` getter 함수 6종 추가 — `GetState()`, `GetClosing()`, `GetSessionID()`, `GetNickname()`, `GetBinaryAddr()`, `GetStrAddr()`
+- `ClientManager::GetClients()` 추가 — `clients_mutex` 보호 하에 clients snapshot 반환; `Manager_wp.lock()` 패턴으로 접근
+- `LineLogger::WriteSessionLog()` 시그니처에 `std::string nickname` 파라미터 추가; 출력 형식에 `[Nickname name]` 추가
+- `LineLogger::WriteChatLog()` 신규 추가 — 클라이언트 수신 메시지 전용 출력 (`[nickname] message` 형식)
 
 ### 구현 예정
 
@@ -92,7 +102,7 @@
 - ClientSession별 `send_mutex`
 - `ClientManager::Broadcast()`
 - broadcast 시 clients snapshot 복사 구조
-- nickname / message type 확장
+- message type 확장
 - broadcast 중 송신 실패 세션 정리 정책
 - `SessionID` 기반 로그 출력 및 세션 추적 개선
 - `SessionID` 기반 컨테이너 구조 검증
@@ -210,14 +220,20 @@ MultiThreaded Echo-Chat Server
 struct PacketHeader {
     int32_t type;
     uint32_t length;
+    char nickname[32];
 };
 #pragma pack(pop)
 ```
 
-- `type`: 일반 메시지 / 에러 메시지 / 추후 채팅 메시지 타입 구분
+- `type`: 일반 메시지 / 에러 메시지 / 닉네임 변경 결과 타입 구분
 - `length`: payload 길이
+- `nickname`: 송신자 닉네임 (고정 32바이트, 가변 길이 닉네임은 0패딩으로 채움)
 - 최대 payload 길이: `4096 bytes`
 - payload length가 `0`이거나 최대 크기를 초과하면 protocol error로 처리
+
+`PacketHeader::nickname`은 항상 **송신자의 현재 닉네임**입니다.
+`NICKNAME_CHANGE` 패킷의 경우 payload에 설정하려는 닉네임이 담기며,
+헤더의 `nickname`은 송신한 주체(클라이언트)의 닉네임입니다.
 
 현재 코드에서는 패킷 타입을 의미 있게 표현하기 위해 `PacketType` enum class를 사용합니다.
 다만 실제 네트워크 패킷에 들어가는 `PacketHeader::type` 필드는 `int32_t`로 유지합니다.
@@ -226,7 +242,9 @@ struct PacketHeader {
 enum class PacketType : int32_t {
     CHAT_MESSAGE = 1,
     NICKNAME_CHANGE = 2,
-    HEADER_ERROR = 3
+    HEADER_ERROR = 3,
+    NICKNAME_CHANGE_FAILED = 4,
+    NICKNAME_CHANGE_SUCESS = 5
 };
 ```
 
@@ -330,6 +348,7 @@ LineLogger::GetInstance().WriteLog(
 ```cpp
 LineLogger::GetInstance().WriteSessionLog(
     session_id,
+    nickname,
     ClientAddrStr,
     ntohs(ClientAddr.sin_port),
     LineLogger::LogType::RECV_COMPLETE,
@@ -340,7 +359,19 @@ LineLogger::GetInstance().WriteSessionLog(
 예상 출력 형식은 다음과 같습니다.
 
 ```text
-[SessionID 3][127.0.0.1:53021][RECV_COMPLETE] payload received
+[SessionID 3][Nickname maple][127.0.0.1:53021][RECV_COMPLETE] payload received
+```
+
+클라이언트에서 수신 메시지를 출력할 때는 `WriteChatLog()`를 사용합니다.
+
+```cpp
+LineLogger::GetInstance().WriteChatLog(nickname, payload);
+```
+
+출력 형식은 다음과 같습니다.
+
+```text
+[maple] hello world
 ```
 
 현재 `LineLogger` 라이브러리는 구현 완료 상태이며,
@@ -403,16 +434,14 @@ Client A → Server → Client B
 
 단기 목표:
 
-- `SessionID` 도입
-- 로그 출력 형식 개선
+- 로그 출력 형식 개선 (`LineLogger` 전면 적용)
 - `ClientSession`별 `send_mutex` 추가
 - `ClientManager::Broadcast()` 구현
 
 중기 목표:
 
 - Broadcast Chat Server 구현
-- nickname 기반 클라이언트 식별
-- message type 확장
+- message type 확장 (`JOIN`, `LEAVE`, `SERVER_NOTICE` 등)
 - 송신 실패 세션 정리 정책 구현
 
 장기 목표:

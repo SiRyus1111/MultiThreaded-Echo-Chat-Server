@@ -140,6 +140,32 @@
 - `TransportExceptionHandling()` → `HandleTransportException()` 이름 변경
 - `ClientApp`에 `closing` / `MarkClosing()` 추가
 
+### 닉네임 시스템
+
+- `PacketType` 추가 — `NICKNAME_CHANGE_FAILED = 4`, `NICKNAME_CHANGE_SUCESS = 5`
+- `PacketHeader`에 `char nickname[32]` 필드 추가 (`#pragma pack(push, 1)` 적용)
+- `RecvResult`에 `Nickname nick` 필드 추가 (수신 패킷의 송신자 닉네임)
+- `ClientSession`에 `Nickname nickname` 멤버 추가
+- `ClientSession` 생성자에서 `user_(session_id)` 형태의 기본 닉네임 자동 설정 (`ostringstream` 사용)
+- `ClientSession` getter 함수 6종 추가 — `GetState()`, `GetClosing()`, `GetSessionID()`, `GetNickname()`, `GetBinaryAddr()`, `GetStrAddr()`
+  (현재 미사용, 추후 직접 접근 패턴 정리 시 적용 예정)
+- `ClientManager::GetClients()` 추가 — `clients_mutex` 보호 하에 clients snapshot 반환; `Manager_wp.lock()` 패턴으로 접근
+- `ClientSession::SendPacket()` 시그니처에 `Nickname nick` 파라미터 추가; nickname 패딩 (`memset` → `memcpy`) 처리
+- `ClientSession::RecvPacket()`에서 33바이트 버퍼로 nickname 파싱 (`[32]`에 `'\0'` 강제 추가); `result.nick` 설정
+- `ClientSession::HandleRecvPacket()`에 `NICKNAME_CHANGE` 처리 구현
+  — 32바이트 길이 검사, `GetClients()` snapshot 기반 중복 검사 (`res.payload` 비교), 닉네임 갱신, 성공/실패 패킷 송신
+- `ClientSession::HandleTransportException()` 내 `WriteSessionLog()` 호출 전체에 `nickname` 파라미터 추가
+- `ECHO_NICK = "EchoFromServer"` 상수 추가 — echo 패킷 헤더 닉네임용
+- `SERVER_NICK = "ServerMessage"` 상수 추가 — 서버 알림 패킷 헤더 닉네임용
+- `LineLogger::WriteSessionLog()` 시그니처에 `std::string nickname` 파라미터 추가; 출력 형식에 `[Nickname name]` 추가
+- `LineLogger::WriteChatLog()` 신규 추가 — 클라이언트 수신 메시지 전용 출력 (`[nickname] message` 형식)
+- `InputParser::Parse()`에 닉네임 32바이트 초과 검사 추가 (`valid = false`)
+- `ClientApp` 생성자에 빈 닉네임 초기화 (`nick_.resize(MAX_NICKNAME_LENGTH, '\0')`)
+- `ClientApp::Run()`에 초기 닉네임 설정 루프 추가 — 메인 루프 진입 전 서버와 닉네임 동기화
+- `ClientApp::SendPacket()` 시그니처에 `Nickname nick` 파라미터 추가
+- `ClientApp::HandleRecvPacket()`에 `NICKNAME_CHANGE_SUCESS` / `NICKNAME_CHANGE_FAILED` 처리 추가
+  — 성공 시 `nick_` = `res.payload`로 갱신
+
 ---
 
 ## 3. 현재 기준 미구현
@@ -157,7 +183,6 @@
 
 ### 클라이언트 (미구현)
 
-- `ClientApp`에 닉네임 시스템 연동 (서버 측 `NICKNAME_CHANGE` 처리와 함께 구현 예정)
 - `HandleTransportException()` 내부 `std::cout` 출력을 `LineLogger` 기반으로 교체
 
 ### Others
@@ -356,29 +381,21 @@ Client A → Server → Client B
 
 ### 5-2. nickname 도입
 
-현재 진행 상태:
+현재 구현 완료 상태:
 
-- 클라이언트에서 `/nick` 명령어 파싱 구현 완료 (`InputParser`)
-- `PacketType::NICKNAME_CHANGE` 추가 완료
-- 서버 측 `ClientSession`의 닉네임 처리는 미구현
+- `PacketHeader`에 `char nickname[32]` 고정 필드 추가
+- `PacketType::NICKNAME_CHANGE_FAILED` / `NICKNAME_CHANGE_SUCESS` 추가
+- 클라이언트에서 `/nick` 명령어 파싱 구현 완료 (`InputParser`, 32바이트 초과 검사 포함)
+- `ClientSession::nickname` 멤버 추가; 기본 닉네임 `user_(session_id)` 자동 설정
+- `ClientSession::HandleRecvPacket()`에 `NICKNAME_CHANGE` 처리 구현 (길이 검사, 중복 검사, 닉네임 갱신)
+- `ClientManager::GetClients()` 추가 (닉네임 중복 검사에 활용)
+- `ClientApp::Run()` 초기 닉네임 설정 루프 추가 (서버-클라이언트 닉네임 동기화)
+- `ClientApp::HandleRecvPacket()` — `NICKNAME_CHANGE_SUCESS` / `NICKNAME_CHANGE_FAILED` 처리 완료
 
-채팅 서버로 확장하면 클라이언트 표시 이름이 필요합니다.
+향후 과제:
 
-예상 추가 필드:
-
-```cpp
-class ClientSession {
-private:
-    std::string nickname;
-};
-```
-
-고려할 점:
-
-- 기본 nickname 부여 방식
-- 중복 nickname 허용 여부
-- nickname 변경 메시지 타입
-- 접속 / 퇴장 메시지 출력 형식
+- Broadcast 단계에서 닉네임 기반 입장 / 퇴장 메시지 출력
+- 닉네임 기반 클라이언트 식별 로그 개선
 
 ---
 
@@ -478,7 +495,7 @@ thread-per-client 구조를 구현한 뒤,
 ### Broadcast 단계
 
 - [ ] 한 클라이언트 메시지가 다른 클라이언트에게 전달됨
-- [ ] sender 자신에게 보낼지 정책 확인
+- [v] sender 자신에게 보낼지 정책 확인
 - [ ] `closing == true` 세션은 송신 제외
 - [ ] broadcast 중 클라이언트 종료 상황 처리
 - [ ] Header / Payload 순서가 섞이지 않음
@@ -523,11 +540,10 @@ docs/original-design-note.md
 현재 기준 우선순위는 다음과 같습니다.
 
 ```text
-1. LineLogger 클라이언트 전용 인터페이스 구현
-2. 서버 ClientSession 닉네임 시스템 구현
-3. send_mutex 추가
-4. Broadcast 구현
-5. Chat Server로 확장
+1. LineLogger 프로젝트 전면 적용 (서버 전역 로그, ClientManager 로그 교체)
+2. send_mutex 추가
+3. ClientManager::Broadcast() 구현
+4. Chat Server로 확장
 ```
 
 즉, 지금 당장 중요한 것은 화려한 채팅 기능이 아니라,

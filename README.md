@@ -197,11 +197,13 @@ MultiThreaded Echo-Chat Server
 
 | 문서 | 내용 |
 |---|---|
-| [`docs/architecture.md`](docs/architecture.md) | main thread, client thread, ClientSession, ClientManager 등 스레드 / 클래스의 책임 분리, 전체적인 구조 |
+| [`docs/server-architecture.md`](docs/server-architecture.md) | 서버의 스레드 / 클래스의 책임 분리, 전체적인 구조 |
+| [`docs/client-architecture.md`](docs/client-architecture.md) | 클라이언트의 스레드 / 클래스의 책임 분리, 전체적인 구조 |
 | [`docs/protocol.md`](docs/protocol.md) | TCP byte stream, partial send/recv 처리, 애플리케이션 레벨 프로토콜 관련 |
 | [`docs/socket-raii.md`](docs/socket-raii.md) | WinsockGuard, ListenSocket, ClientSocket, ConnectSocket, socket lifetime |
 | [`docs/concurrency-design.md`](docs/concurrency-design.md) | 멀티스레딩, 객체 소유권, 세션 생명주기, 동기화 관련 설계 |
-| [`docs/component-design.md`](docs/component-design.md) | 주요 클래스의 멤버 변수와 핵심 함수의 설계 의도 |
+| [`docs/server-component-design.md`](docs/server-component-design.md) | 서버의 주요 클래스의 멤버 변수와 핵심 함수의 설계 의도 |
+| [`docs/client-component-design.md`](docs/client-component-design.md) | 클라이언트의 주요 클래스의 멤버 변수와 핵심 함수의 설계 의도 |
 | [`docs/roadmap.md`](docs/roadmap.md) | 현재 구현 상태, 구현 예정, 향후 개선 계획 |
 | [`docs/original-design-note.md`](docs/original-design-note.md) | 기존 README 원본 설계 노트 보존본 |
 

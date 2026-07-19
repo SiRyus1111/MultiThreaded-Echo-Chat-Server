@@ -166,6 +166,15 @@
 - `ClientApp::HandleRecvPacket()`에 `NICKNAME_CHANGE_SUCESS` / `NICKNAME_CHANGE_FAILED` 처리 추가
   — 성공 시 `nick_` = `res.payload`로 갱신
 
+### TryMarkClosing() 개편 (중복 종료 방지)
+
+- `ClientSession::MarkClosing()` / `ClientApp::MarkClosing()`을 `TryMarkClosing()`으로 이름 변경
+- `closing.compare_exchange_strong()` 기반 CAS로 전환 — 성공/실패를 `bool`로 반환
+- `TryMarkClosing()` 호출 위치를 `Run()`에서 `HandleTransportException()` 내부 최상단으로 이동
+- `HandleTransportException()`이 `TryMarkClosing()` 실패 시 즉시 반환하도록 가드 추가 — `protocol_error` 처리 중 에러 패킷 송신 실패로 인한 재귀 호출에서의 중복 실행 방지
+- `ClientSession::HandleRecvPacket()`의 `HEADER_ERROR` 분기에 `TryMarkClosing()` 성공 시에만 `RemoveThisClient()`를 호출하는 페어링 적용 (기존에는 `RemoveThisClient()` 호출이 누락되어 있었음)
+- `ClientApp`은 `RemoveThisClient()` 대응 개념이 없어 `TryMarkClosing()` 반환값을 현재는 사용하지 않으나, 추후 클라이언트 멀티스레드 확장을 대비해 반환 타입은 유지
+
 ---
 
 ## 3. 현재 기준 미구현

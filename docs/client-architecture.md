@@ -107,7 +107,7 @@ public:
 
     void HandleRecvPacket(const RecvResult& res);
     void HandleTransportException(const NetState& state);
-    void MarkClosing();
+    bool TryMarkClosing();
 };
 ```
 
@@ -119,8 +119,13 @@ closing == true
   → Run()의 while 루프를 종료한다
 ```
 
-`HandleRecvPacket()`에서 `HEADER_ERROR` 패킷 수신 시 `MarkClosing()`을 호출하며,
+`HandleRecvPacket()`에서 `HEADER_ERROR` 패킷 수신 시 `TryMarkClosing()`을 호출하며,
 `Run()`은 `HandleRecvPacket()` 호출 이후 `closing` 상태를 확인하여 루프를 종료합니다.
+
+`ClientApp`에는 서버의 `RemoveThisClient()`에 대응하는 개념이 없으므로
+`TryMarkClosing()`의 반환값을 현재는 사용하지 않습니다.
+다만 반환 타입을 `bool`로 유지하는 이유는, 추후 클라이언트가 멀티스레드로 확장될 경우를 대비해
+"이 호출이 실제로 종료를 성공시켰는가"를 알 수 있는 인터페이스를 미리 갖춰두기 위해서입니다.
 
 초기 닉네임 설정 루프가 필요한 이유는 다음과 같습니다.
 

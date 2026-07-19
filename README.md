@@ -92,6 +92,7 @@
 - `ClientManager::GetClients()` 추가 — `clients_mutex` 보호 하에 clients snapshot 반환; `Manager_wp.lock()` 패턴으로 접근
 - `LineLogger::WriteSessionLog()` 시그니처에 `std::string nickname` 파라미터 추가; 출력 형식에 `[Nickname name]` 추가
 - `LineLogger::WriteChatLog()` 신규 추가 — 클라이언트 수신 메시지 전용 출력 (`[nickname] message` 형식)
+- `MarkClosing()`을 CAS 기반 `TryMarkClosing()`으로 개편 — 중복 종료(double-close) 처리 방지
 
 ### 구현 예정
 

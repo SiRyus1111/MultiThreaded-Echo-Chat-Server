@@ -184,8 +184,8 @@ switch (res.type)
     → WriteChatLog(res.nick, res.payload)로 수신 메시지 출력
 
   HEADER_ERROR
-    → WriteChatLog(res.nick, 서버 종료 알림 메시지)
-    → MarkClosing()
+    → WriteChatLog(res.nick, res.payload)
+    → TryMarkClosing()
 
   NICKNAME_CHANGE_SUCESS
     → nick_ = res.payload (서버가 응답한 payload에 새 닉네임 포함)
@@ -194,6 +194,11 @@ switch (res.type)
   NICKNAME_CHANGE_FAILED
     → WriteChatLog()로 실패 원인 메시지 출력
 ```
+
+`ClientApp`에는 서버의 `RemoveThisClient()`에 대응하는 개념이 없으므로,
+`TryMarkClosing()`을 `RemoveThisClient()`와 페어링하지 않고 단독으로 호출합니다.
+`TryMarkClosing()`의 CAS 동작과 반환값 설계 배경은
+[server-component-design.md §5-6](server-component-design.md#5-6-trymarkclosing) 참고.
 
 #### ClientSession::HandleRecvPacket()과의 차이점
 

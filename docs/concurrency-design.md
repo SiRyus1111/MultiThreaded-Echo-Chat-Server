@@ -244,11 +244,11 @@ client thread의 종료 여부를 직접 관측할 수 없습니다.
 - transport error
 - peer exit
 - protocol error
-- `HEADER_ERROR` 타입의 패킷 수신 (`HandleRecvPacket()` 내부에서 `MarkClosing()` 호출)
+- `HEADER_ERROR` 타입의 패킷 수신 (`HandleRecvPacket()` 내부에서 `TryMarkClosing()` 성공 시)
 
 마지막 항목은 수신 자체의 실패가 아니라, **수신된 패킷의 내용에 의한 종료**입니다.
 하지만 "이 세션은 더 이상 정상적인 송수신 대상이 아니다"라는 `closing`의 의미에 부합하므로,
-동일한 플래그와 `MarkClosing()` 함수를 통해 표현합니다.
+동일한 플래그와 `TryMarkClosing()` 함수를 통해 표현합니다.
 
 즉, `closing = true`의 기준은 **"해당 세션을 종료해야 하는 상황인가"** 로 일관되게 유지됩니다.
 트리거가 transport 계층의 실패이든, 수신된 패킷의 의미이든 관계없이 동일한 기준을 적용합니다.
@@ -261,7 +261,78 @@ client thread의 종료 여부를 직접 관측할 수 없습니다.
 
 ---
 
-## 8. RemoveClient의 의미
+## 8. TryMarkClosing()의 원자성과 RemoveThisClient() 페어링
+
+`closing`을 `true`로 바꾸는 시점은 단순히 상태 하나를 갱신하는 것이 아니라,
+"이 세션의 종료 후처리(로그 출력, `RemoveThisClient()` 호출)를 누가 담당할 것인가"를 정하는 시점이기도 합니다.
+
+기존 `MarkClosing()`은 다음과 같이 무조건 `closing`을 `true`로 바꾸기만 하는 함수였습니다.
+
+```cpp
+void MarkClosing() {
+    closing.store(true);
+}
+```
+
+이 방식은 다음 두 상황에서 같은 세션에 대해 종료 후처리가 중복 실행되는 것을 막지 못했습니다.
+
+```text
+1. 기존에도 있던 문제
+   HandleTransportException()의 protocol_error 분기는
+   에러 패킷 송신에 실패하면 자기 자신을 재귀 호출한다.
+   이 재귀 호출로 인해 로그 출력과 RemoveThisClient()가 두 번 실행될 수 있었다.
+
+2. 향후 Broadcast 단계에서 예상되는 문제
+   Broadcast()가 도입되면 다른 client_thread가
+   같은 ClientSession의 SendPacket()을 호출하다 실패하여
+   HandleTransportException()을 동시에 트리거할 수 있다.
+```
+
+이를 막기 위해 `MarkClosing()`을 `TryMarkClosing()`으로 개편했습니다.
+`std::atomic<bool>::compare_exchange_strong()`을 사용해
+`closing`을 `false → true`로 바꾸는 시도가 **정확히 한 번만 성공**하도록 만듭니다.
+
+```cpp
+bool TryMarkClosing() {
+    bool expected = false;
+
+    if (!closing.compare_exchange_strong(expected, true)) {
+        return false;
+    }
+
+    return true;
+}
+```
+
+```text
+TryMarkClosing()
+  → 성공(true 반환): 이 호출이 최초로 종료를 감지함, 이후 종료 후처리 책임을 가짐
+  → 실패(false 반환): 이미 다른 호출/스레드가 종료 처리 중, 아무것도 하지 않고 즉시 반환
+```
+
+`std::mutex::try_lock()`과 비슷한 감각입니다.
+`lock()`처럼 실패 시 대기하지 않고, 실패하면 즉시 포기합니다.
+
+`TryMarkClosing()`과 `RemoveThisClient()`는 다음처럼 항상 세트로 취급합니다.
+
+```text
+TryMarkClosing()을 호출해 성공한 쪽만
+RemoveThisClient()를 호출할 책임을 가진다.
+
+TryMarkClosing()에 실패한 쪽은
+RemoveThisClient()를 호출하지 않는다.
+```
+
+이 페어링을 강제하기 위해 `TryMarkClosing()` 호출 위치를 `Run()`에서
+`HandleTransportException()` 내부 최상단으로 옮겼습니다.
+`HEADER_ERROR` 타입 패킷처럼 `HandleTransportException()`을 거치지 않는 경로(`HandleRecvPacket()`)에도
+동일하게 `TryMarkClosing()` 성공 시에만 `RemoveThisClient()`를 호출하는 패턴을 적용합니다.
+
+자세한 함수 설계는 [server-component-design.md §5-6](server-component-design.md#5-6-trymarkclosing)을 참고합니다.
+
+---
+
+## 9. RemoveClient의 의미
 
 `RemoveClient()`는 세션 객체를 즉시 소멸시키는 함수가 아닙니다.
 
@@ -305,7 +376,7 @@ RemoveClient()
 세션의 생존은 여전히 `shared_ptr`이 담당하고,
 `SessionID`는 `ClientManager`가 어떤 세션을 제거할지 식별하는 기준으로만 사용됩니다.
 
-## 9. 종료 흐름
+## 10. 종료 흐름
 
 전체 종료 흐름은 다음과 같습니다.
 
@@ -314,23 +385,26 @@ RemoveClient()
 
 [경로 A] 수신 과정 자체에서 예외 발생 (transport error / peer exit / protocol error)
 1. RecvPacket()이 RecvResult.state에 예외 상태를 기록하여 반환한다.
-2. Run()이 state를 확인하고 MarkClosing() → HandleTransportException(state) 호출 후 break한다.
+2. Run()이 state를 확인하고 HandleTransportException(state)를 호출한다.
+3. HandleTransportException() 내부 최상단에서 TryMarkClosing()을 시도한다.
+   - 실패하면 이미 다른 경로에서 종료 처리 중이므로 즉시 반환한다.
+   - 성공하면 상태별 로그 / 에러 응답 처리 후, 함수 마지막에 RemoveThisClient()를 호출한다.
+4. Run()이 break한다.
 
 [경로 B] 정상 수신된 패킷의 내용에 의한 종료 (HEADER_ERROR 수신 등)
 1. RecvPacket()이 type = HEADER_ERROR인 RecvResult를 반환한다.
 2. Run()이 HandleRecvPacket(res)를 호출한다.
-3. HandleRecvPacket() 내부에서 MarkClosing()을 호출한다.
+3. HandleRecvPacket() 내부에서 TryMarkClosing()을 시도하고, 성공한 경우에만 RemoveThisClient()를 호출한다.
 4. Run()이 HandleRecvPacket() 이후 closing 상태를 확인하고 break한다.
 
 [공통 경로]
 5. 이후 ClientManager의 broadcast는 해당 세션을 send 대상에서 제외한다.
-6. client_thread는 Run() 종료 전에 RemoveThisClient()를 호출한다.
-7. RemoveThisClient()는 Manager_wp.lock()으로 ClientManager에 접근한다.
-8. RemoveThisClient()는 자기 자신의 session_id를 넘겨 RemoveClient(session_id)를 호출한다.
-9. ClientManager::RemoveClient(SessionID)가 clients unordered_map에서 해당 key를 제거한다.
-10. Run()이 return되면 client_thread가 들고 있던 shared_ptr도 해제된다.
-11. 마지막 shared_ptr이 사라지면 ClientSession이 소멸한다.
-12. ClientSession이 소유하던 ClientSocket도 소멸하면서 raw SOCKET이 closesocket()으로 정리된다.
+6. RemoveThisClient()는 Manager_wp.lock()으로 ClientManager에 접근한다.
+7. RemoveThisClient()는 자기 자신의 session_id를 넘겨 RemoveClient(session_id)를 호출한다.
+8. ClientManager::RemoveClient(SessionID)가 clients unordered_map에서 해당 key를 제거한다.
+9. Run()이 return되면 client_thread가 들고 있던 shared_ptr도 해제된다.
+10. 마지막 shared_ptr이 사라지면 ClientSession이 소멸한다.
+11. ClientSession이 소유하던 ClientSocket도 소멸하면서 raw SOCKET이 closesocket()으로 정리된다.
 ```
 
 이 흐름에서 중요한 점은 `closing = true`가 객체 소멸을 의미하지 않는다는 것입니다.
@@ -339,7 +413,7 @@ RemoveClient()
 또한 `RemoveClient(session_id)`는 key 기반으로 `ClientManager`의 관리 목록에서 세션을 제거하는 동작입니다.
 이 함수가 호출되었다고 해서 즉시 `ClientSession` 객체가 소멸한다고 보장할 수는 없습니다.
 
-## 10. ClientManager lock
+## 11. ClientManager lock
 
 `ClientManager`는 접속 중인 `ClientSession` 목록을 관리합니다.
 
@@ -415,7 +489,7 @@ lock 없이 snapshot을 순회하는 점입니다.
 `res.payload`(설정하려는 새 닉네임)임에 유의합니다.
 `res.nick`으로 비교하면 두 번째 이후 닉네임 변경이 항상 실패합니다.
 
-## 11. Broadcast 전체 lock 방식의 문제
+## 12. Broadcast 전체 lock 방식의 문제
 
 처음 생각할 수 있는 방식은 `Broadcast()` 전체에 하나의 lock을 거는 것입니다.
 
@@ -437,7 +511,7 @@ Broadcast() 시작
 
 ---
 
-## 12. ClientManager lock과 ClientSession send lock 분리
+## 13. ClientManager lock과 ClientSession send lock 분리
 
 현재 설계에서는 lock의 역할을 다음처럼 분리할 예정입니다.
 
@@ -502,7 +576,7 @@ public:
 
 ---
 
-## 13. Broadcast snapshot 구조
+## 14. Broadcast snapshot 구조
 
 `ClientManager::Broadcast()`는 다음 흐름으로 구현할 예정입니다.
 
@@ -565,7 +639,7 @@ void ClientManager::Broadcast(
 
 ---
 
-## 14. 로그 출력 동기화
+## 15. 로그 출력 동기화
 
 멀티스레드 환경에서는 여러 스레드가 동시에 `std::cout`을 사용할 수 있습니다.
 
@@ -585,7 +659,7 @@ std::cout << a
 
 ---
 
-### 14-1. std::cout 보호 mutex 단일화
+### 15-1. std::cout 보호 mutex 단일화
 
 `std::cout`은 프로젝트 전체에서 공유되는 출력 자원입니다.
 
@@ -612,7 +686,7 @@ LineLogger::GetInstance().WriteLog("server started");
 
 ---
 
-### 14-2. 문자열 조립과 출력 구간 분리
+### 15-2. 문자열 조립과 출력 구간 분리
 
 `LineLogger`는 먼저 `std::ostringstream`로 로그 문자열을 완성합니다.
 
@@ -648,7 +722,7 @@ mutex 해제
 
 ---
 
-### 14-3. lock 점유 시간 최소화
+### 15-3. lock 점유 시간 최소화
 
 락을 잡은 상태에서 문자열을 조립하면,
 로그 포맷 생성 시간까지 lock 점유 시간에 포함됩니다.
@@ -670,7 +744,7 @@ mutex 해제
 
 ---
 
-### 14-4. 출력 연산 최소화
+### 15-4. 출력 연산 최소화
 
 기존 출력 방식은 하나의 로그를 여러 번의 `operator<<()` 호출로 출력합니다.
 
@@ -689,7 +763,7 @@ std::cout << oss.str();
 
 ---
 
-### 14-5. 로그 타입 제한
+### 15-5. 로그 타입 제한
 
 `LineLogger`는 로그 타입을 문자열이 아니라 `LogType` enum class로 받습니다.
 
@@ -713,7 +787,7 @@ enum class LogType {
 
 ---
 
-### 14-6. 정리
+### 15-6. 정리
 
 `LineLogger`의 로그 출력 동기화 설계는 다음으로 요약할 수 있습니다.
 
@@ -730,7 +804,7 @@ enum class LogType {
 
 ---
 
-### 14-7. Logging 계층 분리
+### 15-7. Logging 계층 분리
 
 현재 프로젝트는 로그 출력 계층을 다음과 같이 구분합니다.
 
@@ -771,7 +845,7 @@ WriteTransportLog(...)
 향후 확장 후보로 남겨둡니다.
 
 ---
-## 15. 아직 남은 정책 결정
+## 16. 아직 남은 정책 결정
 
 Broadcast 단계에서 아직 결정해야 할 정책은 다음과 같습니다.
 
@@ -786,7 +860,7 @@ Broadcast 단계에서 아직 결정해야 할 정책은 다음과 같습니다.
 
 ---
 
-## 16. 향후 send queue 구조 검토
+## 17. 향후 send queue 구조 검토
 
 현재 설계는 `Broadcast()`가 각 `ClientSession::SendPacket()`을 직접 호출하는 구조입니다.
 
@@ -812,7 +886,7 @@ clients snapshot
 
 ---
 
-## 17. 정리
+## 18. 정리
 
 현재 멀티스레딩 설계의 핵심은 다음과 같습니다.
 

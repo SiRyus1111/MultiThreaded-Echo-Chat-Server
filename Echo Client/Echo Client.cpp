@@ -133,7 +133,7 @@ public:
             case PacketType::HEADER_ERROR:
             {
                 LineLogger::GetInstance().WriteChatLog(res.nick, res.payload);
-                MarkClosing();
+                TryMarkClosing(); // 여기도 서버 코드와 같은 처리 필요할 듯(추측). 아 RemoveThisClient() 같은 코드가 없네. 상관 없겠다.
                 break;
             }
             case PacketType::NICKNAME_CHANGE_FAILED:
@@ -157,6 +157,10 @@ public:
     }
 
     void HandleTransportException(const NetState& state) {
+        // 다른 스레드가 이미 TryMarkClosing() 한 경우 대비용
+        if (!TryMarkClosing()) {
+            return;
+        }
         // break시 오류 발생 체크, 클라이언트 종료하기
         // 이 로직 별개의 함수로 분리해야함!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
         // !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
@@ -209,9 +213,14 @@ public:
 
     RecvResult RecvPacket();
 
-    void MarkClosing() {
-        closing.store(true);
-        return;
+    bool TryMarkClosing() {
+        bool expected = false;
+
+        if (!closing.compare_exchange_strong(expected, true)) {
+            return false;
+        }
+
+        return true;
     }
 
 };
@@ -241,7 +250,6 @@ void ClientApp::Run() {
             res.transport_error) {
 
             HandleTransportException(res);
-            MarkClosing();
             break;
         }
 
@@ -252,7 +260,6 @@ void ClientApp::Run() {
             nickname_change_res.state.transport_error) {
 
             HandleTransportException(nickname_change_res.state);
-            MarkClosing();
             break;
         }
 
@@ -305,7 +312,6 @@ void ClientApp::Run() {
             SendState.transport_error) {
 
             HandleTransportException(SendState);
-            MarkClosing();
             break;
         }
 
@@ -316,7 +322,6 @@ void ClientApp::Run() {
             RecvRes.state.transport_error) {
 
             HandleTransportException(RecvRes.state);
-            MarkClosing();
             break;
         }
 

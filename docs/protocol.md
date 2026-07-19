@@ -427,12 +427,12 @@ RecvResult.state가 정상인 경우
   → HandleRecvPacket(res)
   → PacketType별 처리 (서버 기준)
     CHAT_MESSAGE          → SendPacket() (echo, 헤더에 ECHO_NICK 포함)
-    HEADER_ERROR          → MarkClosing() (정상 수신된 에러 알림 패킷)
+    HEADER_ERROR          → TryMarkClosing() 성공 시 RemoveThisClient() (정상 수신된 에러 알림 패킷)
     NICKNAME_CHANGE       → 길이 검사 → 중복 검사 → 닉네임 갱신 → 성공/실패 패킷 송신
 
   → PacketType별 처리 (클라이언트 기준)
     CHAT_MESSAGE          → WriteChatLog()로 수신 메시지 출력
-    HEADER_ERROR          → WriteChatLog() 후 MarkClosing()
+    HEADER_ERROR          → WriteChatLog() 후 TryMarkClosing()
     NICKNAME_CHANGE_SUCESS  → nick_ 갱신 (res.payload), 성공 메시지 출력
     NICKNAME_CHANGE_FAILED  → 실패 원인 메시지 출력
 ```

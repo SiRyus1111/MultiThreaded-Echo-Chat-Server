@@ -150,10 +150,10 @@ Client A → Server → Client A
 Run()
   ├── RecvPacket()              → RecvResult 반환
   ├── 수신 상태 확인 (state)
-  │     └── 예외 발생 시 MarkClosing() → HandleTransportException(state)
+  │     └── 예외 발생 시 HandleTransportException(state)
   ├── HandleRecvPacket(res)     → 패킷 타입별 처리
   │     ├── CHAT_MESSAGE        → SendPacket() (echo, 헤더에 ECHO_NICK 포함)
-  │     ├── HEADER_ERROR        → MarkClosing()
+  │     ├── HEADER_ERROR        → TryMarkClosing() 성공 시 RemoveThisClient()
   │     └── NICKNAME_CHANGE     → 길이 검사 → GetClients() 중복 검사
   │                               → 통과 시 nickname 갱신 + NICKNAME_CHANGE_SUCESS 송신
   │                               → 실패 시 NICKNAME_CHANGE_FAILED 송신
@@ -225,7 +225,7 @@ public:
 
     void HandleRecvPacket(const RecvResult& res);
     void HandleTransportException(NetState state);
-    void MarkClosing();
+    bool TryMarkClosing();
     void RemoveThisClient();
 
     NetState GetState() const;

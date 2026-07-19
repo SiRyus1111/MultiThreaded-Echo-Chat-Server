@@ -589,11 +589,11 @@ void Run();
 Run()
   ├── RecvPacket()              → RecvResult 반환
   ├── RecvResult.state 확인
-  │     └── 예외 발생 시 MarkClosing() → HandleTransportException(state) → break
+  │     └── 예외 발생 시 HandleTransportException(state) → break
   ├── HandleRecvPacket(res)     → 패킷 타입별 처리
   │     ├── CHAT_MESSAGE        → SendPacket() 호출 (헤더에 ECHO_NICK 포함)
-  │     │     └── 송신 실패 시 MarkClosing() → HandleTransportException(send_state)
-  │     ├── HEADER_ERROR        → MarkClosing()
+  │     │     └── 송신 실패 시 HandleTransportException(send_state)
+  │     ├── HEADER_ERROR        → TryMarkClosing() 성공 시 RemoveThisClient()
   │     └── NICKNAME_CHANGE     → 길이 검사 → 중복 검사 → 닉네임 갱신(닉네임 유효 시) → 성공/실패 패킷 송신
   └── closing 확인 → true이면 break
 ```
@@ -813,12 +813,11 @@ recv_packet_state
 이렇게 하면 `Run()`의 흐름이 다음처럼 명확해집니다.
 
 ```cpp
-RecvResult recv_res = RecvPacket());
+RecvResult recv_res = RecvPacket();
 
 if (recv_res.state.transport_error ||
     recv_res.state.protocol_error ||
     recv_res.state.peer_closed) {
-    MarkClosing();
     HandleTransportException(recv_res.state);
 
     break;
@@ -947,46 +946,85 @@ NetState ClientSession::SendPacket(const char* msg, uint32_t len, PacketType typ
 
 ---
 
-## 5-6. MarkClosing()
+## 5-6. TryMarkClosing()
 
 ```cpp
-void MarkClosing();
+bool TryMarkClosing();
 ```
 
-`MarkClosing()`은 `ClientSession`의 논리적 종료 상태를 표시하는 함수입니다.
+`TryMarkClosing()`은 `ClientSession`의 논리적 종료 상태로의 전환을 **원자적으로 시도**하는 함수입니다.
 
-내부적으로는 `closing`을 `true`로 바꾸는 역할입니다.
+기존에는 `MarkClosing()`이 단순히 `closing.store(true)`만 수행하는 무조건적 setter였습니다.
+하지만 이 방식은 같은 세션에 대해 종료 처리가 두 번 이상 실행되는 것을 막지 못했습니다.
+
+예를 들어 `HandleTransportException()`의 `protocol_error` 분기는 에러 패킷 송신에 실패하면
+자기 자신을 재귀 호출합니다. 이 재귀 호출이 발생하면 함수 본문(로그 출력, `RemoveThisClient()`)이
+다시 한 번 실행될 수 있었습니다. 또한 추후 Broadcast 단계에서는 다른 client_thread가
+`Broadcast()`를 통해 같은 세션의 `SendPacket()`을 호출하다 실패하여 `HandleTransportException()`을
+동시에 트리거할 수도 있습니다.
+
+`TryMarkClosing()`은 `std::atomic<bool>::compare_exchange_strong()`을 사용해
+`closing`을 `false → true`로 바꾸는 시도가 **정확히 한 번만 성공**하도록 만듭니다.
+
+```cpp
+bool ClientSession::TryMarkClosing() {
+    bool expected = false;
+
+    if (!closing.compare_exchange_strong(expected, true)) {
+        return false;
+    }
+
+    return true;
+}
+```
 
 ```text
-MarkClosing()
-  → closing = true
+TryMarkClosing()
+  → closing == false였다면 true로 바꾸고 true 반환 (호출자가 종료 처리 책임을 가짐)
+  → closing이 이미 true였다면 바꾸지 않고 false 반환 (이미 다른 곳에서 처리 중이므로 아무것도 하지 않음)
 ```
 
-이 함수를 따로 두는 이유는,
-`closing`이라는 멤버를 외부에서 직접 변경하지 않도록 하기 위해서입니다.
+`std::mutex`의 `try_lock()`과 비슷한 감각입니다. 일단 시도해보고, 실패하면 재시도하지 않고 즉시 포기합니다.
 
-즉, 종료 상태 전환을 명시적인 함수 호출로 표현합니다.
+### TryMarkClosing()과 RemoveThisClient()의 관계
+
+`TryMarkClosing()`과 `RemoveThisClient()`는 항상 세트로 취급합니다.
+
+```text
+TryMarkClosing()에 성공한 호출만
+RemoveThisClient()를 호출할 책임을 가진다.
+
+TryMarkClosing()에 실패한 호출은
+이미 다른 호출이 종료 처리를 담당하고 있다고 보고,
+RemoveThisClient()를 호출하지 않는다.
+```
+
+이 페어링을 강제하기 위해 `TryMarkClosing()` 호출 위치를 `Run()`에서
+`HandleTransportException()` 내부 최상단으로 옮겼습니다.
 
 ```text
 Run()
   → 오류 또는 종료 상황 감지
-  → MarkClosing()
-  → HandleTransportException()
+  → HandleTransportException(state) 호출
+
+HandleTransportException(state)
+  → 함수 최상단에서 TryMarkClosing() 시도
+  → 실패 시 즉시 반환 (아무 처리도 하지 않음)
+  → 성공 시에만 상태별 로그 / 에러 응답 처리 후 RemoveThisClient() 호출
 ```
 
-이 구조를 사용하면 나중에 `closing`을 바꾸는 순간에
-추가 작업을 넣기도 쉬워집니다.
+기존 구조에서는 `Run()`이 먼저 `MarkClosing()`을 호출한 뒤 `HandleTransportException()`을 호출했기 때문에,
+`HandleTransportException()`은 자신이 호출되기 전 `closing`이 이미 바뀌었는지 알 수 없었습니다.
+`TryMarkClosing()`을 `HandleTransportException()` 내부로 옮기면, 그 반환값을 함수 자신이 바로 확인해서
+자기 몸체(로그 + `RemoveThisClient()`)를 실행할지 즉시 반환할지 결정할 수 있습니다.
 
-예를 들어 추후 다음 작업이 필요해질 수 있습니다.
+또한 `HEADER_ERROR` 타입 패킷은 `HandleTransportException()`을 거치지 않는 별도 경로(5-8. `HandleRecvPacket()` 참조)이므로,
+그 경로에도 동일한 `TryMarkClosing()` 성공 시에만 `RemoveThisClient()` 호출 패턴을 적용합니다.
 
-- 종료 로그 출력
-- 종료 사유 저장
-- 중복 종료 처리 방지
-- 통계 정보 갱신
-- send queue 정리
+### 이름 변경 이유
 
-따라서 단순히 `closing = true`를 직접 여러 곳에 흩뿌리기보다,
-`MarkClosing()`으로 종료 상태 전환 지점을 모으는 것이 좋습니다.
+`closing`을 무조건 `true`로 바꾸는 함수가 아니라, 원자적 전환을 **시도**하고 성공 여부를 알려주는 함수이므로
+`MarkClosing()`에서 `TryMarkClosing()`으로 이름을 바꿨습니다.
 
 ---
 
@@ -1017,9 +1055,32 @@ void HandleTransportException(NetState state);
 Run()
   → 송수신 상태 확인
   → 종료 / 예외 상황 감지
-  → MarkClosing()
   → HandleTransportException(state)
+
+HandleTransportException(state)
+  → 함수 최상단에서 TryMarkClosing() 시도
+  → 실패 시 즉시 반환
+  → 성공 시에만 이후 후처리 진행
 ```
+
+함수 최상단에 `TryMarkClosing()` 가드를 두는 이유는 다음과 같습니다.
+
+```text
+protocol_error 처리 중 에러 패킷 송신이 실패하면
+HandleTransportException()이 자기 자신을 재귀 호출한다.
+
+이때 재귀 호출 시점에는 이미 바깥쪽 호출이 TryMarkClosing()에 성공해
+closing == true인 상태이므로, 
+재귀 호출은 TryMarkClosing()에 실패해
+즉시 반환된다.
+
+따라서 로그 출력과 RemoveThisClient()는
+바깥쪽(최초) 호출에서 정확히 한 번만 실행된다.
+```
+
+이 가드가 없던 기존 구조에서는 이 재귀 호출 경로를 통해 `RemoveThisClient()`가
+두 번 호출될 수 있었습니다. `TryMarkClosing()`과의 페어링에 대한 자세한 설계 배경은
+5-6. `TryMarkClosing()`을 참고합니다.
 
 기존 구조에서는 `HandleTransportException()` 함수는 오로지 `ClientState`를 참조하여 통신 종료 / 예외 상황의 후처리를 진행했습니다.
 하지만 추후에 Broadcast 구조로 확장되었을 때, `HandleTransportException()` 함수가 호출되기 전에 `ClientState`가 갱신되어
@@ -1077,10 +1138,10 @@ void HandleRecvPacket(const RecvResult& res);
 switch (res.type)
   CHAT_MESSAGE
     → SendPacket()으로 echo (헤더에 ECHO_NICK 포함)
-    → 송신 실패 시 MarkClosing() → HandleTransportException(send_state)
+    → 송신 실패 시 HandleTransportException(send_state)
 
   HEADER_ERROR
-    → MarkClosing()
+    → TryMarkClosing() 성공 시 RemoveThisClient()
     → 정상 수신된 에러 알림 패킷이므로 HandleTransportException()을 거치지 않음
 
   NICKNAME_CHANGE
@@ -1098,10 +1159,10 @@ switch (res.type)
 HEADER_ERROR 패킷
   → 수신 실패가 아닌 정상 수신된 패킷
   → NetState에 기록하지 않음
-  → HandleRecvPacket()에서 MarkClosing()을 호출하여 세션 종료 처리
+  → HandleRecvPacket()에서 TryMarkClosing()에 성공한 경우에만 RemoveThisClient()를 호출하여 세션 종료 처리
 ```
 
-`HandleRecvPacket()`이 `MarkClosing()`을 호출하면,
+`HandleRecvPacket()`이 `TryMarkClosing()`에 성공하면 `RemoveThisClient()`를 호출하고,
 `Run()`은 이 함수 반환 후 `closing == true`를 확인하고 루프를 종료합니다.
 
 `HandleRecvPacket()`이 `Run()`의 루프 외부에 있기 때문에 직접 `break`할 수 없습니다.
@@ -1210,6 +1271,21 @@ ClientSession 소멸
 
 따라서 만약 `ClientSession` 내부의 다른 함수에서도 `shared_from_this()`를 사용하지 않는다면,
 장기적으로는 `ClientSession`의 `std::enable_shared_from_this<ClientSession>` 상속 필요성도 다시 검토할 수 있습니다.
+
+### 호출 위치와 TryMarkClosing()과의 관계
+
+`RemoveThisClient()`는 단독으로 호출되지 않고, 항상 `TryMarkClosing()` 성공 여부와 함께 호출됩니다.
+
+```text
+HandleTransportException()
+  → TryMarkClosing() 성공 시에만 함수 본문 실행, 마지막에 RemoveThisClient() 호출
+
+HandleRecvPacket()의 HEADER_ERROR 분기
+  → TryMarkClosing() 성공 시에만 RemoveThisClient() 호출
+```
+
+이 페어링 덕분에 같은 세션에 대해 `RemoveThisClient()`가 중복 호출되지 않습니다.
+자세한 배경은 5-6. `TryMarkClosing()`을 참고합니다.
 
 ## 5-10. getter 함수
 
@@ -2173,15 +2249,15 @@ NetState에 이상 없음
 
 transport error
   → Run()이 HandleTransportException() 호출
-  → HandleTransportException()이 MarkClosing() 후 종료 처리
+  → HandleTransportException()이 TryMarkClosing() 성공 시 종료 처리
 
 peer exit
   → Run()이 HandleTransportException() 호출
-  → HandleTransportException()이 MarkClosing() 후 제거 처리
+  → HandleTransportException()이 TryMarkClosing() 성공 시 제거 처리
 
 protocol error
   → Run()이 HandleTransportException() 호출
-  → HandleTransportException()이 MarkClosing() 및 에러 응답 처리
+  → HandleTransportException()이 TryMarkClosing() 성공 시 에러 응답 처리
 ```
 
 즉, `NetState`는 함수 간 책임 분리를 위한 장치입니다.

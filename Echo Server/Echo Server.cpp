@@ -136,12 +136,12 @@ public:
 
 		    	// 수신한 패킷의 타입이 CHAT_MESSAGE일 때 실행할 코드
 	    		// 이 함수 부분은 HandlePacket() 안으로 넣어야할 듯.. (넣었음)
-    			NetState send_state = SendPacket(buf, (uint32_t)strlen(buf), PacketType::CHAT_MESSAGE, ECHO_NICK);
+    			NetState send_state = SendPacket(buf, res.length, PacketType::CHAT_MESSAGE, ECHO_NICK); // 여기 (uint32_t) strlen(buf)에서 res.length로 수정함. 만약 보내려는 문자 중간에 널문자 있으면 클남.
 
 			    if (send_state.transport_error ||
 				    send_state.protocol_error ||
 			    	send_state.peer_closed) {
-		    		MarkClosing();
+		    		
 	    			HandleTransportException(send_state);
 
     			}
@@ -152,7 +152,11 @@ public:
 			{
 				// 수신한 패킷의 타입이 HEADER_ERROR일 때 실행할 코드
 				LineLogger::GetInstance().WriteSessionLog(session_id,nickname, ClientAddrStr, ntohs(ClientAddr.sin_port), LineLogger::LogType::RECEIVE_ERROR_PACKET, "Received an error packet from a Client.");
-				MarkClosing();
+			    // 여기 수정 필요함. 꼭 기억해두셈. 여기 RemoveThisClient() 함수 없음. CAS 기반 MarkClosing() 함수 추가할 때 이거 추가하셈.
+				// 수정 완료
+				if (TryMarkClosing()) {
+					RemoveThisClient();
+				}
 
 				break;
 			}
@@ -180,6 +184,8 @@ public:
 				if (nick_already_used) {
 					// 닉네임 설정 실패 시 정책에 맞게 실패한 이유를 페이로드에 실어서 보냄
 					SendPacket(nick_already_used_msg.c_str(), nick_already_used_msg.size(), PacketType::NICKNAME_CHANGE_FAILED, SERVER_NICK);
+
+					// 여기 SendPacket() 에 대한 예외처리 안되어있음!
 					break;
 				}
 				// 이 이후로는 유효한 닉네임인 경우에만 실행할 수 있음
@@ -190,6 +196,8 @@ public:
 				// 닉네임 설정 성공 시 클라이언트의 지역 닉네임을 갱신하기 위해 클라이언트가 갱신할 닉네임을 페이로드에 실어서 보내고,
 				// 닉네임 설정 성공 메시지는 전적으로 클라이언트에게 책임을 맏김
 				SendPacket(res.payload.c_str(), res.payload.size(), PacketType::NICKNAME_CHANGE_SUCESS, SERVER_NICK); // size()는 널문자를 제외한 문자열의 크기를 나타냄. 그렇기 때문에 그냥 쓰면 맨 뒤에 널문자가 안붙음.
+                
+				// 여기 SendPacket() 에 대한 예외처리 안되어있음!
 
 				break;
 			}
@@ -199,6 +207,10 @@ public:
 	}
 
 	void HandleTransportException(NetState State) {
+		// MarkClosing 시도하고 실패하면 다른 스레드가 예외 처리 한다는 뜻이니까 해당 스레드는 예외처리 하지 않음.
+		if (!TryMarkClosing()) {
+			return;
+		}
 
 		if (State.transport_error) {
 
@@ -255,8 +267,14 @@ public:
 
 	RecvResult RecvPacket();
 
-	void MarkClosing() {
-		closing.store(true);
+	bool TryMarkClosing() {
+		bool expected = false;
+
+		if (!closing.compare_exchange_strong(expected, true)) {
+			return false;
+		}
+
+		return true;
 	}
 
 	void RemoveThisClient() {
@@ -302,7 +320,6 @@ void ClientSession::Run() {
 			recv_res.state.protocol_error ||
 			recv_res.state.peer_protocol_error || // 이건 일단 남겨놓음. 추후에 NetState 구조체 갈아엎으면서 수정할 예정
 			recv_res.state.peer_closed) {
-			MarkClosing();
 			HandleTransportException(recv_res.state);
 
 			break;
@@ -456,7 +473,7 @@ RecvResult ClientSession::RecvPacket() {
 	}
 
 	result.type = static_cast<PacketType>(recv_host_header.type);
-
+	result.length = recv_host_header.length; // 이거 기록 안했었음. 그것땜에 항상 result.length == 0으로 판정되는 버그 있었음.
 	result.nick = nick_buf;
 
 	// 페이로드 수신

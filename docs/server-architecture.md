@@ -221,9 +221,9 @@ public:
     void Run();
 
     RecvResult RecvPacket();
-    NetState SendPacket(const char* msg, uint32_t len, PacketType type, Nickname nick);
+    NetState SendPacket(std::shared_ptr<Packet> packet);
 
-    void HandleRecvPacket(const RecvResult& res);
+    void HandleRecvPacket(std::shared_ptr<Packet> packet);
     void HandleTransportException(NetState state);
     bool TryMarkClosing();
     void RemoveThisClient();

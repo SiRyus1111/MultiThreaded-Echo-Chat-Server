@@ -144,9 +144,9 @@ public:
     void Run();
 
     RecvResult RecvPacket();
-    NetState SendPacket(const char* msg, uint32_t len, PacketType type, Nickname nick);
+    NetState SendPacket(std::shared_ptr<Packet> packet);
 
-    void HandleRecvPacket(const RecvResult& res);
+    void HandleRecvPacket(std::shared_ptr<Packet> packet);
     void HandleTransportException(NetState state);
     void MarkClosing();
     void RemoveThisClient();
@@ -660,37 +660,31 @@ RecvResult RecvPacket();
 기본 흐름은 다음과 같습니다.
 
 ```text
-1. PacketHeader 수신
-2. network byte order → host byte order 변환
-3. length 검사
-4. type 검사
-5. payload 길이만큼 payload 수신
-6. 문자열 출력용 null 문자 추가
-7. nickname 필드 파싱 (33바이트 버퍼, [32]에 '\0' 강제 추가 — 상세는 protocol.md §2 nickname 참조)
-8. 수신이 정상적으로 완료되었다면 RECV_COMPLETE 로그 Logging (nickname 파라미터 포함)
-9. 수신 결과를 RecvResult로 반환
+1. std::make_shared<Packet>()로 Packet 객체 생성
+2. PacketHeader 수신 (packet->header에 직접, 네트워크 바이트 정렬 그대로 저장)
+3. length / type 검사용 값을 로컬 변수로 host byte order 변환 (packet->header 자체는 수정하지 않음)
+4. length 검사
+5. type 검사
+6. payload_up->resize()로 크기 설정 후 payload_up->data()에 직접 payload 수신
+7. 수신이 정상적으로 완료되었다면 RECV_COMPLETE 로그 Logging (nickname 파라미터 포함)
+8. 수신 결과를 RecvResult{state, packet}로 반환
 ```
 
-반환 타입이 기존의 `NetState`에서 현재의 `RecvResult`로 변경된 이유는 다음과 같습니다.
+반환 타입이 기존의 `NetState`에서 `RecvResult`로 변경된 이유 자체는 이전과 동일합니다.
+수신 과정의 성공/실패(`NetState`)와, 정상 수신된 패킷의 의미(타입/페이로드)를 분리해서 전달하기 위해서입니다.
 
-패킷 핸들러(`HandleRecvPacket()`)를 도입하려면,
-수신된 패킷의 `PacketType`과 페이로드를 호출자에게 명확히 전달해야 합니다.
-기존의 `NetState`만으로는 "수신 과정에서 문제가 있었는가"만 알 수 있고,
-"어떤 타입의 패킷이 정상 수신됐는가"를 구분할 수 없었습니다.
+다만 "정상 수신된 패킷"을 표현하는 방식이 `type` / `length` / `payload` / `nick` 개별 필드에서
+`std::shared_ptr<Packet>` 하나로 바뀌었습니다. 이는 향후 하나의 수신 패킷을 여러 `ClientSession`의
+Send Queue에 복사 없이 공유해야 하는 상황(Broadcast 단계)을 대비한 것입니다.
+`Packet`의 설계 의도(shared_ptr 공유, 네트워크 바이트 정렬 at-rest, 공개 전 수정 가능 불변식)는
+**§10. Packet 구조체와 RecvResult**에서 다룹니다.
 
-특히 `HEADER_ERROR` 타입의 패킷은 수신 실패가 아닌 **정상 수신된 에러 알림 패킷**입니다.
-기존 구조에서는 이를 `NetState::peer_protocol_error`로 표현했는데,
-이 방식은 "수신 과정의 실패"와 "수신된 패킷의 의미"를 같은 `NetState` 안에서 혼용하는 문제가 있었습니다.
-
-`RecvResult`는 이 두 책임을 분리합니다.
+`RecvResult`는 이제 다음과 같습니다.
 
 ```cpp
 struct RecvResult {
-    NetState state{};                           // 수신 과정의 성공/실패
-    PacketType type = PacketType::CHAT_MESSAGE; // 정상 수신된 패킷의 타입
-    uint32_t length = 0;
-    std::string payload;
-    Nickname nick;                              // 수신 패킷의 송신자 닉네임 (PacketHeader::nickname)
+    NetState state{};                  // 수신 과정의 성공/실패
+    std::shared_ptr<Packet> packet;    // 수신한 패킷 (헤더 + payload)
 };
 ```
 
@@ -699,36 +693,30 @@ NetState
   → 수신 과정 자체에 문제가 있었는가?
   → transport error / protocol error(invalid length, invalid type) / peer closed
 
-PacketType (RecvResult.type)
-  → 정상적으로 수신된 패킷이 어떤 의미인가?
-  → CHAT_MESSAGE / NICKNAME_CHANGE / HEADER_ERROR
+Packet (RecvResult.packet)
+  → 정상적으로 수신된 패킷 자체
+  → packet->header.type을 확인해 CHAT_MESSAGE / NICKNAME_CHANGE / HEADER_ERROR를 판별
 ```
 
 따라서 `Run()`은 `RecvResult.state`를 보고 수신 실패 여부를 판단하고,
-`RecvResult.type`을 보고 `HandleRecvPacket()`에서 타입별 처리를 수행합니다.
-
-정상적으로 Header와 Payload 수신이 완료되면
-`LineLogger::WriteSessionLog()`를 통해 `RECV_COMPLETE` 로그를 출력합니다.
-
-수신 로그는 low-level `recv_all()` 계층이 아니라,
-세션 단위의 의미 있는 이벤트가 발생한 시점에 기록합니다.
+`RecvResult.packet`을 `HandleRecvPacket()`에 그대로 넘겨 타입별 처리를 수행합니다.
 
 ### RecvPacket()이 RecvResult를 반환하는 이유
 
 `RecvPacket()`은 `RecvResult`를 반환합니다.
 
-`RecvResult`는 `NetState`와 `PacketType`, 페이로드를 함께 담는 구조체입니다.
+`RecvResult`는 `NetState`와, 수신한 패킷 자체(`std::shared_ptr<Packet>`)를 함께 담는 구조체입니다.
 
 `NetState`만으로는 "수신 과정에서 문제가 있었는가"만 알 수 있고,
-"어떤 타입의 패킷이 정상 수신됐는가"를 Run()에 전달할 수 없었습니다.
+"어떤 패킷이 정상 수신됐는가"를 `Run()`에 전달할 수 없었습니다.
 
 패킷 핸들러(`HandleRecvPacket()`)를 도입하려면
-수신된 `PacketType`을 호출자에게 명확히 전달해야 하기 때문에
-`RecvPacket()`의 반환 타입을 `RecvResult`로 확장했습니다.
+수신된 패킷을 호출자에게 명확히 전달해야 하기 때문에
+`RecvPacket()`의 반환 타입을 `RecvResult`로 확장했고, 그 안에 `Packet`을 담았습니다.
 
 단, `RecvResult` 안에도 `NetState`가 포함되어 있습니다.
 `Run()`은 `RecvResult.state`를 보고 수신 실패 여부를 판단하고,
-`RecvResult.type`을 보고 `HandleRecvPacket()`에서 타입별 처리를 수행합니다.
+`RecvResult.packet`을 `std::move()`로 넘겨 `HandleRecvPacket()`에서 타입별 처리를 수행합니다.
 
 ### RecvPacket()이 RecvResult에 NetState를 포함해서 반환하는 이유
 
@@ -829,7 +817,7 @@ if (recv_res.state.transport_error ||
 ## 5-5. SendPacket()
 
 ```cpp
-NetState SendPacket(const char* msg, uint32_t len, PacketType type, Nickname nick);
+NetState SendPacket(std::shared_ptr<Packet> packet);
 ```
 
 `SendPacket()`은 하나의 완전한 패킷을 송신하는 함수입니다.
@@ -837,14 +825,17 @@ NetState SendPacket(const char* msg, uint32_t len, PacketType type, Nickname nic
 기본 흐름은 다음과 같습니다.
 
 ```text
-1. payload 길이 검사
-2. PacketHeader 구성 (nickname 패딩 포함 — memset 후 memcpy, 상세는 protocol.md §2 nickname 참조)
-3. host byte order → network byte order 변환
-4. PacketHeader 송신
-5. Payload 송신
-6. 송신이 정상적으로 완료되었다면 SEND_COMPLETE 로그 Logging (nickname 파라미터 포함)
-7. 송신 과정에서 발생한 상태를 NetState로 반환
+1. packet->header를 로컬 변수로 host byte order 변환하여 payload 길이 / 타입 검사
+2. PacketHeader 송신 (packet->header는 이미 네트워크 바이트 정렬 상태이므로 그대로 송신)
+3. Payload 송신 (packet->payload_up->c_str()을, ntohl(packet->header.length)만큼)
+4. 송신이 정상적으로 완료되었다면 SEND_COMPLETE 로그 Logging (nickname 파라미터 포함)
+5. 송신 과정에서 발생한 상태를 NetState로 반환
 ```
+
+`SendPacket()`은 더 이상 `msg` / `len` / `type` / `nick`을 개별 인자로 받지 않습니다.
+헤더(닉네임 포함)와 payload가 이미 채워진 `Packet`을 통째로 받아 그 내용을 그대로 송신하며,
+nickname 패딩(memset 후 memcpy)은 더 이상 `SendPacket()` 내부에서 수행하지 않습니다 —
+상세는 [protocol.md §2](protocol.md#패딩--파싱-메커니즘) 참고.
 
 Header와 Payload 송신이 정상적으로 완료되면
 `LineLogger::WriteSessionLog()`를 통해 `SEND_COMPLETE` 로그를 출력합니다.
@@ -1126,18 +1117,19 @@ Run()이 다시 예외 처리 코드로 비대해지는 것을 막는다.
 ## 5-8. HandleRecvPacket()
 
 ```cpp
-void HandleRecvPacket(const RecvResult& res);
+void HandleRecvPacket(std::shared_ptr<Packet> packet);
 ```
 
 `HandleRecvPacket()`은 `RecvPacket()`이 정상적으로 수신한 패킷을
 타입별로 처리하는 패킷 핸들러입니다.
 
-이 함수는 `RecvResult.state`에 이상이 없는 경우, 즉 수신 자체가 성공한 경우에만 호출됩니다.
+이 함수는 `RecvResult.state`에 이상이 없는 경우, 즉 수신 자체가 성공한 경우에만,
+`Run()`이 `result.packet`을 `std::move()`로 넘겨 호출합니다.
 
 ```text
-switch (res.type)
+switch (static_cast<PacketType>(ntohl(packet->header.type)))
   CHAT_MESSAGE
-    → SendPacket()으로 echo (헤더에 ECHO_NICK 포함)
+    → 같은 packet의 header.nickname을 ECHO_NICK으로 덮어쓴 뒤 SendPacket(packet) (echo)
     → 송신 실패 시 HandleTransportException(send_state)
 
   HEADER_ERROR
@@ -1145,13 +1137,22 @@ switch (res.type)
     → 정상 수신된 에러 알림 패킷이므로 HandleTransportException()을 거치지 않음
 
   NICKNAME_CHANGE
-    → 길이 검사: res.length가 MAX_NICKNAME_LENGTH(32) 초과 시 NICKNAME_CHANGE_FAILED 송신
-    → 중복 검사: GetClients() snapshot 순회, res.payload와 기존 세션 nickname 비교
-      → 비교 대상은 res.nick(현재 헤더 닉네임)이 아닌 res.payload(설정하려는 닉네임)
-      → 중복 시 NICKNAME_CHANGE_FAILED 송신
-    → 검사 통과 시 nickname = res.payload 갱신
-    → NICKNAME_CHANGE_SUCESS 송신 (payload에 새 닉네임 포함, 헤더에 SERVER_NICK 포함)
+    → 길이 검사: ntohl(packet->header.length)가 MAX_NICKNAME_LENGTH(32) 초과 시,
+      packet을 NICKNAME_CHANGE_FAILED 응답으로 덮어써 SendPacket(packet) 송신,
+      실패 시 HandleTransportException(send_res)
+    → 중복 검사: GetClients() snapshot 순회, *packet->payload_up과 기존 세션 nickname 비교
+      → 비교 대상은 packet->header.nickname(현재 헤더 닉네임)이 아닌 *packet->payload_up(설정하려는 닉네임)
+      → 중복 시 packet을 NICKNAME_CHANGE_FAILED 응답으로 덮어써 SendPacket(packet) 송신,
+        실패 시 HandleTransportException(send_res)
+    → 검사 통과 시 nickname = *packet->payload_up 갱신
+    → packet을 NICKNAME_CHANGE_SUCESS 응답으로 덮어써 SendPacket(packet) 송신
+      (payload에 새 닉네임 포함, 헤더에 SERVER_NICK 포함), 실패 시 HandleTransportException(send_res)
 ```
+
+각 분기에서 응답 패킷을 새로 만들지 않고 **수신한 `packet`을 그 자리에서 고쳐 써서 그대로 재사용**하는 이유는,
+이 시점의 `packet`이 아직 어떤 Send Queue에도 공개(발행)되지 않은 상태이기 때문입니다.
+"공개된 `Packet`은 수정하지 않는다"는 불변식은 발행 이후에만 적용되며, 발행 전 단계에서는 자유롭게 고쳐 쓸 수 있습니다.
+상세는 §10. Packet 구조체와 RecvResult 참고.
 
 `HEADER_ERROR` 처리에서 중요한 점은 다음입니다.
 
@@ -1204,8 +1205,9 @@ HEADER_ERROR 패킷
 
 이런 차이점이 있기 때문에,
 `HandleTransportException()`은 수신 과정의 예외 상황을 기록한 `NetState` 구조체만을 인자로 받아 처리하지만,
-`HandleRecvPacket()`은 패킷 타입에 맞는 처리를 해야하기 때문에 `NetState`와 `PacketType` / `payload`까지 포함되어있는
-`RecvResult` 구조체를 인자로 받습니다.
+`HandleRecvPacket()`은 패킷 타입에 맞는 처리를 해야 하므로 헤더와 payload를 모두 담고 있는
+`std::shared_ptr<Packet>`을 인자로 받습니다.
+`NetState`는 `Run()`이 `RecvResult.state`를 확인하는 시점에 이미 판별이 끝나므로, `HandleRecvPacket()`에는 전달되지 않습니다.
 
 ---
 
@@ -2154,9 +2156,108 @@ PacketHeader와 Payload를 각각 정해진 길이만큼 수신합니다.
 
 ---
 
-# 10. NetState
+# 10. Packet 구조체와 RecvResult
 
 ## 10-1. 역할
+
+`Packet`은 서버가 하나의 완전한 패킷(헤더 + payload)을 표현하기 위해 도입한 구조체입니다.
+
+```cpp
+struct Packet {
+    PacketHeader header{};
+    std::unique_ptr<std::string> payload_up;
+
+    Packet() : payload_up(std::make_unique<std::string>()) {}
+};
+```
+
+`RecvPacket()`은 이 `Packet`을 만들어 `std::shared_ptr<Packet>`으로 감싸 반환하고,
+`SendPacket()`은 이 `std::shared_ptr<Packet>`을 그대로 받아 송신합니다.
+
+```text
+RecvResult
+  └── NetState state              ← 수신 과정이 정상적이었는지 확인용
+  └── std::shared_ptr<Packet> packet  ← 패킷 핸들러(HandleRecvPacket())에 그대로 전달
+                  └── PacketHeader header
+                  |       └── int32_t type
+                  |       └── uint32_t length
+                  |       └── char nickname[32]
+                  └── std::unique_ptr<std::string> payload_up
+```
+
+## 10-2. 왜 `shared_ptr<Packet>`인가
+
+`SendPacket()` / `RecvPacket()`의 시그니처를 `Packet` 하나로 통일하는 목적은,
+향후 Broadcast 단계에서 하나의 수신 패킷을 여러 `ClientSession`의 Send Queue에
+**복사 없이** 전달해야 하는 상황을 대비하기 위해서입니다.
+
+`Packet`을 값으로 복사하면 최대 4096바이트의 payload까지 매번 deep copy해야 하므로 성능 손실이 큽니다.
+반면 `std::shared_ptr<Packet>`을 사용하면:
+
+```text
+- 여러 곳(Send Queue 등)이 같은 Packet 객체를 참조로 공유한다.
+- 참조가 모두 사라지기 전까지 Packet 객체는 소멸하지 않는다 (댕글링 포인터 방지).
+- 더 이상 소유할 필요가 없는 지역에서는 std::move()로 넘겨 ref count 증가 없이 소유권만 이동한다.
+```
+
+`payload_up`을 `std::unique_ptr<std::string>`으로 둔 이유는,
+`Packet`이 자신의 payload를 배타적으로 소유한다는 의미를 명확히 하고,
+실수로 무거운 값 복사가 일어나는 것을 코드 레벨에서 막기 위해서입니다.
+
+## 10-3. 헤더는 항상 네트워크 바이트 정렬로 유지
+
+`Packet::header`는 항상 네트워크 바이트 정렬 상태를 "정본(canonical)"으로 유지합니다.
+`length`나 `type` 같은 필드 값이 필요할 때는, 원본 `packet->header`를 직접 고치지 않고
+별도의 로컬 변수로 `ntohl()` 변환해서 읽습니다.
+
+```cpp
+// 예시 (RecvPacket() 내부)
+PacketHeader recv_host_header{};
+recv_host_header.type = ntohl(static_cast<int32_t>(packet->header.type));
+recv_host_header.length = ntohl(packet->header.length);
+// packet->header 자체는 여전히 네트워크 바이트 정렬 상태
+```
+
+이렇게 하는 이유는, 향후 하나의 `shared_ptr<Packet>`가 여러 Send Queue에서 동시에 참조될 수 있는
+구조로 확장될 것이기 때문입니다. 원본 헤더를 호스트 정렬로 바꿔버리면, 그 사이 다른 참조자가
+일관되지 않은 값을 보게 되거나, 송신 직전에 다시 네트워크 정렬로 되돌리는 과정에서
+여러 참조자가 경쟁하는 문제가 생길 수 있습니다.
+
+## 10-4. "공개된 Packet은 수정하지 않는다" 불변식
+
+```text
+Packet은 어떤 Send Queue에도 아직 들어가지 않은 시점(= 아직 공개/발행되지 않은 시점)까지만 수정할 수 있다.
+```
+
+현재 Echo Server 단계에는 Send Queue 자체가 없으므로, `HandleRecvPacket()`이 수신한 `packet`을
+그 자리에서 고쳐 써서(예: `CHAT_MESSAGE`의 header.nickname을 `ECHO_NICK`으로 덮어쓰고 그대로 echo 응답으로 재사용)
+그대로 `SendPacket()`에 넘기는 것은 이 불변식을 위반하지 않습니다. 아직 그 `packet`이 어디에도 공개되지 않았기 때문입니다.
+
+이 불변식은 향후 Send Queue가 도입되면 훨씬 중요해집니다: 하나의 `Packet`이 여러 세션의 Send Queue에
+동시에 올라간 뒤에는, 그 내용이 세션마다 다르게 보이면 안 되기 때문에 더 이상 수정할 수 없습니다.
+
+## 10-5. RecvResult가 {state, packet}으로 구성된 이유
+
+`RecvResult`는 "수신 과정에서 발생한 상태"와 "수신한 대상"을 분리해서 전달한다는 기존 설계 철학을 유지합니다.
+
+```cpp
+struct RecvResult {
+    NetState state{};                // 수신 과정의 성공/실패
+    std::shared_ptr<Packet> packet;  // 수신한 패킷
+};
+```
+
+다만 "수신한 대상"을 `type` / `length` / `payload` / `nick` 개별 필드로 흩뿌리지 않고,
+`Packet` 하나로 통일했습니다. `RecvPacket()` / `SendPacket()` / `HandleRecvPacket()`이 모두
+같은 `Packet` 표현을 공유하므로, 함수 사이를 오갈 때 필드를 하나씩 옮겨 담을 필요가 없어집니다.
+
+상세 함수 설계는 [§5-4. RecvPacket()](#5-4-recvpacket)과 [§5-5. SendPacket()](#5-5-sendpacket) 참고.
+
+---
+
+# 11. NetState
+
+## 11-1. 역할
 
 `NetState`는 송수신 과정에서 발생한 상태를 기록하는 구조체입니다.
 
@@ -2187,7 +2288,7 @@ payload까지 성공
 
 ---
 
-## 10-2. NetState를 사용하는 이유
+## 11-2. NetState를 사용하는 이유
 
 `NetState`를 사용하는 이유는
 통신 결과를 단순 `bool`보다 더 구체적으로 표현하기 위해서입니다.
@@ -2224,7 +2325,7 @@ HEADER_ERROR packet
 
 ---
 
-## 10-3. RecvPacket() / SendPacket()의 반환값으로 사용하는 이유
+## 11-3. RecvPacket() / SendPacket()의 반환값으로 사용하는 이유
 
 `SendPacket()`은 `NetState`를 반환합니다.
 `RecvPacket()`은 `RecvResult`를 반환하지만, `RecvResult` 안에 `NetState`가 포함되어 있습니다.
@@ -2275,9 +2376,9 @@ HandleTransportException()
 
 ---
 
-# 11. PacketHeader와 PacketType
+# 12. PacketHeader와 PacketType
 
-## 11-1. PacketHeader::type
+## 12-1. PacketHeader::type
 
 ```cpp
 #pragma pack(push, 1)
@@ -2306,7 +2407,7 @@ PacketHeader::type
 
 ---
 
-## 11-2. PacketType
+## 12-2. PacketType
 
 ```cpp
 enum class PacketType : int32_t {
@@ -2371,9 +2472,9 @@ NICKNAME_CHANGE_SUCESS (5)
 
 ---
 
-# 12. 추후 확장 지점
+# 13. 추후 확장 지점
 
-## 12-1. send_mutex
+## 13-1. send_mutex
 
 추후 Broadcast Chat Server 단계에서는 여러 thread가
 같은 `ClientSession`에 대해 `SendPacket()`을 호출할 수 있습니다.
@@ -2398,7 +2499,7 @@ send_mutex
 
 ---
 
-## 12-2. Broadcast()
+## 13-2. Broadcast()
 
 `Broadcast()`는 Chat Server 확장의 핵심 함수입니다.
 
@@ -2415,7 +2516,7 @@ send_mutex
 
 ---
 
-# 13. 정리
+# 14. 정리
 
 현재 컴포넌트 설계의 핵심은 다음과 같습니다.
 

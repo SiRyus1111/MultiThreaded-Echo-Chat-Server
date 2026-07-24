@@ -285,6 +285,29 @@ result.nick = nick_buf;
 이 상태에서 `char*`를 `std::string`으로 변환하면 버퍼를 넘어 읽는 undefined behavior가 발생할 수 있습니다.
 따라서 수신 측은 반드시 33바이트 버퍼를 만들고 `[32]`에 `'\0'`을 강제로 씁니다.
 
+#### 서버 측 적용 위치 변경 (Packet 구조체 도입 이후)
+
+서버의 `ClientSession::SendPacket()` / `ClientSession::RecvPacket()`은 더 이상 이 패딩 / 파싱 절차를
+함수 내부에서 직접 수행하지 않습니다. `Packet::header`가 항상 네트워크 바이트 정렬 상태로 유지되고,
+여러 곳에서 재사용될 수 있는 하나의 헤더를 그대로 송수신하기 때문입니다.
+
+```text
+서버 SendPacket() / RecvPacket()
+  → nickname 패딩 / 파싱을 더 이상 직접 수행하지 않음
+  → packet->header를 이미 완성된 상태로 그대로 송수신
+
+서버에서 이 패딩 절차가 실제로 일어나는 위치
+  → HandleRecvPacket()          (echo 응답, NICKNAME_CHANGE 성공 / 실패 응답 조립 시)
+  → HandleTransportException()  (HEADER_ERROR 응답 조립 시)
+
+클라이언트 SendPacket() / RecvPacket()
+  → 위의 패딩 / 파싱 절차를 그대로 유지 (Packet 기반 개편 대상 아님)
+```
+
+즉, 이 패딩 / 파싱 메커니즘 자체는 여전히 유효한 설계이지만, 서버 쪽에서는 그 책임 위치가
+`SendPacket()` / `RecvPacket()` 내부에서
+각 패킷을 조립하는 호출부(`HandleRecvPacket()`, `HandleTransportException()`)로 옮겨졌습니다.
+
 ### 특수 닉네임 상수
 
 서버가 직접 생성하는 패킷에는 클라이언트 닉네임 대신 예약된 특수 상수를 사용합니다.
@@ -379,32 +402,34 @@ while 이미 받은 길이 < 전체 길이:
 현재 기본 수신 흐름은 `ClientSession::RecvPacket()`으로 분리되어 있습니다.
 
 ```text
-1. PacketHeader 수신
-2. network byte order → host byte order 변환
-3. nickname 필드 파싱 (상세는 2. PacketHeader - nickname 참조)
+1. std::make_shared<Packet>()로 Packet 객체 생성
+2. PacketHeader 수신 (packet->header에 직접, 네트워크 바이트 정렬 그대로 저장)
+3. length / type 검사용 값을 로컬 변수로 host byte order 변환 (packet->header 자체는 수정하지 않음)
 4. length 검사
 5. type 검사
-6. payload 길이만큼 payload 수신
-7. 문자열 출력용 null 문자 추가
-8. 수신 결과를 RecvResult로 반환
+6. payload_up->resize()로 크기 설정 후 payload_up->data()에 직접 payload 수신
+7. 수신 결과를 RecvResult{state, packet}로 반환
 ```
 
 `RecvPacket()`은
-수신 과정의 성공/실패를 나타내는 `NetState`와 정상 수신된 패킷의 타입 / 페이로드를 함께 담은 `RecvResult`를 반환합니다.
+수신 과정의 성공/실패를 나타내는 `NetState`와, 수신한 패킷 자체(`std::shared_ptr<Packet>`)를 함께 담은 `RecvResult`를 반환합니다.
+`Packet`의 설계 의도와 구조는 [server-component-design.md §10](server-component-design.md#10-packet-구조체와-recvresult) 참고.
 
 `HEADER_ERROR` 타입의 패킷은 수신 실패가 아닌 **정상 수신된 에러 알림 패킷**입니다.
 따라서 `RecvPacket()` 내부에서 `NetState`에 기록하지 않고,
-`RecvResult`의 `type` 필드를 통해 호출자에게 전달합니다.
+`result.packet`(수신한 `Packet`)에 담아 호출자에게 전달합니다.
+호출자는 `packet->header.type`을 직접 확인하여 `HEADER_ERROR` 여부를 판별합니다.
 
 현재 기본 송신 흐름은 `ClientSession::SendPacket()`으로 분리되어 있습니다.
 
 ```text
-1. payload 길이 검사
-2. PacketHeader 구성 (nickname 필드 패딩 포함, 상세는 2. PacketHeader - nickname 참조)
-3. host byte order → network byte order 변환
-4. PacketHeader 송신
-5. Payload 송신
+1. 인자로 받은 std::shared_ptr<Packet>의 packet->header를 로컬 변수로 host byte order 변환하여 length / type 검사
+2. PacketHeader 송신 (packet->header는 이미 네트워크 바이트 정렬 상태이므로 그대로 송신, 별도 조립 없음)
+3. Payload 송신 (packet->payload_up->c_str()을, ntohl(packet->header.length)만큼)
 ```
+
+`SendPacket()`은 더 이상 호출자로부터 `msg` / `len` / `type` / `nick`을 개별 인자로 받지 않습니다.
+헤더(닉네임 포함)와 payload가 이미 채워진 `Packet`을 통째로 받아, 그 내용을 그대로 송신합니다.
 
 즉, `Run()`은 byte order 변환이나 Header / Payload 송수신 세부 절차를 직접 알 필요가 없습니다.
 
@@ -424,13 +449,14 @@ RecvResult.state에 문제가 있는 경우
   → transport error / protocol error / peer closed 처리
 
 RecvResult.state가 정상인 경우
-  → HandleRecvPacket(res)
+  → HandleRecvPacket(packet)   (packet = std::move(recv_res.packet))
   → PacketType별 처리 (서버 기준)
-    CHAT_MESSAGE          → SendPacket() (echo, 헤더에 ECHO_NICK 포함)
+    CHAT_MESSAGE          → 같은 packet에 ECHO_NICK을 덮어써서 그대로 SendPacket(packet) (echo)
     HEADER_ERROR          → TryMarkClosing() 성공 시 RemoveThisClient() (정상 수신된 에러 알림 패킷)
     NICKNAME_CHANGE       → 길이 검사 → 중복 검사 → 닉네임 갱신 → 성공/실패 패킷 송신
+                            → 각 송신(SendPacket())이 실패하면 HandleTransportException() 호출
 
-  → PacketType별 처리 (클라이언트 기준)
+  → PacketType별 처리 (클라이언트 기준, 기존 구조 유지)
     CHAT_MESSAGE          → WriteChatLog()로 수신 메시지 출력
     HEADER_ERROR          → WriteChatLog() 후 TryMarkClosing()
     NICKNAME_CHANGE_SUCESS  → nick_ 갱신 (res.payload), 성공 메시지 출력

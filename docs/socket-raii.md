@@ -112,6 +112,7 @@ ListenSocket
 - `send_all()` 기반 송신
 - `recv_all()` 기반 수신
 - 소멸 시 `closesocket()` 자동 호출
+- `ClientSockShutdown()` — 종료 권한을 가진 스레드가 `shutdown()`으로 blocking 중인 recv thread의 `recv()` 호출을 강제로 탈출시킴
 
 `ClientSocket`은 특정 클라이언트와 연결된 raw socket을 소유하는 RAII 객체입니다.
 
@@ -160,6 +161,7 @@ ClientSession
 - `send_all()` 기반 송신
 - `recv_all()` 기반 수신
 - 소멸 시 `closesocket()` 자동 호출
+- `ConnectSockShutdown()` — 클라이언트 종료 시 blocking 중인 `RecvRun()`의 `recv()` 호출을 강제로 탈출시킴
 
 서버 측의 `ListenSocket` / `ClientSocket`과 달리,
 `ConnectSocket`은 클라이언트 프로그램에서 서버와의 연결을 담당합니다.

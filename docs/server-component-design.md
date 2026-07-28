@@ -136,19 +136,28 @@ private:
     std::atomic<bool> closing = false;
     SessionID session_id;
     Nickname nickname;
+    std::queue<std::shared_ptr<Packet>> send_queue;
+    std::mutex send_queue_mutex;
+    std::condition_variable send_queue_cv;
 
 public:
     ClientSession(std::unique_ptr<ClientSocket> s, sockaddr_in addr, SessionID id);
 
     void AddToManager(std::shared_ptr<ClientManager> manager_sp);
-    void Run();
+    void RecvRun();
+    void SendRun();
 
     RecvResult RecvPacket();
     NetState SendPacket(std::shared_ptr<Packet> packet);
 
+    bool SendQueuePush(std::shared_ptr<Packet> packet);
+    std::shared_ptr<Packet> SendQueuePop();
+    void SendQueueCV_NotifyOne();
+    void SendQueueCV_NotifyAll();
+
     void HandleRecvPacket(std::shared_ptr<Packet> packet);
     void HandleTransportException(NetState state);
-    void MarkClosing();
+    bool TryMarkClosing();
     void RemoveThisClient();
 
     NetState GetState() const;
@@ -485,6 +494,54 @@ PacketHeader::nickname
 
 즉, `SendPacket()`이 헤더의 `nickname` 필드를 채울 때 `ClientSession::nickname`을 기준으로 사용합니다.
 
+## 4-9. send_queue
+
+```cpp
+std::queue<std::shared_ptr<Packet>> send_queue;
+```
+
+`send_queue`는 이 세션에 대해 아직 송신하지 못한 패킷들을 담아두는 큐입니다.
+
+기존에는 브로드캐스트를 호출한 스레드가 각 세션의 `SendPacket()`을 직접 호출하는 구조를 검토했지만,
+이 경우 그 스레드가 느린 클라이언트의 `send()` blocking에 발이 묶이는 문제가 있었습니다.
+
+따라서 `broadcast()`(또는 echo, 닉네임 변경 응답 등 다른 송신 지점)는 이 큐에 패킷을 `push()`만 하고,
+실제 송신은 해당 세션을 담당하는 `SendRun()`이 큐를 소비하며 수행합니다.
+
+`private`으로 은닉되어 있으며, 외부에서는 `SendQueuePush()` / `SendQueuePop()`을 통해서만 접근할 수 있습니다.
+자세한 함수 설계는 [§5-10](#5-10-sendqueuepush-sendqueuepop) 참고.
+
+## 4-10. send_queue_mutex
+
+```cpp
+std::mutex send_queue_mutex;
+```
+
+`send_queue_mutex`는 `send_queue`의 `push()` / `pop()`을 보호하는 mutex입니다.
+
+여러 스레드(broadcast를 호출하는 스레드, 패킷 핸들러가 실행되는 recv thread 등)가 동시에 `push()`할 수 있고,
+`SendRun()`이 동시에 `pop()`할 수 있으므로 이 접근을 보호해야 합니다.
+
+기존에 계획했던 `send_mutex`(Header + Payload 송신 구간 전체를 감싸는 락)와는 역할이 다릅니다.
+세션당 실제 `SendPacket()` 호출 주체가 `SendRun()` 하나로 고정되어 있어 송신 구간 자체를 락으로 보호할 필요가 없고,
+`send_queue_mutex`는 오직 큐 자료구조 접근만 보호합니다.
+
+또한 `TryMarkClosing()`의 CAS 연산도 이 mutex를 잡은 상태에서 수행합니다.
+이는 `SendRun()`이 `send_queue_cv.wait(lock)`으로 대기 조건을 확인하는 구간과 `closing`이 바뀌는 시점이
+겹쳐서 notify를 놓치는 lost wakeup을 방지하기 위한 것입니다.
+
+## 4-11. send_queue_cv
+
+```cpp
+std::condition_variable send_queue_cv;
+```
+
+`send_queue_cv`는 `SendRun()`이 `send_queue`가 비어있을 때 spin 없이 대기하기 위한 condition variable입니다.
+
+`SendQueuePush()`가 큐에 패킷을 넣은 뒤 `notify_one()`으로 대기 중인 `SendRun()`을 깨우고,
+세션이 종료되어야 할 때는 `SendQueueCV_NotifyAll()`로 대기 중인 `SendRun()`을 깨워
+`closing == true`를 확인하고 빠져나올 수 있게 합니다.
+
 # 5. ClientSession 핵심 함수 설계
 
 ## 5-1. ClientSession 생성자
@@ -572,13 +629,17 @@ ClientSession은 ClientManager에게 제거 요청을 해야 한다.
 
 ---
 
-## 5-3. Run()
+## 5-3. Run() (legacy)
+
+> Send Queue와 recv/send thread 분리 도입 이후, `Run()`은 더 이상 호출되지 않는 legacy 함수입니다.
+> 코드에는 과거 Echo Server 단계의 설계를 보여주는 참고용으로 남아있으며, 실제 실행 흐름은
+> [§5-3-1. RecvRun()](#5-3-1-recvrun)과 [§5-3-2. SendRun()](#5-3-2-sendrun)을 참고합니다.
 
 ```cpp
-void Run();
+void Run(); // 현재 미사용
 ```
 
-`Run()`은 해당 클라이언트 세션의 고수준 실행 흐름을 담당합니다.
+`Run()`은 해당 클라이언트 세션의 고수준 실행 흐름을 담당하던 함수입니다(Echo Server 단계, recv/send thread 분리 이전).
 
 현재 5.20 리팩토링 이후,
 `Run()`은 Header / Payload 송수신 세부 절차를 직접 담당하지 않습니다.
@@ -646,6 +707,56 @@ RecvPacket()
 
 즉, 메시지 처리 방식이 echo에서 broadcast로 바뀌더라도,
 패킷 수신 / 송신 함수의 기본 구조는 재사용할 수 있습니다.
+
+## 5-3-1. RecvRun()
+
+```cpp
+void RecvRun();
+```
+
+`RecvRun()`은 해당 세션의 수신 흐름 전담 함수로, `client_recv_thread`가 실행합니다.
+
+```text
+RecvRun()
+  while (true):
+    ├── RecvPacket()              → RecvResult 반환
+    ├── closing 확인 → true이면 return (다른 스레드가 이미 종료 처리 중)
+    ├── 수신 상태 확인
+    │     └── 예외 발생 시 HandleTransportException(state) → SendQueueCV_NotifyAll() → break
+    ├── HandleRecvPacket(packet)  → 패킷 타입별 처리(SendQueuePush()로 응답 예약)
+    └── closing 확인 → true이면 return (HandleRecvPacket() 안에서 종료됐을 수 있음)
+```
+
+`RecvPacket()` 직후와 `HandleRecvPacket()` 직후 두 번 `closing`을 확인하는 이유는,
+`SendRun()` 쪽에서 먼저 오류를 감지해 `TryMarkClosing()`에 성공하고 `ClientSockShutdown()`을 호출했을 수도 있고,
+`HandleRecvPacket()` 자신(HEADER_ERROR 처리)이 방금 `closing`을 바꿨을 수도 있기 때문입니다.
+
+에러를 감지해 `HandleTransportException()`을 호출한 뒤에는 `SendQueueCV_NotifyAll()`을 호출합니다.
+`SendRun()`이 빈 큐에서 `send_queue_cv.wait()`로 대기 중일 수 있는데, `closing`이 바뀐 것을 놓치지 않고
+바로 깨어나 종료할 수 있도록 하기 위해서입니다.
+
+## 5-3-2. SendRun()
+
+```cpp
+void SendRun();
+```
+
+`SendRun()`은 해당 세션의 송신 흐름 전담 함수로, `client_send_thread`가 실행합니다.
+이 세션에 대해 `SendPacket()`을 실제로 호출하는 주체는 이 함수 하나뿐입니다.
+
+```text
+SendRun()
+  while (true):
+    ├── send_queue_mutex 획득 후, (closing == true 또는 send_queue가 비어있지 않음)까지 send_queue_cv.wait(lock)
+    ├── closing 확인 → true이면 return
+    ├── SendQueuePop()으로 패킷 하나 꺼냄
+    ├── SendPacket(packet) 실행
+    └── 예외 발생 시 HandleTransportException(send_res)
+```
+
+`SendPacket()` 호출 주체가 이 함수로 고정되어 있기 때문에, 같은 세션에 대해 Header/Payload가
+서로 다른 스레드의 호출로 뒤섞일 가능성이 구조적으로 없습니다. 그래서 기존에 검토했던
+"`SendPacket()` 내부의 `send_mutex`"가 더 이상 필요하지 않습니다.
 
 ---
 
@@ -885,7 +996,7 @@ Run()
 
 하지만 별개로 한 `ClientSession`의 상태인 `ClientState`에도 `SendPacket()`의 상태를 기록합니다.
 
-### SendPacket()과 send_mutex
+### SendPacket()과 send_mutex (폐기된 방안)
 
 현재 `SendPacket()`은 Header와 Payload를 하나의 논리적 패킷으로 보냅니다.
 
@@ -894,10 +1005,9 @@ PacketHeader 송신
 Payload 송신
 ```
 
-추후 Broadcast Chat Server 단계에서는 여러 thread가 같은 `ClientSession`에 대해
-`SendPacket()`을 호출할 가능성이 있습니다.
-
-이때 다음과 같은 순서가 발생하면 안 됩니다.
+Broadcast Chat Server 단계를 검토하며, 여러 thread가 같은 `ClientSession`에 대해
+`SendPacket()`을 직접 호출할 가능성을 우려해 다음과 같은 순서가 발생하지 않도록
+`SendPacket()` 내부에 `send_mutex`를 두는 방안을 검토했습니다.
 
 ```text
 잘못된 예:
@@ -908,32 +1018,21 @@ Payload_A
 Payload_B
 ```
 
-원하는 순서는 다음과 같습니다.
-
-```text
-올바른 예:
-
-Header_A
-Payload_A
-Header_B
-Payload_B
-```
-
-따라서 추후 `ClientSession`별 `send_mutex`는
-`SendPacket()` 내부에 적용하는 것이 자연스럽습니다.
-
 ```cpp
-// 추후 적용 예정
+// 검토했던 방안 (현재는 채택하지 않음)
 NetState ClientSession::SendPacket(const char* msg, uint32_t len, PacketType type) {
     std::lock_guard<std::mutex> lock(send_mutex);
-
-    // Header 구성
-    // Header 송신
-    // Payload 송신
+    // Header 구성 / Header 송신 / Payload 송신
 }
 ```
 
-이렇게 하면 같은 클라이언트에게 보내는 Header / Payload 순서를 보호할 수 있습니다.
+하지만 Send Queue와 recv/send thread 분리를 도입하면서, 한 세션에 대해 실제로 `SendPacket()`을
+호출하는 주체가 그 세션의 `SendRun()` 스레드 하나로 고정되었습니다. 다른 스레드는 `SendQueuePush()`로
+패킷을 큐에 넣기만 할 뿐 `SendPacket()`을 직접 호출하지 않으므로, 여러 스레드가 동시에 같은 세션의
+`SendPacket()`을 호출해 Header/Payload가 뒤섞이는 상황 자체가 구조적으로 발생하지 않습니다.
+
+따라서 `send_mutex`를 `SendPacket()` 내부에 두는 방안은 채택하지 않았습니다. 대신 `Send Queue` 자체를
+보호하는 `send_queue_mutex`가 필요합니다. 자세한 내용은 [§5-10. SendQueuePush() / SendQueuePop()](#5-10-sendqueuepush-sendqueuepop) 참고.
 
 ---
 
@@ -960,10 +1059,16 @@ bool TryMarkClosing();
 ```cpp
 bool ClientSession::TryMarkClosing() {
     bool expected = false;
-
-    if (!closing.compare_exchange_strong(expected, true)) {
-        return false;
+    {
+        std::lock_guard<std::mutex> lock(send_queue_mutex); // send thread의 lost wakeup 방지
+        if (!closing.compare_exchange_strong(expected, true)) {
+            return false;
+        }
     }
+
+    // 이 이후를 실행할 수 있는 스레드는 종료 권한을 가진다.
+    ClientSock->ClientSockShutdown();
+    RemoveThisClient();
 
     return true;
 }
@@ -971,46 +1076,41 @@ bool ClientSession::TryMarkClosing() {
 
 ```text
 TryMarkClosing()
-  → closing == false였다면 true로 바꾸고 true 반환 (호출자가 종료 처리 책임을 가짐)
+  → closing == false였다면 true로 바꾸고, 이어서 shutdown()과 RemoveThisClient()까지 직접 수행한 뒤 true 반환
   → closing이 이미 true였다면 바꾸지 않고 false 반환 (이미 다른 곳에서 처리 중이므로 아무것도 하지 않음)
 ```
 
 `std::mutex`의 `try_lock()`과 비슷한 감각입니다. 일단 시도해보고, 실패하면 재시도하지 않고 즉시 포기합니다.
 
+CAS 자체를 `send_queue_mutex` 락 범위 안에서 수행하는 이유는, `SendRun()`이
+`send_queue_cv.wait(lock)`으로 (`closing == true` 또는 큐가 비어있지 않음) 조건을 확인하는 구간과
+`closing`이 바뀌는 시점이 서로 겹쳐서 `notify`를 놓치는 lost wakeup을 막기 위해서입니다.
+같은 mutex를 공유하면, `closing`의 변경과 `SendRun()`의 조건 확인이 서로를 완전히 앞서거나 뒤따르게 되어
+notify를 놓치지 않습니다.
+
 ### TryMarkClosing()과 RemoveThisClient()의 관계
 
 `TryMarkClosing()`과 `RemoveThisClient()`는 항상 세트로 취급합니다.
+다만 Send Queue / recv-send thread 도입 이전에는 이 페어링을 호출부(`HandleTransportException()`,
+`HandleRecvPacket()`의 `HEADER_ERROR` 분기)가 책임졌지만, 지금은 `TryMarkClosing()` 자신이
+CAS 성공 시 `shutdown()`과 `RemoveThisClient()`를 내부에서 직접 수행하도록 통합했습니다.
 
 ```text
-TryMarkClosing()에 성공한 호출만
-RemoveThisClient()를 호출할 책임을 가진다.
+TryMarkClosing()의 CAS에 성공한 호출은
+함수 내부에서 shutdown()과 RemoveThisClient()를 모두 수행한다.
 
 TryMarkClosing()에 실패한 호출은
 이미 다른 호출이 종료 처리를 담당하고 있다고 보고,
-RemoveThisClient()를 호출하지 않는다.
+아무것도 하지 않는다.
 ```
 
-이 페어링을 강제하기 위해 `TryMarkClosing()` 호출 위치를 `Run()`에서
-`HandleTransportException()` 내부 최상단으로 옮겼습니다.
+호출부(`HandleTransportException()`, `HandleRecvPacket()`의 `HEADER_ERROR` 분기 등)는
+`TryMarkClosing()`을 호출하기만 하면 되고, 반환값을 보고 별도로 `RemoveThisClient()`를 호출할 필요가 없습니다.
+과거에는 호출부마다 "성공했으면 `RemoveThisClient()`를 호출해야 한다"는 페어링을 각자 지켜야 했는데,
+이 책임을 `TryMarkClosing()` 하나로 모아서 호출부가 페어링을 놓치는 실수를 구조적으로 막았습니다.
 
-```text
-Run()
-  → 오류 또는 종료 상황 감지
-  → HandleTransportException(state) 호출
-
-HandleTransportException(state)
-  → 함수 최상단에서 TryMarkClosing() 시도
-  → 실패 시 즉시 반환 (아무 처리도 하지 않음)
-  → 성공 시에만 상태별 로그 / 에러 응답 처리 후 RemoveThisClient() 호출
-```
-
-기존 구조에서는 `Run()`이 먼저 `MarkClosing()`을 호출한 뒤 `HandleTransportException()`을 호출했기 때문에,
-`HandleTransportException()`은 자신이 호출되기 전 `closing`이 이미 바뀌었는지 알 수 없었습니다.
-`TryMarkClosing()`을 `HandleTransportException()` 내부로 옮기면, 그 반환값을 함수 자신이 바로 확인해서
-자기 몸체(로그 + `RemoveThisClient()`)를 실행할지 즉시 반환할지 결정할 수 있습니다.
-
-또한 `HEADER_ERROR` 타입 패킷은 `HandleTransportException()`을 거치지 않는 별도 경로(5-8. `HandleRecvPacket()` 참조)이므로,
-그 경로에도 동일한 `TryMarkClosing()` 성공 시에만 `RemoveThisClient()` 호출 패턴을 적용합니다.
+`HEADER_ERROR` 타입 패킷은 `HandleTransportException()`을 거치지 않는 별도 경로(5-8. `HandleRecvPacket()` 참조)인데,
+이 경로도 동일하게 `TryMarkClosing()` 호출 하나로 종료 처리가 끝납니다.
 
 ### 이름 변경 이유
 
@@ -1276,20 +1376,96 @@ ClientSession 소멸
 
 ### 호출 위치와 TryMarkClosing()과의 관계
 
-`RemoveThisClient()`는 단독으로 호출되지 않고, 항상 `TryMarkClosing()` 성공 여부와 함께 호출됩니다.
+`RemoveThisClient()`는 더 이상 호출부에서 개별적으로 호출되지 않고, `TryMarkClosing()` 내부에서만 호출됩니다.
 
 ```text
-HandleTransportException()
-  → TryMarkClosing() 성공 시에만 함수 본문 실행, 마지막에 RemoveThisClient() 호출
+TryMarkClosing()
+  → CAS 성공 시 함수 내부에서 ClientSockShutdown() 및 RemoveThisClient()를 직접 수행
 
-HandleRecvPacket()의 HEADER_ERROR 분기
-  → TryMarkClosing() 성공 시에만 RemoveThisClient() 호출
+HandleTransportException() / HandleRecvPacket()의 HEADER_ERROR 분기
+  → TryMarkClosing()을 호출하기만 하면 되고, RemoveThisClient()를 별도로 호출하지 않는다
 ```
 
-이 페어링 덕분에 같은 세션에 대해 `RemoveThisClient()`가 중복 호출되지 않습니다.
+`RemoveThisClient()` 호출을 `TryMarkClosing()` 하나로 모았기 때문에, 여러 호출부가 각자
+"성공 시 `RemoveThisClient()` 호출" 페어링을 지켜야 했던 기존 구조보다 중복 호출 실수 가능성이 줄어듭니다.
 자세한 배경은 5-6. `TryMarkClosing()`을 참고합니다.
 
-## 5-10. getter 함수
+## 5-10. SendQueuePush() / SendQueuePop()
+
+```cpp
+bool SendQueuePush(std::shared_ptr<Packet> packet);
+std::shared_ptr<Packet> SendQueuePop();
+```
+
+`SendQueuePush()` / `SendQueuePop()`은 `send_queue`에 접근하는 유일한 통로입니다.
+`send_queue`는 `private`으로 은닉되어 있고, 이 두 함수를 통해서만 조작할 수 있습니다.
+
+```cpp
+bool ClientSession::SendQueuePush(std::shared_ptr<Packet> packet) {
+    {
+        std::lock_guard<std::mutex> lock(send_queue_mutex);
+
+        if (closing.load()) {
+            return false;
+        }
+
+        send_queue.push(std::move(packet));
+    }
+
+    SendQueueCV_NotifyOne();
+
+    return true;
+}
+
+std::shared_ptr<Packet> ClientSession::SendQueuePop() {
+    std::lock_guard<std::mutex> lock(send_queue_mutex);
+
+    std::shared_ptr<Packet> packet = std::move(send_queue.front());
+    send_queue.pop();
+
+    return packet;
+}
+```
+
+`SendQueuePush()`는 `closing == true`인 세션에는 패킷을 넣지 않고 `false`를 반환합니다.
+이미 종료 처리 중인 세션에 패킷을 쌓아봤자 송신될 일이 없기 때문입니다. 다만 이 검사는
+"확실히 걸러지는" 보장이 아니라 거름망 정도이며, TOCTOU를 근본적으로 막는 것은 실제 송신 주체가
+`SendRun()` 하나로 고정되어 있다는 구조 자체입니다.
+
+락은 `push()` / `pop()` 시점에만 짧게 잡습니다. `notify_one()`은 락을 해제한 뒤 호출해서
+불필요하게 락을 오래 들고 있지 않도록 합니다.
+
+`std::move(packet)`으로 넘기는 이유는, 호출자가 이 시점 이후로 해당 `std::shared_ptr<Packet>`을
+계속 들고 있을 필요가 없을 때 `control block`의 ref count를 추가로 올리지 않고 소유권만 넘기기 위해서입니다.
+
+## 5-11. SendQueueCV_NotifyOne() / SendQueueCV_NotifyAll()
+
+```cpp
+void SendQueueCV_NotifyOne();
+void SendQueueCV_NotifyAll();
+```
+
+이 두 함수는 `send_queue_cv`를 깨우는 인터페이스입니다.
+
+```cpp
+void ClientSession::SendQueueCV_NotifyOne() {
+    send_queue_cv.notify_one();
+}
+
+void ClientSession::SendQueueCV_NotifyAll() {
+    send_queue_cv.notify_all();
+}
+```
+
+`SendQueueCV_NotifyOne()`은 `SendQueuePush()`가 패킷을 하나 넣은 직후 호출합니다.
+이 세션의 송신 대기 스레드는 `SendRun()` 하나뿐이므로 `notify_one()`으로 충분합니다.
+
+`SendQueueCV_NotifyAll()`은 `RecvRun()`이 수신 에러를 감지해 `HandleTransportException()`을 호출한 직후
+호출합니다. `SendRun()`이 빈 큐에서 대기 중일 수 있는데, `closing`이 바뀐 것을 놓치지 않고 즉시
+깨어나 종료할 수 있도록 하기 위해서입니다. 대기자가 하나뿐이라 `notify_one()`으로도 충분하지만,
+"종료를 알리는 신호"라는 의미를 더 명확히 하기 위해 `notify_all()`을 사용합니다.
+
+## 5-12. getter 함수
 
 `ClientSession`은 다음 6종의 getter 함수를 제공합니다.
 
@@ -2474,28 +2650,25 @@ NICKNAME_CHANGE_SUCESS (5)
 
 # 13. 추후 확장 지점
 
-## 13-1. send_mutex
+## 13-1. Send Queue (구현 완료)
 
-추후 Broadcast Chat Server 단계에서는 여러 thread가
-같은 `ClientSession`에 대해 `SendPacket()`을 호출할 수 있습니다.
+당초에는 여러 thread가 같은 `ClientSession`에 대해 `SendPacket()`을 직접 호출할 가능성을 우려해
+`ClientSession`별 `send_mutex`로 Header/Payload 송신 순서를 보호하는 방안을 검토했습니다.
 
-이때 Header / Payload 순서가 섞이지 않도록
-`ClientSession`별 `send_mutex`를 도입할 예정입니다.
-
-```text
-send_mutex
-  → 특정 ClientSession에 대한 Header + Payload 송신 순서 보호
-```
-
-이는 `ClientManager`의 `clients_mutex`와 역할이 다릅니다.
+이 방안 대신, Send Queue와 recv/send thread 분리를 도입해 세션당 실제 `SendPacket()` 호출 주체를
+`SendRun()` 하나로 고정했습니다. 다른 스레드는 `SendQueuePush()`로 큐에 패킷을 넣을 뿐이므로,
+Header/Payload가 뒤섞이는 문제 자체가 구조적으로 발생하지 않습니다.
 
 ```text
+send_queue_mutex
+  → Send Queue(send_queue)의 push() / pop() 보호
+
 clients_mutex
-  → clients 컨테이너 보호
-
-send_mutex
-  → 특정 ClientSession에 대한 패킷 송신 순서 보호
+  → ClientManager의 clients 컨테이너 보호
 ```
+
+자세한 함수 설계는 §5-10. SendQueuePush() / SendQueuePop(),
+§5-11. SendQueueCV_NotifyOne() / SendQueueCV_NotifyAll() 참고.
 
 ---
 
@@ -2527,9 +2700,12 @@ ClientSession
 ClientManager
   → 여러 ClientSession의 목록과 관계를 관리한다.
 
-Run()
-  → Echo Server의 고수준 흐름을 제어한다.
+RecvRun() / SendRun()
+  → 각각 수신 / 송신 전담 스레드로서 Echo Server의 고수준 흐름을 제어한다. (Run()은 분리 이전 legacy)
 
+SendQueuePush() / SendQueuePop()
+  → Send Queue를 캡슐화해, 세션당 실제 송신 주체를 SendRun() 하나로 고정한다.
+  
 RecvPacket()
   → PacketHeader + Payload 수신 세부 절차를 담당하고 RecvResult를 반환한다.
   → RecvResult 안에 NetState, PacketType, 페이로드가 함께 담긴다.

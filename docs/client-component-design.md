@@ -101,7 +101,7 @@ ParsedInput
 ## 3-2. 소유 관계
 
 ```cpp
-class ClientApp {
+class ClientApp : public std::enable_shared_from_this<ClientApp> {
 private:
     ConnectSocket sock_;  // 서버와 TCP 연결로 통신하는 소켓
     NetState state_;      // 클라이언트 전체 상태 (생애주기 추적용)
@@ -129,11 +129,17 @@ recv_state  → 이번 RecvPacket() 호출의 결과만
 
 이 상태 기록 정책은 `ClientSession::SendPacket()` / `ClientSession::RecvPacket()`과 동일합니다.
 
+`enable_shared_from_this<ClientApp>`를 상속하는 이유는 `SendRun()`을 detach된 별도 스레드로 띄울 때,
+그 스레드가 `ClientApp` 객체의 `shared_ptr` 사본을 직접 들고 있어야 하기 때문입니다.
+`ClientSession`이 같은 이유로 `enable_shared_from_this<ClientSession>`을 상속하는 것과 동일한 패턴입니다.
+
 ---
 
 ## 3-3. Run()
 
-`Run()`은 클라이언트의 고수준 실행 루프를 담당합니다.
+## 3-3. Run()
+
+`Run()`은 클라이언트의 초기 닉네임 설정과, 이후 recv/send 스레드 분기까지를 담당합니다.
 
 ```text
 [초기 닉네임 설정 루프 — 메인 루프 진입 전]
@@ -147,25 +153,75 @@ while(true)
   ├── HandleRecvPacket()
   │     ├── NICKNAME_CHANGE_SUCESS → nick_ = res.payload → break
   │     └── NICKNAME_CHANGE_FAILED → 실패 원인 출력 → continue
-  └── (break 발생 시 메인 루프 진입)
+  └── (break 발생 시 아래로 진행)
 
-[메인 루프]
-while(true)
-  ├── 사용자 입력 받기
-  ├── InputParser::Parse() → ParsedInput
-  ├── valid == false → 에러 출력 → continue
-  ├── quit == true  → 루프 종료
-  ├── length 범위 초과 → 에러 출력 → continue
-  ├── SendPacket(payload, length, type, nick_)
-  ├── 송신 상태 확인 → 에러 시 루프 종료
-  ├── RecvPacket()
-  ├── 수신 상태 확인 → 에러 시 루프 종료
-  └── HandleRecvPacket() → 수신 메시지 출력 또는 닉네임 처리
+closing 확인 → true이면 return (초기 닉네임 설정 도중 종료 상황 발생)
+
+std::thread(&ClientApp::SendRun, shared_from_this()).detach()
+RecvRun()   // main 스레드가 그대로 이어서 담당
 ```
+
+`Run()`은 초기 닉네임 설정까지만 직접 수행하고, 그 이후의 실제 송/수신 루프는
+[§3-3-1. SendRun()](#3-3-1-sendrun)과 [§3-3-2. RecvRun()](#3-3-2-recvrun)으로 넘어갑니다.
+`Run()`은 입력 파싱의 세부 절차를 직접 알 필요가 없습니다.
+`InputParser::Parse()`가 반환한 `ParsedInput`을 보고 어떤 패킷을 보낼지, 루프를 계속할지 결정합니다.
 
 `Run()`은 입력 파싱의 세부 절차를 직접 알 필요가 없습니다.
 `InputParser::Parse()`가 반환한 `ParsedInput`을 보고
 어떤 패킷을 보낼지, 루프를 계속할지 결정합니다.
+
+## 3-3-1. SendRun()
+
+```cpp
+void SendRun();
+```
+
+`SendRun()`은 사용자 입력을 받아 서버로 송신하는 루프를 전담하며, `Run()`이 `shared_from_this()`로
+detach시킨 별도 스레드에서 실행됩니다.
+
+```text
+SendRun()
+  while(true):
+    ├── 사용자 입력 받기 (std::getline, blocking)
+    ├── closing 확인 → true이면 return
+    ├── InputParser::Parse() → ParsedInput
+    ├── valid == false → 에러 출력 → continue
+    ├── quit == true  → TryMarkClosing() → 루프 종료
+    ├── length 범위 초과 → 에러 출력 → continue
+    ├── SendPacket(payload, length, type, nick_)
+    └── 송신 상태 확인 → 에러 시 HandleTransportException() → 루프 종료
+```
+
+서버와 달리 클라이언트는 송신 트리거가 사용자 키보드 입력 하나뿐이라 Send Queue나 관련 mutex/condition_variable이
+필요하지 않습니다. `std::getline()`의 blocking 자체가 서버 쪽 `send_queue_cv.wait()`와 같은 역할을 합니다.
+
+`/quit` 입력 시 `break` 전에 `TryMarkClosing()`을 호출하는 이유는, 이 호출이 `sock_.ConnectSockShutdown()`을
+수행해 `RecvRun()`이 blocking 중인 `RecvPacket()`에서 빠져나올 수 있게 하기 위해서입니다. 이 호출이 없으면
+사용자가 `/quit`을 입력해도 `RecvRun()`이 종료되지 않는 문제가 있었습니다.
+
+## 3-3-2. RecvRun()
+
+```cpp
+void RecvRun();
+```
+
+`RecvRun()`은 서버로부터 오는 응답을 수신하는 루프를 전담하며, `Run()`을 호출한 스레드(main)가 그대로 이어서 실행합니다.
+서버의 accept 루프처럼 메인 스레드를 비워줘야 할 이유가 없기 때문에, 별도 스레드를 새로 만들지 않습니다.
+
+```text
+RecvRun()
+  while(true):
+    ├── RecvPacket()
+    ├── closing 확인 → true이면 return
+    ├── 수신 상태 확인 → 에러 시 HandleTransportException() → 루프 종료
+    ├── HandleRecvPacket() → 수신 메시지 출력 또는 닉네임 처리
+    └── closing 확인 → true이면 return
+```
+
+`RecvRun()`이 return하면 `Run()`도 곧바로 return하고, `main()`도 뒤이어 종료됩니다.
+이때 `SendRun()`이 아직 `std::getline()`에서 blocking 중일 수 있는데, `ClientApp`이 `shared_ptr`로 관리되므로
+파괴된 객체를 참조하는 문제(UB)는 발생하지 않습니다. 다만 `SendRun()`이 마무리 작업 없이 프로세스 종료와 함께
+그냥 종료된다는 점은 현재 단계에서 감수하는 한계입니다.
 
 ## 3-4. HandleRecvPacket()
 

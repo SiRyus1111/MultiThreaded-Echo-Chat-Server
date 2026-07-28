@@ -21,7 +21,10 @@
 ClientManager
   └── unordered_map<SessionID, shared_ptr<ClientSession>>
 
-client_thread()
+client_recv_thread()
+  └── shared_ptr<ClientSession>
+
+client_send_thread()
   └── shared_ptr<ClientSession>
 
 ClientSession
@@ -29,7 +32,10 @@ ClientSession
   ├── weak_ptr<ClientManager>
   ├── NetState
   ├── atomic<bool> closing
-  └── SessionID session_id
+  ├── SessionID session_id
+  ├── queue<shared_ptr<Packet>> send_queue
+  ├── mutex send_queue_mutex
+  └── condition_variable send_queue_cv
 
 ClientSocket
   └── SOCKET
@@ -38,7 +44,7 @@ ClientSocket
 이 구조의 핵심은 다음입니다.
 
 ```text
-ClientManager와 client_thread가 ClientSession을 공유 소유한다.
+ClientManager와 client_recv_thread / client_send_thread가 ClientSession을 공유 소유한다.
 ClientSession은 ClientSocket을 독점 소유한다.
 ClientSession은 ClientManager를 소유하지 않고 weak_ptr로 참조한다.
 ClientManager는 SessionID를 key로 ClientSession을 관리한다.
@@ -50,14 +56,14 @@ ClientManager는 SessionID를 key로 ClientSession을 관리한다.
 ## 2. shared_ptr의 역할
 
 `ClientSession`은 `ClientManager`뿐만 아니라
-각 클라이언트를 담당하는 `client_thread`에서도 사용됩니다.
+각 클라이언트를 담당하는 `client_recv_thread` / `client_send_thread`에서도 각각 사용됩니다.
 
 따라서 `shared_ptr<ClientSession>`으로 세션 객체의 물리적 생존을 관리합니다.
 
 ```text
 ClientManager가 clients에 보관 중이거나
 OR
-client_thread가 shared_ptr<ClientSession>을 들고 있으면
+client_recv_thread / client_send_thread 중 하나라도 shared_ptr<ClientSession>을 들고 있으면
 
 ClientSession 객체는 소멸하지 않는다.
 ```
@@ -189,8 +195,8 @@ void ClientSession::RemoveThisClient() {
 현재 구조에서는 클라이언트별 thread를 생성한 뒤 `detach()`합니다.
 
 ```cpp
-std::thread ClientThread(client_thread, session);
-ClientThread.detach();
+std::thread(client_recv_thread, session).detach();
+std::thread(client_send_thread, session).detach();
 ```
 
 `detach()`를 선택한 이유는 현재 단계에서 `join()` 기반으로
@@ -316,17 +322,21 @@ TryMarkClosing()
 `TryMarkClosing()`과 `RemoveThisClient()`는 다음처럼 항상 세트로 취급합니다.
 
 ```text
-TryMarkClosing()을 호출해 성공한 쪽만
-RemoveThisClient()를 호출할 책임을 가진다.
+TryMarkClosing()의 CAS에 성공한 스레드만
+shutdown()과 RemoveThisClient()를 수행할 종료 권한을 가진다.
 
 TryMarkClosing()에 실패한 쪽은
-RemoveThisClient()를 호출하지 않는다.
+shutdown()도 RemoveThisClient()도 호출하지 않는다.
 ```
 
-이 페어링을 강제하기 위해 `TryMarkClosing()` 호출 위치를 `Run()`에서
-`HandleTransportException()` 내부 최상단으로 옮겼습니다.
-`HEADER_ERROR` 타입 패킷처럼 `HandleTransportException()`을 거치지 않는 경로(`HandleRecvPacket()`)에도
-동일하게 `TryMarkClosing()` 성공 시에만 `RemoveThisClient()`를 호출하는 패턴을 적용합니다.
+Send Queue / recv-send thread 도입 이후에는 이 페어링을 호출부의 책임으로 남기지 않고,
+`TryMarkClosing()` 함수 자신이 CAS 성공 시 `ClientSockShutdown()`과 `RemoveThisClient()`를 내부에서 직접 수행하도록 통합했습니다.
+`HandleTransportException()`이나 `HandleRecvPacket()`의 `HEADER_ERROR` 분기 등 어떤 경로로 호출되든
+`TryMarkClosing()` 하나만 호출하면 종료 처리가 완결됩니다.
+
+또한 `TryMarkClosing()`의 CAS 연산은 `send_queue_mutex` 락 범위 안에서 수행합니다.
+이는 send thread가 `send_queue_cv.wait(lock)`으로 대기 조건(`closing == true` 또는 큐가 비어있지 않음)을 확인하는 구간과
+`closing`을 바꾸는 시점이 겹쳐서 notify를 놓치는 lost wakeup을 방지하기 위한 것입니다.
 
 자세한 함수 설계는 [server-component-design.md §5-6](server-component-design.md#5-6-trymarkclosing)을 참고합니다.
 
@@ -385,26 +395,29 @@ RemoveClient()
 
 [경로 A] 수신 과정 자체에서 예외 발생 (transport error / peer exit / protocol error)
 1. RecvPacket()이 RecvResult.state에 예외 상태를 기록하여 반환한다.
-2. Run()이 state를 확인하고 HandleTransportException(state)를 호출한다.
+2. RecvRun()이 state를 확인하고 HandleTransportException(state)를 호출한다.
 3. HandleTransportException() 내부 최상단에서 TryMarkClosing()을 시도한다.
    - 실패하면 이미 다른 경로에서 종료 처리 중이므로 즉시 반환한다.
-   - 성공하면 상태별 로그 / 에러 응답 처리 후, 함수 마지막에 RemoveThisClient()를 호출한다.
-4. Run()이 break한다.
+   - 성공하면 TryMarkClosing() 내부에서 ClientSockShutdown()과 RemoveThisClient()를 즉시 수행한 뒤,
+     이어서 HandleTransportException()이 상태별 로그 / 에러 응답(Send Queue push)을 처리한다.
+4. RecvRun()이 SendQueueCV_NotifyAll()로 send thread를 깨운 뒤 break한다(빈 큐에서 대기 중일 수 있으므로).
 
 [경로 B] 정상 수신된 패킷의 내용에 의한 종료 (HEADER_ERROR 수신 등)
 1. RecvPacket()이 type = HEADER_ERROR인 RecvResult를 반환한다.
-2. Run()이 HandleRecvPacket(res)를 호출한다.
-3. HandleRecvPacket() 내부에서 TryMarkClosing()을 시도하고, 성공한 경우에만 RemoveThisClient()를 호출한다.
-4. Run()이 HandleRecvPacket() 이후 closing 상태를 확인하고 break한다.
+2. RecvRun()이 HandleRecvPacket(packet)를 호출한다.
+3. HandleRecvPacket() 내부에서 TryMarkClosing()을 호출한다. 성공 시 TryMarkClosing() 내부에서
+   ClientSockShutdown()과 RemoveThisClient()가 즉시 수행된다.
+4. RecvRun()이 HandleRecvPacket() 이후 closing 상태를 확인하고 return한다.
 
 [공통 경로]
-5. 이후 ClientManager의 broadcast는 해당 세션을 send 대상에서 제외한다.
-6. RemoveThisClient()는 Manager_wp.lock()으로 ClientManager에 접근한다.
-7. RemoveThisClient()는 자기 자신의 session_id를 넘겨 RemoveClient(session_id)를 호출한다.
-8. ClientManager::RemoveClient(SessionID)가 clients unordered_map에서 해당 key를 제거한다.
-9. Run()이 return되면 client_thread가 들고 있던 shared_ptr도 해제된다.
-10. 마지막 shared_ptr이 사라지면 ClientSession이 소멸한다.
-11. ClientSession이 소유하던 ClientSocket도 소멸하면서 raw SOCKET이 closesocket()으로 정리된다.
+5. ClientSockShutdown()으로 blocking 중이던 recv()가 강제로 풀리므로, 반대편 스레드도 곧 closing == true를 확인하고 빠져나온다.
+6. 이후 ClientManager의 broadcast는 해당 세션을 send 대상에서 제외한다.
+7. RemoveThisClient()는 Manager_wp.lock()으로 ClientManager에 접근한다.
+8. RemoveThisClient()는 자기 자신의 session_id를 넘겨 RemoveClient(session_id)를 호출한다.
+9. ClientManager::RemoveClient(SessionID)가 clients unordered_map에서 해당 key를 제거한다.
+10. RecvRun() / SendRun()이 각각 return되면, client_recv_thread / client_send_thread가 들고 있던 shared_ptr도 각각 해제된다.
+11. 마지막 shared_ptr이 사라지면 ClientSession이 소멸한다.
+12. ClientSession이 소유하던 ClientSocket도 소멸하면서 raw SOCKET이 closesocket()으로 정리된다.
 ```
 
 이 흐름에서 중요한 점은 `closing = true`가 객체 소멸을 의미하지 않는다는 것입니다.
@@ -513,66 +526,64 @@ Broadcast() 시작
 
 ## 13. ClientManager lock과 ClientSession send lock 분리
 
-현재 설계에서는 lock의 역할을 다음처럼 분리할 예정입니다.
+현재 설계에서는 lock의 역할을 다음처럼 분리합니다.
 
 ```text
 ClientManager의 clients_mutex
   → 현재 접속 중인 ClientSession map 보호
 
-ClientSession의 send_mutex
-  → 해당 클라이언트에게 보내는 Header + Payload의 패킷 경계 보호
+ClientSession의 send_queue_mutex
+  → Send Queue(send_queue)의 push() / pop() 보호
 ```
 
 핵심은 다음입니다.
 
 ```text
-보호해야 하는 것은 “브로드캐스트 전체”가 아니라,
-“같은 ClientSession에 대한 패킷 송신 순서”이다.
+보호해야 하는 것은 "브로드캐스트 전체"가 아니라,
+"같은 ClientSession에 대한 패킷 송신 순서"이다.
 ```
 
-26.05.20(수) 리팩토링으로 `ClientSession::SendPacket()`이 1차 구현되었습니다.
-따라서 추후 `send_mutex`는 새 송신 함수를 따로 만드는 방식이 아니라,
-이미 존재하는 `SendPacket()` 내부의 Header + Payload 송신 구간을 감싸는 방식으로 적용할 수 있습니다.
+당초에는 이 패킷 송신 순서를 `SendPacket()` 내부에 `send_mutex`를 걸어서 보호하는 방식을 검토했습니다.
+하지만 Send Queue와 recv/send thread 분리가 도입되면서, 한 `ClientSession`에 대해
+실제로 `SendPacket()`을 호출하는 주체가 그 세션을 담당하는 `SendRun()` 스레드 하나로 고정되었습니다.
+따라서 여러 스레드가 동시에 같은 세션의 `SendPacket()`을 호출해서 Header/Payload가 뒤섞이는 상황 자체가
+구조적으로 발생할 수 없고, `SendPacket()` 내부에 별도의 락을 걸 필요가 없어졌습니다.
 
-같은 클라이언트에게 다음과 같이 패킷이 섞이면 안 됩니다.
-
-```text
-잘못된 예:
-
-Header_A
-Header_B
-Payload_A
-Payload_B
-```
-
-원하는 송신 순서는 다음과 같습니다.
-
-```text
-올바른 예:
-
-Header_A
-Payload_A
-Header_B
-Payload_B
-```
-
-예상 구조:
+대신 보호가 필요한 지점은 `Send Queue`입니다. `broadcast()`를 호출하는 스레드(또는 다른 client_recv_thread)와,
+그 큐를 소비하는 `SendRun()` 스레드가 동시에 `push()` / `pop()`할 수 있기 때문에,
+`send_queue_mutex`가 이 접근을 짧게 보호합니다.
 
 ```cpp
 class ClientSession {
 private:
-    std::mutex send_mutex;
+    std::queue<std::shared_ptr<Packet>> send_queue;
+    std::mutex send_queue_mutex;
+    std::condition_variable send_queue_cv;
 
 public:
-    NetState SendPacket(const char* msg, uint32_t len, PacketType type) {
-        std::lock_guard<std::mutex> lock(send_mutex);
+    bool SendQueuePush(std::shared_ptr<Packet> packet) {
+        {
+            std::lock_guard<std::mutex> lock(send_queue_mutex);
+            if (closing.load()) {
+                return false;
+            }
+            send_queue.push(std::move(packet));
+        }
+        send_queue_cv.notify_one();
+        return true;
+    }
 
-        // 1. PacketHeader 구성
-        // 2. Header 송신
-        // 3. Payload 송신
+    std::shared_ptr<Packet> SendQueuePop() {
+        std::lock_guard<std::mutex> lock(send_queue_mutex);
+        std::shared_ptr<Packet> packet = std::move(send_queue.front());
+        send_queue.pop();
+        return packet;
     }
 };
 ```
+
+실제 Header/Payload 송신 순서 보호는 "락"이 아니라 "송신 주체를 하나로 고정한다"는 구조적 보장으로 대체되었습니다.
+자세한 함수 설계는 [server-component-design.md §5-10](server-component-design.md#5-10-sendqueuepush-sendqueuepop)을 참고합니다.
 
 ---
 
@@ -613,7 +624,7 @@ void ClientManager::Broadcast(
             continue;
         }
 
-        client->SendPacket(msg, len, type);
+        client->SendQueuePush(packet); // 실제 송신은 해당 세션의 SendRun()이 수행
     }
 }
 ```
@@ -621,10 +632,10 @@ void ClientManager::Broadcast(
 이 구조의 장점은 다음과 같습니다.
 
 - `clients_mutex`는 clients 목록을 복사하는 짧은 구간에서만 사용
-- 실제 `send()`는 `clients_mutex`를 잡지 않은 상태에서 수행
-- 같은 `ClientSession`에 대한 송신만 `send_mutex`로 직렬화
-- 서로 다른 `ClientSession`에 대한 send lock이 서로를 직접 막지 않음
-- Header / Payload 패킷 경계가 섞이는 문제를 방지할 수 있음
+- `broadcast()`를 호출한 스레드는 `SendQueuePush()`만 하고 실제 `send()`는 전혀 수행하지 않음
+- 같은 `ClientSession`에 대한 실제 송신 주체가 그 세션의 `SendRun()` 하나로 고정되어 있어 별도 직렬화 락이 필요 없음
+- 서로 다른 `ClientSession`에 대한 처리가 서로를 직접 막지 않음
+- Header / Payload 패킷 경계가 섞이는 문제를 구조적으로 방지
 
 다만 하나의 `Broadcast()` 호출 내부에서 `snapshot`을 단일 thread가 순회한다면,
 그 `Broadcast()` 내부의 send 호출 자체는 순차적으로 진행됩니다.
@@ -860,12 +871,10 @@ Broadcast 단계에서 아직 결정해야 할 정책은 다음과 같습니다.
 
 ---
 
-## 17. 향후 send queue 구조 검토
+## 17. Send Queue 구조 도입 완료
 
-현재 설계는 `Broadcast()`가 각 `ClientSession::SendPacket()`을 직접 호출하는 구조입니다.
-
-하지만 클라이언트 수가 많아지거나 느린 클라이언트 문제가 커지면,
-추후 다음 구조를 검토할 수 있습니다.
+당초에는 `Broadcast()`가 각 `ClientSession::SendPacket()`을 직접 호출하는 구조를 검토했고,
+클라이언트 수가 많아지거나 느린 클라이언트 문제가 커질 경우를 대비해 다음 구조를 향후 검토 과제로 남겨두었습니다.
 
 ```text
 ClientSession
@@ -875,14 +884,20 @@ ClientSession
   └── dedicated sender thread 또는 event loop
 ```
 
-다만 현재 단계에서는 구조가 지나치게 복잡해질 수 있으므로,
-우선은 다음 구조를 목표로 합니다.
+Broadcast 기능 자체보다 먼저, 이 Send Queue 구조를 실제로 도입했습니다.
 
 ```text
-clients snapshot
-  + per-session send_mutex
-  + closing check
+ClientSession
+  ├── send_queue          (std::queue<std::shared_ptr<Packet>>)
+  ├── send_queue_mutex     (push() / pop() 보호)
+  ├── send_queue_cv        (큐가 비어있을 때 SendRun()을 대기시키고, push() 시 깨움)
+  └── SendRun()             (해당 세션 전담 송신 스레드, 실제 SendPacket() 호출 주체)
 ```
+
+`SendPacket()` 직접 호출은 사라지고, 모든 송신 요청은 `SendQueuePush()`를 거칩니다.
+실제 `SendPacket()` 호출은 해당 세션을 담당하는 `SendRun()` 스레드 하나에서만 일어나므로,
+"per-session send_mutex"로 직렬화할 필요 없이 구조적으로 송신 순서가 보장됩니다.
+자세한 내용은 [server-component-design.md §5-10, §5-11](server-component-design.md#5-10-sendqueuepush-sendqueuepop)을 참고합니다.
 
 ---
 
@@ -892,23 +907,28 @@ clients snapshot
 
 ```text
 shared_ptr
-  → ClientSession의 물리적 생존 보장
+  → ClientSession의 물리적 생존 보장 (client_recv_thread / client_send_thread가 각각 보유)
 
 closing
   → ClientSession의 논리적 종료 상태
 
+TryMarkClosing()
+  → closing을 false → true로 바꾸는 종료 권한을 CAS로 정확히 한 스레드에게만 부여하고,
+    성공한 스레드가 shutdown()과 RemoveClient()를 함께 수행
+
 RemoveClient()
-  → ClientManager의 관리 목록에서 제거
+  → ClientManager의 관리 목록에서 제거 (TryMarkClosing() 내부에서 수행됨)
 
 clients_mutex
   → ClientManager의 clients 컨테이너 보호
 
-send_mutex
-  → 특정 ClientSession에 대한 Header + Payload 송신 순서 보호
+send_queue_mutex
+  → 특정 ClientSession의 Send Queue push() / pop() 보호 (Header + Payload 송신 순서 자체는 SendRun() 하나로 송신 주체가 고정되어 구조적으로 보장됨)
 ```
 
 그리고 가장 중요한 원칙은 다음입니다.
 
 ```text
 manager lock을 잡은 상태에서 blocking될 수 있는 send()를 오래 수행하지 않는다.
+recv 전담 스레드와 send 전담 스레드를 분리해, 한쪽의 blocking이 다른 쪽 흐름을 막지 않게 한다.
 ```

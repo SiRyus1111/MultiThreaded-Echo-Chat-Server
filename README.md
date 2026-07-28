@@ -93,6 +93,14 @@
 - `LineLogger::WriteSessionLog()` 시그니처에 `std::string nickname` 파라미터 추가; 출력 형식에 `[Nickname name]` 추가
 - `LineLogger::WriteChatLog()` 신규 추가 — 클라이언트 수신 메시지 전용 출력 (`[nickname] message` 형식)
 - `MarkClosing()`을 CAS 기반 `TryMarkClosing()`으로 개편 — 중복 종료(double-close) 처리 방지
+- `ClientSession`에 `send_queue` / `send_queue_mutex` / `send_queue_cv` 도입 — Send Queue 자료구조 신설
+- `SendQueuePush()` / `SendQueuePop()` 구현 — Send Queue를 `private`으로 은닉하고 전용 함수로만 접근하도록 캡슐화
+- `SendQueueCV_NotifyOne()` / `SendQueueCV_NotifyAll()` 구현 — Send Queue에 패킷이 들어왔거나 종료 상황일 때 대기 중인 send thread를 깨움
+- `HandleRecvPacket()` / `HandleTransportException()`의 모든 송신 지점을 `SendPacket()` 직접 호출에서 `SendQueuePush()`로 교체 — 세션당 실제 송신 주체를 `SendRun()` 하나로 고정
+- `ClientSession::Run()`을 `RecvRun()` / `SendRun()`으로 분리, 각각 별도 스레드(`client_recv_thread` / `client_send_thread`)로 실행
+- `TryMarkClosing()` 개편 — CAS 연산을 `send_queue_mutex` 락 범위 안에서 수행(send thread의 lost wakeup 방지), CAS 성공 시 `ClientSock->ClientSockShutdown()`과 `RemoveThisClient()`를 함수 내부에서 함께 수행하도록 통합
+- `ClientSocket::ClientSockShutdown()` / `ConnectSocket::ConnectSockShutdown()` 추가 — 종료 권한을 가진 스레드가 blocking 중인 recv를 강제로 깨우기 위한 함수
+- `ClientApp`이 `std::enable_shared_from_this<ClientApp>`을 상속하도록 변경, `ClientApp::Run()`을 `RecvRun()` / `SendRun()`으로 분리 — `SendRun()`은 detach된 스레드로, `RecvRun()`은 메인 스레드가 직접 수행
 
 ### 구현 예정
 
@@ -100,7 +108,6 @@
 - `Server` 전역 로그의 `LineLogger` 적용
 - low-level transport 계층 로그 정책 검토
 - `SessionID` 기반 표준 로그 형식 전면 적용
-- ClientSession별 `send_mutex`
 - `ClientManager::Broadcast()`
 - broadcast 시 clients snapshot 복사 구조
 - message type 확장
@@ -114,10 +121,13 @@
 
 ```text
 main thread
-  → 새 연결을 받아 ClientSession을 생성하고 client_thread를 시작한다.
+  → 새 연결을 받아 ClientSession을 생성하고 client_recv_thread / client_send_thread를 시작한다.
 
-client_thread
-  → 특정 ClientSession 하나의 실행 흐름을 담당한다.
+client_recv_thread
+  → 특정 ClientSession 하나의 수신 흐름(RecvRun())을 담당한다.
+
+client_send_thread
+  → 특정 ClientSession 하나의 송신 흐름(SendRun())을 담당한다. Send Queue에 쌓인 패킷만 실제로 송신한다.
 
 ClientSession
   → 클라이언트 한 명의 socket, 상태, 송수신 흐름을 관리한다.
@@ -268,8 +278,8 @@ TCP는 message boundary를 보장하지 않는 byte stream 기반 프로토콜�
 ClientManager의 clients_mutex
   → 현재 접속 중인 ClientSession 목록 보호
 
-ClientSession의 send_mutex
-  → 해당 클라이언트에게 보내는 Header + Payload의 패킷 경계 보호
+ClientSession의 send_queue_mutex
+  → Send Queue의 push() / pop() 보호 (Header + Payload 패킷 경계 자체는 세션당 송신 주체가 SendRun() 하나로 고정되어 있어 더 이상 락으로 보호할 필요가 없다)
 ```
 
 핵심은 다음과 같습니다.
@@ -280,7 +290,8 @@ ClientSession의 send_mutex
 ```
 
 따라서 broadcast 시에는 clients 목록을 snapshot으로 복사한 뒤,
-`clients_mutex`를 해제하고 각 `ClientSession::SendPacket()`을 호출하는 구조를 목표로 합니다.
+`clients_mutex`를 해제하고 각 `ClientSession::SendQueuePush()`로 패킷을 넘기는 구조를 목표로 합니다.
+실제 송신(`SendPacket()`)은 broadcast를 호출한 스레드가 아니라, 해당 `ClientSession`을 담당하는 `SendRun()`이 수행합니다.
 
 자세한 내용은 [`docs/concurrency-design.md`](docs/concurrency-design.md)를 참고합니다.
 
@@ -438,7 +449,6 @@ Client A → Server → Client B
 단기 목표:
 
 - 로그 출력 형식 개선 (`LineLogger` 전면 적용)
-- `ClientSession`별 `send_mutex` 추가
 - `ClientManager::Broadcast()` 구현
 
 중기 목표:

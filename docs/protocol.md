@@ -399,7 +399,7 @@ while 이미 받은 길이 < 전체 길이:
 
 ## 6. 송수신 순서
 
-현재 기본 수신 흐름은 `ClientSession::RecvPacket()`으로 분리되어 있습니다.
+현재 서버의 기본 수신 흐름은 `ClientSession::RecvPacket()`으로 분리되어 있습니다.
 
 ```text
 1. std::make_shared<Packet>()로 Packet 객체 생성
@@ -411,16 +411,29 @@ while 이미 받은 길이 < 전체 길이:
 7. 수신 결과를 RecvResult{state, packet}로 반환
 ```
 
-`RecvPacket()`은
+`ClientSession::RecvPacket()`은
 수신 과정의 성공/실패를 나타내는 `NetState`와, 수신한 패킷 자체(`std::shared_ptr<Packet>`)를 함께 담은 `RecvResult`를 반환합니다.
 `Packet`의 설계 의도와 구조는 [server-component-design.md §10](server-component-design.md#10-packet-구조체와-recvresult) 참고.
+
+현재 클라이언트의 기본 수신 흐름은 `ClientApp::RecvPacket()`으로 분리되어 있습니다.
+
+```text
+1. PacketHeader 수신
+2. network byte order → host byte order 변환
+3. nickname 필드 파싱 (상세는 2. PacketHeader - nickname 참조)
+4. length 검사
+5. type 검사
+6. payload 길이만큼 payload 수신
+7. 문자열 출력용 null 문자 추가
+8. 수신 결과를 RecvResult로 반환
+```
 
 `HEADER_ERROR` 타입의 패킷은 수신 실패가 아닌 **정상 수신된 에러 알림 패킷**입니다.
 따라서 `RecvPacket()` 내부에서 `NetState`에 기록하지 않고,
 `result.packet`(수신한 `Packet`)에 담아 호출자에게 전달합니다.
 호출자는 `packet->header.type`을 직접 확인하여 `HEADER_ERROR` 여부를 판별합니다.
 
-현재 기본 송신 흐름은 `ClientSession::SendPacket()`으로 분리되어 있습니다.
+현재 서버의 기본 송신 흐름은 `ClientSession::SendPacket()`으로 분리되어 있습니다.
 
 ```text
 1. 인자로 받은 std::shared_ptr<Packet>의 packet->header를 로컬 변수로 host byte order 변환하여 length / type 검사
@@ -428,8 +441,18 @@ while 이미 받은 길이 < 전체 길이:
 3. Payload 송신 (packet->payload_up->c_str()을, ntohl(packet->header.length)만큼)
 ```
 
-`SendPacket()`은 더 이상 호출자로부터 `msg` / `len` / `type` / `nick`을 개별 인자로 받지 않습니다.
+`ClientSession::SendPacket()`은 더 이상 호출자로부터 `msg` / `len` / `type` / `nick`을 개별 인자로 받지 않습니다.
 헤더(닉네임 포함)와 payload가 이미 채워진 `Packet`을 통째로 받아, 그 내용을 그대로 송신합니다.
+
+현재 클라이언트의 기본 송신 흐름은 `ClientApp::SendPacket()`으로 분리되어 있습니다.
+
+```text
+1. payload 길이 검사
+2. PacketHeader 구성 (nickname 필드 패딩 포함, 상세는 2. PacketHeader - nickname 참조)
+3. host byte order → network byte order 변환
+4. PacketHeader 송신
+5. Payload 송신
+```
 
 즉, `Run()`은 byte order 변환이나 Header / Payload 송수신 세부 절차를 직접 알 필요가 없습니다.
 

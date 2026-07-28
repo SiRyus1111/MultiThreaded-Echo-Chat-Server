@@ -44,8 +44,8 @@ main thread
   │     ├── ClientSession 생성
   │     ├── ClientManager::AddClient(session, session_id)
   │     ├── 다음 SessionID 설정
-  │     ├── std::thread ClientThread(client_thread, session)
-  │     └── ClientThread.detach()
+  │     ├── std::thread(client_recv_thread, session).detach()
+  │     └── std::thread(client_send_thread, session).detach()
   └── accept() loop 계속 진행
 ```
 
@@ -115,28 +115,46 @@ client_thread에 넘긴다.
 
 ---
 
-## 4. client_thread
+## 4. client_recv_thread / client_send_thread
 
-`client_thread`는 특정 클라이언트 하나를 담당하는 실행 흐름입니다.
+`client_recv_thread`와 `client_send_thread`는 특정 클라이언트 하나를 담당하는 실행 흐름을
+수신 / 송신으로 나눈 두 개의 스레드입니다.
+
+기존에는 `client_thread` 하나가 수신과 송신을 모두 담당했지만, 브로드캐스트 단계에서는
+"한 클라이언트만 계속 메시지를 보내고 다른 클라이언트는 안 보내는" 상황처럼 recv/send 호출 빈도가
+서로 어긋날 수 있어, 두 흐름을 분리했습니다.
 
 현재 형태는 다음과 같습니다.
 
 ```cpp
-void client_thread(std::shared_ptr<ClientSession> session) {
-    session->Run();
+void client_recv_thread(std::shared_ptr<ClientSession> session) {
+    session->RecvRun();
+}
+
+void client_send_thread(std::shared_ptr<ClientSession> session) {
+    session->SendRun();
 }
 ```
 
 ### 역할
 
+`client_recv_thread` (RecvRun())
+
 - 특정 `ClientSession` 하나를 인자로 받음
-- `ClientSession::Run()` 실행
-- `Run()` 내부에서 `RecvPacket()` / `SendPacket()`을 호출하여 Echo 흐름 수행
-- 해당 클라이언트의 송 / 수신 루프 수행
-- transport error / peer exit / protocol error 감지
-- 종료 상황 발생 시 `closing = true` 설정
-- 종료 후 `HandleTransportException()`을 통해 상태별 후처리 수행
-- 종료 전 `ClientManager`에 자기 세션 제거 요청
+- `RecvPacket()`을 반복 호출해 패킷 수신, `HandleRecvPacket()`으로 타입별 처리
+- transport error / peer exit / protocol error 감지 시 `HandleTransportException()` 호출
+- 종료 상황 발생 시 `SendQueueCV_NotifyAll()`로 send thread를 깨움
+
+`client_send_thread` (SendRun())
+
+- 특정 `ClientSession` 하나를 인자로 받음
+- Send Queue가 비어있으면 `send_queue_cv`로 대기, 채워지면 깨어나 `SendQueuePop()` 후 `SendPacket()` 실행
+- 송신 중 transport error 등 발생 시 `HandleTransportException()` 호출
+
+공통
+
+- 종료 상황이 감지되면 `TryMarkClosing()`을 통해 CAS로 종료 권한을 획득한 스레드만
+  `ClientSockShutdown()`(recv thread의 blocking recv() 탈출용)과 `RemoveThisClient()`를 수행
 
 현재 Echo Server 단계에서는 수신한 메시지를 같은 클라이언트에게 다시 돌려보냅니다.
 
@@ -144,20 +162,28 @@ void client_thread(std::shared_ptr<ClientSession> session) {
 Client A → Server → Client A
 ```
 
-현재 `Run()`은 Echo Server의 고수준 흐름만 담당합니다.
+현재 `RecvRun()` / `SendRun()`은 각각 다음 고수준 흐름을 담당합니다.
 
 ```text
-Run()
+RecvRun()
   ├── RecvPacket()              → RecvResult 반환
+  ├── closing 확인 → true이면 return
   ├── 수신 상태 확인 (state)
-  │     └── 예외 발생 시 HandleTransportException(state)
-  ├── HandleRecvPacket(res)     → 패킷 타입별 처리
-  │     ├── CHAT_MESSAGE        → SendPacket() (echo, 헤더에 ECHO_NICK 포함)
-  │     ├── HEADER_ERROR        → TryMarkClosing() 성공 시 RemoveThisClient()
+  │     └── 예외 발생 시 HandleTransportException(state) → SendQueueCV_NotifyAll() → break
+  ├── HandleRecvPacket(packet)  → 패킷 타입별 처리
+  │     ├── CHAT_MESSAGE        → SendQueuePush() (echo, 헤더에 ECHO_NICK 포함)
+  │     ├── HEADER_ERROR        → TryMarkClosing() (성공 시 내부에서 shutdown+RemoveThisClient 수행)
   │     └── NICKNAME_CHANGE     → 길이 검사 → GetClients() 중복 검사
-  │                               → 통과 시 nickname 갱신 + NICKNAME_CHANGE_SUCESS 송신
-  │                               → 실패 시 NICKNAME_CHANGE_FAILED 송신
-  └── closing 확인 → true이면 루프 종료
+  │                               → 통과 시 nickname 갱신 + NICKNAME_CHANGE_SUCESS SendQueuePush()
+  │                               → 실패 시 NICKNAME_CHANGE_FAILED SendQueuePush()
+  └── closing 확인 → true이면 return
+
+SendRun()
+  ├── send_queue_cv.wait()로 (closing == true 또는 큐가 비어있지 않음)까지 대기
+  ├── closing 확인 → true이면 return
+  ├── SendQueuePop()으로 패킷 하나 꺼냄
+  ├── SendPacket(packet) 실행
+  └── 예외 발생 시 HandleTransportException(state)
 ```
 
 추후 Chat Server 단계에서는 수신한 메시지를 그대로 echo하지 않고,
@@ -199,6 +225,8 @@ Client A → Server → Client B
 - `nickname` 멤버 소유 및 관리
 - 연결 즉시 `user_(session_id)` 형태의 기본 닉네임 자동 설정
 - 복사 가능하고 외부 접근이 필요한 멤버에 대한 getter 함수 제공
+- Send Queue(send_queue) 소유 및 push/pop 캡슐화(SendQueuePush() / SendQueuePop())
+- recv/send 두 실행 흐름(RecvRun() / SendRun())을 각각의 담당 스레드에 제공
 
 현재 구조는 다음과 같습니다.
 
@@ -213,15 +241,24 @@ private:
     std::atomic<bool> closing = false;
     SessionID session_id;
     Nickname nickname;
+    std::queue<std::shared_ptr<Packet>> send_queue;
+    std::mutex send_queue_mutex;
+    std::condition_variable send_queue_cv;
 
 public:
     ClientSession(std::unique_ptr<ClientSocket> s, sockaddr_in addr, SessionID id);
 
     void AddToManager(std::shared_ptr<ClientManager> manager_sp);
-    void Run();
+    void RecvRun();
+    void SendRun();
 
     RecvResult RecvPacket();
     NetState SendPacket(std::shared_ptr<Packet> packet);
+
+    bool SendQueuePush(std::shared_ptr<Packet> packet);
+    std::shared_ptr<Packet> SendQueuePop();
+    void SendQueueCV_NotifyOne();
+    void SendQueueCV_NotifyAll();
 
     void HandleRecvPacket(std::shared_ptr<Packet> packet);
     void HandleTransportException(NetState state);
@@ -344,8 +381,9 @@ key 기반으로, O(N)의 시간복잡도로 관리 목록에서 제거할 수 �
 
 | 구성 요소 | 책임 |
 |---|---|
-| `main thread` | 새 연결 수락, 세션 생성, client thread 시작 |
-| `client_thread` | 특정 세션 하나의 실행 흐름 담당 |
+| `main thread` | 새 연결 수락, 세션 생성, client_recv_thread / client_send_thread 시작 |
+| `client_recv_thread` | 특정 세션 하나의 수신 흐름(RecvRun()) 담당 |
+| `client_send_thread` | 특정 세션 하나의 송신 흐름(SendRun()) 담당, Send Queue 소비 |
 | `ClientSession` | 클라이언트 한 명의 socket, SessionID, 상태, 송수신 흐름 관리 |
 | `ClientManager` | SessionID 기반으로 여러 세션의 목록과 관계 관리 |
 | `ClientSocket` | raw `SOCKET` 소유 및 송수신 |

@@ -51,17 +51,28 @@ main()
         │     ├── NICKNAME_CHANGE_SUCESS → nick_ 갱신 → break (메인 루프 진입)
         │     └── NICKNAME_CHANGE_FAILED → 실패 원인 출력 → 루프 재시작
         │
-        └── [메인 루프]
-              ├── 사용자 입력 받기
-              ├── InputParser::Parse() → ParsedInput
-              ├── valid == false → 에러 출력 → 루프 재시작
-              ├── quit == true  → 루프 종료
-              ├── length 범위 검사 → 초과 시 에러 출력 → 루프 재시작
-              ├── ClientApp::SendPacket() (nick_ 포함)
-              ├── 송신 상태 확인 → 에러 시 루프 종료
-              ├── ClientApp::RecvPacket()
-              ├── 수신 상태 확인 → 에러 시 루프 종료
-              └── HandleRecvPacket() → 수신 메시지 출력 또는 닉네임 처리
+        └── [초기 닉네임 설정 완료 후 RecvRun() / SendRun() 분리]
+              ├── std::thread(&ClientApp::SendRun, shared_from_this()).detach()
+              └── RecvRun() (main 스레드가 그대로 담당)
+
+  [SendRun() — detach된 별도 스레드]
+    while (true):
+      ├── 사용자 입력 받기 (std::getline, blocking)
+      ├── closing 확인 → true이면 return
+      ├── InputParser::Parse() → ParsedInput
+      ├── valid == false → 에러 출력 → 루프 재시작
+      ├── quit == true  → TryMarkClosing() → 루프 종료
+      ├── length 범위 검사 → 초과 시 에러 출력 → 루프 재시작
+      ├── ClientApp::SendPacket() (nick_ 포함)
+      └── 송신 상태 확인 → 에러 시 HandleTransportException() → 루프 종료
+
+  [RecvRun() — main 스레드]
+    while (true):
+      ├── ClientApp::RecvPacket()
+      ├── closing 확인 → true이면 return
+      ├── 수신 상태 확인 → 에러 시 HandleTransportException() → 루프 종료
+      ├── HandleRecvPacket() → 수신 메시지 출력 또는 닉네임 처리
+      └── closing 확인 → true이면 return
 ```
 
 핵심은 `main()`은 소켓 생성과 서버 연결의 구현만 담당하고,
@@ -90,7 +101,7 @@ main()
 현재 구조는 다음과 같습니다.
 
 ```cpp
-class ClientApp {
+class ClientApp : public std::enable_shared_from_this<ClientApp> {
 private:
     ConnectSocket sock_;
     NetState state_;
@@ -101,6 +112,8 @@ public:
     ClientApp(ConnectSocket s);
 
     void Run();
+    void RecvRun();
+    void SendRun();
 
     NetState SendPacket(const char* msg, uint32_t len, PacketType type);
     RecvResult RecvPacket();
@@ -258,7 +271,7 @@ struct ParsedInput {
 
 | 구성 요소 | 책임 |
 |---|---|
-| `main()` | WinsockGuard 생성, ConnectSocket 생성 및 연결, ClientApp 생성 및 Run() 호출 |
+| `main()` | WinsockGuard 생성, ConnectSocket 생성 및 연결, `std::shared_ptr<ClientApp>` 생성 및 Run() 호출 |
 | `ClientApp` | ConnectSocket 소유, 송수신 추상화, 입력 → 파싱 → 송신 → 수신 → 출력 루프 관리 |
 | `InputParser` | 사용자 입력 파싱, ParsedInput 반환 |
 | `ParsedInput` | 파싱 결과 전달 객체 (type, payload, quit, valid) |

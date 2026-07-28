@@ -36,6 +36,14 @@ public:
         other.client_sock = INVALID_SOCKET;
     }
 
+    int ClientSockShutdown() {
+        if (shutdown(client_sock, SD_BOTH) == SOCKET_ERROR) { // 송 / 수신 모두 차단
+            err_display("shutdown()");
+            return SOCKET_ERROR;
+        }    
+        return 0;
+    }
+
     int ClientSockSend(NetState& state, const char* msg, int len) {
 
         int send_res = send_all(client_sock, state, msg, len);
@@ -136,6 +144,14 @@ public:
     // 이동 생성자
     ConnectSocket(ConnectSocket&& other) noexcept : connect_sock(other.connect_sock) { // noexcept = 이 함수는 예외를 발생시키지 않는다고 컴파일러에게 알려주기. 그래서 이동 최적화.
         other.connect_sock = INVALID_SOCKET;
+    }
+
+    int ConnectSockShutdown() {
+        if (shutdown(connect_sock, SD_BOTH) == SOCKET_ERROR) { // 송 / 수신 모두 차단
+            err_display("shutdown()");
+            return SOCKET_ERROR;
+        }
+        return 0;
     }
 
     void ConnectSockConnect(sockaddr_in* addr) {

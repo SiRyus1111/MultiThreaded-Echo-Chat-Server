@@ -175,6 +175,10 @@
 - `ClientSession::HandleRecvPacket()`의 `HEADER_ERROR` 분기에 `TryMarkClosing()` 성공 시에만 `RemoveThisClient()`를 호출하는 페어링 적용 (기존에는 `RemoveThisClient()` 호출이 누락되어 있었음)
 - `ClientApp`은 `RemoveThisClient()` 대응 개념이 없어 `TryMarkClosing()` 반환값을 현재는 사용하지 않으나, 추후 클라이언트 멀티스레드 확장을 대비해 반환 타입은 유지
 
+### Packet 기반 서버 로직 개편
+
+### Send Queue, Send / recv Thread 기반 서버 로직 개편
+
 ---
 
 ## 3. 현재 기준 미구현

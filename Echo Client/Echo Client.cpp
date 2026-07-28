@@ -109,7 +109,7 @@ public:
     }
 };
 
-class ClientApp {
+class ClientApp : public std::enable_shared_from_this<ClientApp> {
 private:
     ConnectSocket sock_;
     NetState state_; // 클라이언트 전체 상태 (생애주기 추적용)
@@ -127,6 +127,7 @@ public:
             case PacketType::CHAT_MESSAGE:
             {
                 LineLogger::GetInstance().WriteChatLog(res.nick, res.payload);
+                LineLogger::GetInstance().WriteInputLog("Message to send (Maximum 4096 Bytes) : "); // 메시지 찍은 직후 프롬프트 다시 그려주기. 이건 구조적 한계라 어쩔 수가 없다.
 
                 break;
             }
@@ -201,12 +202,18 @@ public:
         }
 
         std::cout << "서버와 연결 종료됨.\n";
+
+        return;
     }
 
     ClientApp& operator=(const ClientApp&) = delete;
     ClientApp(const ClientApp&) = delete;
 
     void Run();
+
+    void RecvRun();
+
+    void SendRun();
 
     // nick은 수정할 닉네임이 아닌 해당 패킷을 송 / 수신하는 주체의 닉네임
     NetState SendPacket(const char* msg, uint32_t len, PacketType type, Nickname nick);
@@ -219,6 +226,10 @@ public:
         if (!closing.compare_exchange_strong(expected, true)) {
             return false;
         }
+
+        // 이 이후를 실행할 수 있는 스레드는 종료 책임을 가진다.
+
+        sock_.ConnectSockShutdown();
 
         return true;
     }
@@ -281,11 +292,26 @@ void ClientApp::Run() {
         return;
     }
 
+    // 여기서부터 SendRun() / RecvRun() 띄움.
+    std::thread(&ClientApp::SendRun, shared_from_this()).detach(); // SendRun()은 별개의 스레드로 분리
+
+    RecvRun(); // RecvRun() 은 이 스레드(main)가 직접 맡음
+
+    return;
+}
+
+void ClientApp::SendRun() {
+    char buf[BUFFER_SIZE];
+
     while (true) {
 
         std::string user_input;
         LineLogger::GetInstance().WriteInputLog("Message to send (Maximum 4096 Bytes) : ");
         std::getline(std::cin, user_input);
+
+        if (closing.load()) {
+            return;
+        }
 
         ParsedInput input_to_send = InputParser::Parse(user_input);
 
@@ -295,6 +321,7 @@ void ClientApp::Run() {
         }
         if (input_to_send.quit == true) {
             LineLogger::GetInstance().WriteLog("\"quit\" has been entered. The client is shutting down.");
+            TryMarkClosing(); // 디버깅 포인트 : 이거 안적어서 quit 쳐도 RecvRun()은 종료 안됨
             break;
         }
 
@@ -308,17 +335,25 @@ void ClientApp::Run() {
         NetState SendState = SendPacket(buf, input_to_send.length, input_to_send.type, nick_);
 
         if (SendState.peer_closed ||
-            SendState.peer_protocol_error || 
+            SendState.peer_protocol_error ||
             SendState.transport_error) {
 
             HandleTransportException(SendState);
             break;
         }
+    }
+}
 
+void ClientApp::RecvRun() {
+    while (true) {
         RecvResult RecvRes = RecvPacket();
 
-        if (RecvRes.state.peer_closed || 
-            RecvRes.state.protocol_error || 
+        if (closing.load()) {
+            return;
+        }
+
+        if (RecvRes.state.peer_closed ||
+            RecvRes.state.protocol_error ||
             RecvRes.state.transport_error) {
 
             HandleTransportException(RecvRes.state);
@@ -330,13 +365,10 @@ void ClientApp::Run() {
         // 여기에 closing == true 체크 추가
         // 위의 HandleRecvPacket() 함수로 인한 종료 상황 발생 시 while break 하는 용도
         // 어차피 HandlePacket() 끝난 후 이 코드가 실행되니 위의 Handle*() 함수들로는 TOCTOU문제는 발생하지 않고, 다음 send()에서 발생함. TOCTOU문제는 그 때 처리.
-        if (closing == true) {
-            break;
+        if (closing.load()) {
+            return;
         }
-
     }
-
-    return;
 }
 
 NetState ClientApp::SendPacket(const char* msg, uint32_t len, PacketType type, Nickname nick) {
@@ -529,9 +561,9 @@ int main() {
 
         LineLogger::GetInstance().WriteLog("Connected to the server.");
 
-        ClientApp client(std::move(connect_sock));
+        std::shared_ptr<ClientApp> client = std::make_shared<ClientApp>(std::move(connect_sock));
 
-        client.Run();
+        client->Run();
     }
     catch (std::exception& e) {
         std::cerr << e.what() << '\n';

@@ -14,6 +14,8 @@
 #include <algorithm>
 #include "LineLogger.h"
 #include <sstream>
+#include <queue>
+#include <condition_variable>
 
 #pragma comment(lib, "Ws2_32.lib")
 
@@ -91,6 +93,9 @@ private:
 	std::atomic<bool> closing = false; // alignas(64) 가급적 필요할 듯. false sharing 고려해야함.
 	SessionID session_id;
 	Nickname nickname;
+	std::queue<std::shared_ptr<Packet>> send_queue;
+	std::mutex send_queue_mutex;
+	std::condition_variable send_queue_cv;
 public:	
 	ClientSession(std::unique_ptr<ClientSocket> s, sockaddr_in addr, SessionID id) 
 		: ClientSock(std::move(s)), 
@@ -132,6 +137,41 @@ public:
 		return std::string(ClientAddrStr, strlen(ClientAddrStr));
 	}
 
+	bool SendQueuePush(std::shared_ptr<Packet> packet) {
+		{
+			std::lock_guard<std::mutex> lock(send_queue_mutex);
+
+			if (closing.load()) {
+				return false;
+			}
+
+			send_queue.push(std::move(packet));
+
+		}
+
+		// 여기서 Send Queue cv notify_one()
+		SendQueueCV_NotifyOne();
+
+		return true;
+	}
+
+	std::shared_ptr<Packet> SendQueuePop() {
+		std::lock_guard<std::mutex> lock(send_queue_mutex);
+
+		std::shared_ptr<Packet> packet = std::move(send_queue.front());
+		send_queue.pop();
+
+		return packet;
+	}
+
+	void SendQueueCV_NotifyOne() {
+		send_queue_cv.notify_one();
+	}
+
+	void SendQueueCV_NotifyAll() {
+		send_queue_cv.notify_all();
+	}
+
 	void HandleRecvPacket(std::shared_ptr<Packet> packet) { // 이거 RecvResult가 아닌 Packet 기반으로 수정해야함
 		bool quit = false;
 
@@ -147,6 +187,9 @@ public:
 				memcpy(&packet->header.nickname, ECHO_NICK.c_str(), ECHO_NICK.size()); // 메모리 카피로 문자열 바이트 그대로 헤더의 닉네임 필드에 넣어버리기
 
 
+				SendQueuePush(packet);
+
+				/*
     			NetState send_state = SendPacket(packet); // 여기 (uint32_t) strlen(buf)에서 res.length로 수정함. 만약 보내려는 문자 중간에 널문자 있으면 클남.
 
 			    if (send_state.transport_error ||
@@ -156,6 +199,7 @@ public:
 	    			HandleTransportException(send_state);
 
     			}
+				*/
 
 			    break;
 		    }
@@ -165,9 +209,7 @@ public:
 				LineLogger::GetInstance().WriteSessionLog(session_id,nickname, ClientAddrStr, ntohs(ClientAddr.sin_port), LineLogger::LogType::RECEIVE_ERROR_PACKET, "Received an error packet from a Client.");
 			    // 여기 수정 필요함. 꼭 기억해두셈. 여기 RemoveThisClient() 함수 없음. CAS 기반 MarkClosing() 함수 추가할 때 이거 추가하셈.
 				// 수정 완료
-				if (TryMarkClosing()) {
-					RemoveThisClient();
-				}
+				TryMarkClosing();
 
 				break;
 			}
@@ -181,12 +223,17 @@ public:
 					*packet->payload_up = nick_length_exceed;
 					packet->header.length = htonl(nick_length_exceed.size());
 
+					SendQueuePush(packet);
+
+					/*
 					NetState send_res = SendPacket(packet);
 
 					if (!(!send_res.transport_error && !send_res.peer_closed && !send_res.protocol_error)) {
 						HandleTransportException(send_res);
 					}
+					*/
 
+					break;
 					// break하는 코드 추가
 				}
 
@@ -212,11 +259,14 @@ public:
 					*packet->payload_up = nick_already_used_msg;
 					packet->header.length = htonl(nick_already_used_msg.size());
 
+					SendQueuePush(packet);
+					/*
 					NetState send_res = SendPacket(packet);
 
 					if (!(!send_res.transport_error && !send_res.peer_closed && !send_res.protocol_error)) {
 						HandleTransportException(send_res);
 					}
+					*/
 
 					break;
 				}
@@ -231,11 +281,15 @@ public:
 				memcpy(&packet->header.nickname, SERVER_NICK.c_str(), SERVER_NICK.size());
 				// 페이로드는 변경할 닉네임. 그래서 그대로여도 됨.
 
+				SendQueuePush(packet);
+
+				/*
 				NetState send_res = SendPacket(packet);
 
 				if (!(!send_res.transport_error && !send_res.peer_closed && !send_res.protocol_error)) {
 					HandleTransportException(send_res);
 				}
+				*/
 
 				break;
 			}
@@ -249,6 +303,8 @@ public:
 		if (!TryMarkClosing()) {
 			return;
 		}
+
+		// 이 이후를 실행할 수 있는 스레드는 후처리 책임을 가진다.
 
 		if (State.transport_error) {
 
@@ -273,6 +329,9 @@ public:
 
 			LineLogger::GetInstance().WriteSessionLog(session_id, nickname, ClientAddrStr, ntohs(ClientAddr.sin_port), LineLogger::LogType::SEND_ERROR_PACKET, "Sending an error packet...");
 
+			SendQueuePush(packet);
+
+			/*
 			NetState header_err_send_res = SendPacket(packet);
 
 			if (!(!header_err_send_res.transport_error && !header_err_send_res.peer_closed && !header_err_send_res.protocol_error && !header_err_send_res.peer_protocol_error)) { // 드 모르간 적용해서 하나라도 false라면 AND 연산을 더이상 하지 않는 것을 이용해서 최적화. 
@@ -282,6 +341,7 @@ public:
 				// 이 함수는 호출될 때에 send() 한 후에 오류가 났을 때 결과를 출력함.
 				HandleTransportException(header_err_send_res);
 			}
+			*/
 		}
 		/*
 		else if (State.peer_protocol_error) { // 이거 뺴버리자. 따로 HEADER_ERROR인 패킷을 받았을 때 처리하는 함수를 만들어야겠다..
@@ -291,8 +351,6 @@ public:
 		else if (State.peer_closed) {
 			LineLogger::GetInstance().WriteSessionLog(session_id, nickname, ClientAddrStr, ntohs(ClientAddr.sin_port), LineLogger::LogType::DISCONNECTED, "The client has successfully closed the connection.");
 		}
-
-		RemoveThisClient();
 
 		return;
 	}
@@ -306,16 +364,28 @@ public:
 	// 송수신 로직이 구현되어있는 함수
 	void Run();
 
-	NetState SendPacket(std::shared_ptr<Packet> packet); // 이 함수는 좀 후순위로 수정
+	void RecvRun();
 
-	RecvResult RecvPacket(); // 이 함수 우선 수정
+	void SendRun();
+
+	NetState SendPacket(std::shared_ptr<Packet> packet);
+
+	RecvResult RecvPacket();
 
 	bool TryMarkClosing() {
 		bool expected = false;
-
-		if (!closing.compare_exchange_strong(expected, true)) {
-			return false;
+		{
+			std::lock_guard<std::mutex> lock(send_queue_mutex); // send thread의 lost wakeup을 막기 위해 send thread의 조건 변수의 조건인 closing의 변경에 락을 걸음.
+			if (!closing.compare_exchange_strong(expected, true)) {
+				return false;
+			}
 		}
+			
+
+		// 이 이후를 실행할 수 있는 스레드는 종료 책임을 가진다.
+
+		ClientSock->ClientSockShutdown(); // 만약 SOCKET_ERROR를 반환해도 상관없음. 그러면 Recv / Send도 안되는거 아님?
+		RemoveThisClient();
 
 		return true;
 	}
@@ -379,6 +449,56 @@ void ClientSession::Run() {
 	}
 
 	return;
+}
+
+void ClientSession::RecvRun() {
+	while (true) {
+		RecvResult recv_res = RecvPacket();
+
+		if (closing.load()) { // send thread나 다른 스레드에서 바꾸고 shutdown() 호출했을 때 확인용
+			return;
+		}
+
+		if (recv_res.state.transport_error ||
+			recv_res.state.protocol_error ||
+			recv_res.state.peer_closed) {
+			HandleTransportException(recv_res.state); // 여기서 closing == true로 바꿈
+			SendQueueCV_NotifyAll(); // 여기서 notify_all 호출하니까 send thread가 closing == true를 인식 못하는 문제는 없음
+
+			break;
+		}
+
+		HandleRecvPacket(std::move(recv_res.packet));
+
+		if (closing.load()) { // HandleRecvPacket() 에서 바꾼거 확인용
+			return;
+		}
+	}
+}
+
+void ClientSession::SendRun() {
+	while (true) {
+		{
+			std::unique_lock<std::mutex> lock(send_queue_mutex); // 디버깅 포인트 : 여기 락이랑 밑의 SendQueuePop() 에서 동시에 같은 락을 잡으려 했었음.
+			while (!(closing.load() || !send_queue.empty())) { // 드 모르간 적용, (!closing && empty()), 종료 상태가 아니고 큐가 비어있다면 다음으로 진행하지 않는다.
+				send_queue_cv.wait(lock);
+			}
+		}
+
+		if (closing.load()) { // recv thread나 다른 스레드에서 바꾸고 깨웠을 때 확인용
+			return;
+		}
+
+		std::shared_ptr<Packet> packet = SendQueuePop();
+
+		NetState send_res = SendPacket(packet);
+
+		if (send_res.transport_error ||
+			send_res.protocol_error ||
+			send_res.peer_closed) {
+			HandleTransportException(send_res);
+		}
+	}
 }
 
 NetState ClientSession::SendPacket(std::shared_ptr<Packet> packet) {
@@ -585,6 +705,18 @@ void client_thread(std::shared_ptr<ClientSession> session) { // detach()로 분�
 	return; 
 }
 
+void client_recv_thread(std::shared_ptr<ClientSession> session) {
+	session->RecvRun();
+
+	return;
+}
+
+void client_send_thread(std::shared_ptr<ClientSession> session) {
+	session->SendRun();
+
+	return;
+}
+
 int main() {
 	try {
 		WinsockGuard winsock;
@@ -612,9 +744,8 @@ int main() {
 				manager->AddClient(client_session, next_session_id);
 				next_session_id += 1;
 
-				std::thread ClientThread(client_thread, client_session);
-
-				ClientThread.detach();
+				std::thread(client_recv_thread, client_session).detach();
+				std::thread(client_send_thread, client_session).detach();
 		    }
 			catch (const std::exception& e) {
 				std::cerr << e.what() << '\n';

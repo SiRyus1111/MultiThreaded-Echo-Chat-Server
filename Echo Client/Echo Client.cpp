@@ -534,13 +534,7 @@ RecvResult ClientApp::RecvPacket() {
 
     result.payload = buf;
 
-    /*
-    if (recv_host_header.type == static_cast<int32_t>(PacketType::HEADER_ERROR)) {
-        state_.peer_protocol_error = true;
-        recv_state.peer_protocol_error = true; // 이걸 안 적어서 버그 발생. 이건 나중에 따로 문서화 하자.
-        return recv_state;
-    }
-    */
+\
 
     return result;
 }

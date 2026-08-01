@@ -118,7 +118,7 @@ public:
 	}
 
 	bool GetClosing() const {
-		return static_cast<bool>(closing);
+		return static_cast<bool>(closing.load());
 	}
 
 	SessionID GetSessionID() const {
@@ -179,9 +179,6 @@ public:
 	    	case PacketType::CHAT_MESSAGE: // 여기는 SendPacket() 함수 그대로 쓰는걸로 일단..
     		{
 
-		    	// 수신한 패킷의 타입이 CHAT_MESSAGE일 때 실행할 코드
-	    		// 이 함수 부분은 HandlePacket() 안으로 넣어야할 듯.. (넣었음)
-
 				// 패킷이 공개된 후에는 수정할 수 없다는 불변식 위반 아님. 애초에 패킷이 공개가 안되고 해당 ClientSession 내부에서 처리됨.
 				memset(&packet->header.nickname, '\0', HEADER_NICKNAME_SIZE); // 패딩 채우기
 				memcpy(&packet->header.nickname, ECHO_NICK.c_str(), ECHO_NICK.size()); // 메모리 카피로 문자열 바이트 그대로 헤더의 닉네임 필드에 넣어버리기
@@ -189,17 +186,6 @@ public:
 
 				SendQueuePush(packet);
 
-				/*
-    			NetState send_state = SendPacket(packet); // 여기 (uint32_t) strlen(buf)에서 res.length로 수정함. 만약 보내려는 문자 중간에 널문자 있으면 클남.
-
-			    if (send_state.transport_error ||
-				    send_state.protocol_error ||
-			    	send_state.peer_closed) {
-		    		
-	    			HandleTransportException(send_state);
-
-    			}
-				*/
 
 			    break;
 		    }
@@ -224,14 +210,6 @@ public:
 					packet->header.length = htonl(nick_length_exceed.size());
 
 					SendQueuePush(packet);
-
-					/*
-					NetState send_res = SendPacket(packet);
-
-					if (!(!send_res.transport_error && !send_res.peer_closed && !send_res.protocol_error)) {
-						HandleTransportException(send_res);
-					}
-					*/
 
 					break;
 					// break하는 코드 추가
@@ -260,13 +238,6 @@ public:
 					packet->header.length = htonl(nick_already_used_msg.size());
 
 					SendQueuePush(packet);
-					/*
-					NetState send_res = SendPacket(packet);
-
-					if (!(!send_res.transport_error && !send_res.peer_closed && !send_res.protocol_error)) {
-						HandleTransportException(send_res);
-					}
-					*/
 
 					break;
 				}
@@ -283,13 +254,6 @@ public:
 
 				SendQueuePush(packet);
 
-				/*
-				NetState send_res = SendPacket(packet);
-
-				if (!(!send_res.transport_error && !send_res.peer_closed && !send_res.protocol_error)) {
-					HandleTransportException(send_res);
-				}
-				*/
 
 				break;
 			}
@@ -331,23 +295,7 @@ public:
 
 			SendQueuePush(packet);
 
-			/*
-			NetState header_err_send_res = SendPacket(packet);
-
-			if (!(!header_err_send_res.transport_error && !header_err_send_res.peer_closed && !header_err_send_res.protocol_error && !header_err_send_res.peer_protocol_error)) { // 드 모르간 적용해서 하나라도 false라면 AND 연산을 더이상 하지 않는 것을 이용해서 최적화. 
-				// 이 함수가 호출될 때는 protocol_error 플래그가 true가 될 수 없음. 
-				// send() 할 때도 recv()가 정상적으로 실행된 경우에만 해당 플래그가 true로 바뀔 수 있기 떄문에
-				// 현재 구조에서는 상대의 패킷을 recv() 했을 때만 해당 플래그가 true로 바뀔 수 있음.
-				// 이 함수는 호출될 때에 send() 한 후에 오류가 났을 때 결과를 출력함.
-				HandleTransportException(header_err_send_res);
-			}
-			*/
 		}
-		/*
-		else if (State.peer_protocol_error) { // 이거 뺴버리자. 따로 HEADER_ERROR인 패킷을 받았을 때 처리하는 함수를 만들어야겠다..
-			LineLogger::GetInstance().WriteSessionLog(session_id, ClientAddrStr, ntohs(ClientAddr.sin_port), LineLogger::LogType::RECEIVE_ERROR_PACKET, "Received an error packet from a Client.");
-		}
-		*/
 		else if (State.peer_closed) {
 			LineLogger::GetInstance().WriteSessionLog(session_id, nickname, ClientAddrStr, ntohs(ClientAddr.sin_port), LineLogger::LogType::DISCONNECTED, "The client has successfully closed the connection.");
 		}
@@ -531,23 +479,7 @@ NetState ClientSession::SendPacket(std::shared_ptr<Packet> packet) {
 		return send_packet_state;
 	}
 
-	/*
-	// 닉네임 길이 검사(혹시 모르니)
-	if (nick.size() > 32) {
-		ClientState.protocol_error = true;
-		send_packet_state.protocol_error = true;
-
-		return send_packet_state;
-	}
-	*/
-    // Packet 구조체 기반 송신에는 할 필요가 있나 싶음..
-
-	// 헤더 송신
-	/*
-	PacketHeader send_net_header{};
-	send_net_header.length = htonl(len);
-	send_net_header.type = htonl(static_cast<int32_t>(type));
-	*/
+    // Packet 구조체 기반 송신에는 닉네임 길이 검사를 할 필요가 있나 싶음..
 
 	// 이 코드에 대한 자세한 내용은 닉네임 시스템 설계 문서 - `PacketHeader::nickname`필드를 설정하는 과정 파트 참조
 	// 주석으로 설명하기엔 너무 길다..
@@ -648,12 +580,6 @@ RecvResult ClientSession::RecvPacket() {
 		return result;
 	}
 
-	/*
-	result.type = static_cast<PacketType>(recv_host_header.type);
-	result.length = recv_host_header.length; // 이거 기록 안했었음. 그것땜에 항상 result.length == 0으로 판정되는 버그 있었음.
-	result.nick = nick_buf;
-	*/
-
 	// 페이로드 수신
 	packet->payload_up->resize(recv_host_header.length); // 자세한건 브로드캐스트 설계 문서 - RecvPacket() 개편안 참조
 
@@ -681,14 +607,6 @@ RecvResult ClientSession::RecvPacket() {
 	/*
 	// 문자열로 사용하는지 여부와는 상관없이 해당 바이트열의 끝을 알려주기 위해서 널문자 삽입. 
 	buf[recv_host_header.length] = '\0';
-	*/
-
-	/*
-	if (recv_host_header.type == static_cast<int32_t>(PacketType::HEADER_ERROR)) {
-		ClientState.peer_protocol_error = true;
-		recv_packet_state.peer_protocol_error = true;
-		return recv_packet_state;
-	}
 	*/
 
 	// 수정 : 무조건 메시지만 수신한게 아니라 패킷을 수신했다는 것을 나타내기 위해서 Message Received : buf가 아닌 Packet Receved.로 로그 메시지 수정

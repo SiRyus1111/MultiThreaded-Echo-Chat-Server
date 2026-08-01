@@ -101,6 +101,7 @@
 - `TryMarkClosing()` 개편 — CAS 연산을 `send_queue_mutex` 락 범위 안에서 수행(send thread의 lost wakeup 방지), CAS 성공 시 `ClientSock->ClientSockShutdown()`과 `RemoveThisClient()`를 함수 내부에서 함께 수행하도록 통합
 - `ClientSocket::ClientSockShutdown()` / `ConnectSocket::ConnectSockShutdown()` 추가 — 종료 권한을 가진 스레드가 blocking 중인 recv를 강제로 깨우기 위한 함수
 - `ClientApp`이 `std::enable_shared_from_this<ClientApp>`을 상속하도록 변경, `ClientApp::Run()`을 `RecvRun()` / `SendRun()`으로 분리 — `SendRun()`은 detach된 스레드로, `RecvRun()`은 메인 스레드가 직접 수행
+- `ClientManager::broadcast(std::shared_ptr<Packet> p, SessionID sender_id)` 구현 — clients snapshot(`GetClients()`)을 순회하며 `closing == true`인 세션과 발신자 자신(`sender_id`)을 제외하고 각 세션의 `SendQueuePush()`로 위임
 
 ### 구현 예정
 
@@ -108,8 +109,6 @@
 - `Server` 전역 로그의 `LineLogger` 적용
 - low-level transport 계층 로그 정책 검토
 - `SessionID` 기반 표준 로그 형식 전면 적용
-- `ClientManager::Broadcast()`
-- broadcast 시 clients snapshot 복사 구조
 - message type 확장
 - broadcast 중 송신 실패 세션 정리 정책
 - `SessionID` 기반 로그 출력 및 세션 추적 개선
@@ -272,7 +271,7 @@ TCP는 message boundary를 보장하지 않는 byte stream 기반 프로토콜�
 
 ## 7. 동기화 설계 요약
 
-추후 Broadcast Chat Server로 확장할 때는 다음 구조를 사용할 예정입니다.
+Broadcast Chat Server로 확장하며 다음 구조를 사용합니다.
 
 ```text
 ClientManager의 clients_mutex
@@ -289,8 +288,8 @@ ClientSession의 send_queue_mutex
 “같은 ClientSession에 대한 패킷 송신 순서”이다.
 ```
 
-따라서 broadcast 시에는 clients 목록을 snapshot으로 복사한 뒤,
-`clients_mutex`를 해제하고 각 `ClientSession::SendQueuePush()`로 패킷을 넘기는 구조를 목표로 합니다.
+따라서 `ClientManager::broadcast()`는 clients 목록을 snapshot(`GetClients()`, `vector<shared_ptr<ClientSession>>` 반환)으로 복사한 뒤,
+`clients_mutex`를 해제하고 `closing == true`인 세션과 발신자 자신을 제외한 각 `ClientSession::SendQueuePush()`로 패킷을 넘기는 구조로 구현되어 있습니다.
 실제 송신(`SendPacket()`)은 broadcast를 호출한 스레드가 아니라, 해당 `ClientSession`을 담당하는 `SendRun()`이 수행합니다.
 
 자세한 내용은 [`docs/concurrency-design.md`](docs/concurrency-design.md)를 참고합니다.
@@ -449,7 +448,6 @@ Client A → Server → Client B
 단기 목표:
 
 - 로그 출력 형식 개선 (`LineLogger` 전면 적용)
-- `ClientManager::Broadcast()` 구현
 
 중기 목표:
 

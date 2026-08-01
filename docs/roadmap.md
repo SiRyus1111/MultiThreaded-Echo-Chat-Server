@@ -179,6 +179,13 @@
 
 ### Send Queue, Send / recv Thread 기반 서버 로직 개편
 
+### Broadcast 도입
+
+- `ClientManager::broadcast(std::shared_ptr<Packet> p, SessionID sender_id)` 구현
+- `ClientManager::GetClients()`를 `unordered_map` 반환에서 `vector<shared_ptr<ClientSession>>` 반환으로 개편 (`reserve()` 기반 재할당 최소화)
+- `ClientSession::HandleRecvPacket()`의 `CHAT_MESSAGE` 처리를 자기 자신 echo에서 `ClientManager::broadcast()` 위임으로 전환
+- 송신 정책: `closing == true` 세션 제외, 발신자 자신 제외 (조건문 하나로 정책 전환 가능한 형태 유지)
+
 ---
 
 ## 3. 현재 기준 미구현
@@ -200,12 +207,10 @@
 
 ### Others
 
-- Broadcast Chat 기능
 - nickname 기반 클라이언트 식별
 - 메시지 타입별 채팅 프로토콜 분기
 - ClientSession별 `send_mutex`
 - broadcast 중 송신 실패 세션 정리 정책
-- clients snapshot 기반 broadcast 구조
 
 ---
 
@@ -348,28 +353,6 @@ Payload_B
 
 ---
 
-### 4-4. ClientManager::Broadcast() 구현
-
-초기 Broadcast 구조는 다음을 목표로 합니다.
-
-```text
-1. clients_mutex를 잡는다.
-2. clients snapshot을 복사한다.
-3. clients_mutex를 해제한다.
-4. snapshot을 순회한다.
-5. closing == true인 세션은 건너뛴다.
-6. 각 세션의 SendPacket()을 호출한다.
-```
-
-목표:
-
-- manager lock을 오래 잡지 않기
-- `send()`를 manager lock 내부에서 수행하지 않기
-- 같은 세션에 대한 패킷 경계 보호
-- 종료 예정 세션 송신 제외
-
----
-
 ## 5. 중기 구현 목표
 
 ### 5-1. Broadcast Chat Server
@@ -385,7 +368,6 @@ Client A → Server → Client B
 
 결정할 정책:
 
-- sender 자신에게도 메시지를 보낼 것인가?
 - 입장 / 퇴장 메시지를 broadcast할 것인가?
 - 송신 실패한 클라이언트를 언제 제거할 것인가?
 - `closing == true` 세션을 snapshot 단계에서 제외할 것인가, 순회 단계에서 제외할 것인가?
@@ -501,18 +483,18 @@ thread-per-client 구조를 구현한 뒤,
 
 - [v] AddClient 정상 동작
 - [v] RemoveClient 정상 동작
-- [ ] 동시에 여러 클라이언트 종료 시 clients 컨테이너 안전성 확인
-- [ ] RemoveClient 이후 마지막 shared_ptr 소멸 시점 확인
+- [v] 동시에 여러 클라이언트 종료 시 clients 컨테이너 안전성 확인
+- [v] RemoveClient 이후 마지막 shared_ptr 소멸 시점 확인
 - [ ] closing 상태가 broadcast 대상 제외에 사용되는지 확인
 
 ### Broadcast 단계
 
-- [ ] 한 클라이언트 메시지가 다른 클라이언트에게 전달됨
+- [v] 한 클라이언트 메시지가 다른 클라이언트에게 전달됨
 - [v] sender 자신에게 보낼지 정책 확인
 - [ ] `closing == true` 세션은 송신 제외
 - [ ] broadcast 중 클라이언트 종료 상황 처리
-- [ ] Header / Payload 순서가 섞이지 않음
-- [ ] 느린 클라이언트가 있을 때 서버 전체가 과도하게 막히지 않는지 확인
+- [v] Header / Payload 순서가 섞이지 않음
+- [v] 느린 클라이언트가 있을 때 서버 전체가 과도하게 막히지 않는지 확인
 
 ---
 
@@ -547,17 +529,3 @@ docs/original-design-note.md
 상세한 설계 변경은 `docs` 아래 문서에 반영합니다.
 
 ---
-
-## 9. 현재 우선순위
-
-현재 기준 우선순위는 다음과 같습니다.
-
-```text
-1. LineLogger 프로젝트 전면 적용 (서버 전역 로그, ClientManager 로그 교체)
-2. send_mutex 추가
-3. ClientManager::Broadcast() 구현
-4. Chat Server로 확장
-```
-
-즉, 지금 당장 중요한 것은 화려한 채팅 기능이 아니라,
-세션 수명과 동기화 구조가 깨지지 않는 안정적인 서버 기틀을 만드는 것입니다.

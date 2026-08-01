@@ -171,7 +171,7 @@ RecvRun()
   ├── 수신 상태 확인 (state)
   │     └── 예외 발생 시 HandleTransportException(state) → SendQueueCV_NotifyAll() → break
   ├── HandleRecvPacket(packet)  → 패킷 타입별 처리
-  │     ├── CHAT_MESSAGE        → SendQueuePush() (echo, 헤더에 ECHO_NICK 포함)
+  │     ├── CHAT_MESSAGE        → ClientManager::broadcast() 위임 (closing 세션 / 발신자 자신 제외 후 각 대상 세션 Send Queue에 push)
   │     ├── HEADER_ERROR        → TryMarkClosing() (성공 시 내부에서 shutdown+RemoveThisClient 수행)
   │     └── NICKNAME_CHANGE     → 길이 검사 → GetClients() 중복 검사
   │                               → 통과 시 nickname 갱신 + NICKNAME_CHANGE_SUCESS SendQueuePush()
@@ -339,7 +339,7 @@ HandleRecvpacket()
 - `SessionID` 기반 세션 식별
 - clients 컨테이너 동기화
 - clients snapshot 반환 (`GetClients()`)
-- 추후 broadcast 수행
+- broadcast 수행 (`broadcast()`)
 
 현재 구조는 다음과 같습니다.
 
@@ -352,7 +352,8 @@ private:
 public:
     void AddClient(std::shared_ptr<ClientSession> client, SessionID id);
     void RemoveClient(SessionID id);
-    std::unordered_map<SessionID, std::shared_ptr<ClientSession>> GetClients();
+    void broadcast(std::shared_ptr<Packet> p, SessionID sender_id);
+    std::vector<std::shared_ptr<ClientSession>> GetClients();
 };
 ```
 
@@ -393,14 +394,14 @@ key 기반으로, O(N)의 시간복잡도로 관리 목록에서 제거할 수 �
 
 ## 8. Echo Server에서 Chat Server로의 확장
 
-현재 Echo Server 단계에서는 각 클라이언트가 보낸 메시지를
-해당 클라이언트에게 다시 돌려보냅니다.
+과거 Echo Server 단계에서는 각 클라이언트가 보낸 메시지를
+해당 클라이언트에게 다시 돌려보내는 1:1 echo 구조였습니다.
 
 ```text
 Client A → Server → Client A
 ```
 
-추후 Chat Server 단계에서는 `ClientManager::Broadcast()`를 추가하여,
+현재는 `ClientManager::broadcast()`를 통해,
 한 클라이언트가 보낸 메시지를 다른 클라이언트들에게 전달합니다.
 
 ```text
@@ -413,7 +414,7 @@ Client A → Server → Client B
 
 - 현재 접속 중인 `ClientSession` 목록을 안전하게 순회하는 방법
 - `closing == true`인 세션을 송신 대상에서 제외하는 방법
-- sender 자신에게도 메시지를 보낼지 여부
+- sender 자신에게도 메시지를 보낼지 여부 → 결정됨: 자신은 제외 (`ClientManager::broadcast()`의 `sender_id` 비교 조건문 하나로 정책을 뒤집을 수 있는 형태)
 - 같은 클라이언트에 대한 Header / Payload 송신 순서 보장
 - `send()` 중 block될 수 있는 구간과 manager lock 범위 분리
 - 송신 실패한 클라이언트 정리 정책

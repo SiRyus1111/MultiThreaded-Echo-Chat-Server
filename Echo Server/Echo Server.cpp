@@ -72,10 +72,24 @@ public:
 
 	void RemoveClient(SessionID id);
 
+	void broadcast(std::shared_ptr<Packet> p, SessionID sender_id);
+
 	// ClientSession에서 ClientManager::clients를 얻을 필요가 있을 때 사용하기 위한 함수
-	std::unordered_map<SessionID, std::shared_ptr<ClientSession>> GetClients() {
-		std::lock_guard<std::mutex> lock(clients_mutex);
-		return clients;
+	// SessionID가 이미 ClientSession 객체 내부에 있으므로 std::vector의 형식으로 std::shared_ptr<ClientSession> 객체만 복사함
+    std::vector<std::shared_ptr<ClientSession>> GetClients() {
+
+		std::vector<std::shared_ptr<ClientSession>> snapshot;
+		snapshot.reserve(clients.size()); // 미리 clients의 크기 이상만큼 메모리를 할당받아서 추가적인 메모리 할당 최적화
+
+		{
+			std::lock_guard<std::mutex> lock(clients_mutex);
+			
+			for (const auto& [id, session_ptr] : clients) {
+				snapshot.push_back(session_ptr);
+			}
+		}
+
+		return snapshot;
 	}
 
 	// ClientSession 객체 복사 방지용
@@ -178,21 +192,24 @@ public:
 		switch (static_cast<PacketType>(ntohl(packet->header.type))) {
 	    	case PacketType::CHAT_MESSAGE: // 여기는 SendPacket() 함수 그대로 쓰는걸로 일단..
     		{
-
+				/*
 				// 패킷이 공개된 후에는 수정할 수 없다는 불변식 위반 아님. 애초에 패킷이 공개가 안되고 해당 ClientSession 내부에서 처리됨.
 				memset(&packet->header.nickname, '\0', HEADER_NICKNAME_SIZE); // 패딩 채우기
 				memcpy(&packet->header.nickname, ECHO_NICK.c_str(), ECHO_NICK.size()); // 메모리 카피로 문자열 바이트 그대로 헤더의 닉네임 필드에 넣어버리기
 
 
 				SendQueuePush(packet);
-
+				*/
+				if (auto manager_sp = Manager_wp.lock()) {
+					manager_sp->broadcast(packet, session_id);
+				}
 
 			    break;
 		    }
 			case PacketType::HEADER_ERROR:
 			{
 				// 수신한 패킷의 타입이 HEADER_ERROR일 때 실행할 코드
-				LineLogger::GetInstance().WriteSessionLog(session_id,nickname, ClientAddrStr, ntohs(ClientAddr.sin_port), LineLogger::LogType::RECEIVE_ERROR_PACKET, "Received an error packet from a Client.");
+				LineLogger::GetInstance().WriteSessionLog(session_id, nickname, ClientAddrStr, ntohs(ClientAddr.sin_port), LineLogger::LogType::RECEIVE_ERROR_PACKET, "Received an error packet from a Client.");
 			    // 여기 수정 필요함. 꼭 기억해두셈. 여기 RemoveThisClient() 함수 없음. CAS 기반 MarkClosing() 함수 추가할 때 이거 추가하셈.
 				// 수정 완료
 				TryMarkClosing();
@@ -216,14 +233,14 @@ public:
 				}
 
 				bool nick_already_used = false;
-				std::unordered_map<SessionID, std::shared_ptr<ClientSession>> snapshot;
+				std::vector<std::shared_ptr<ClientSession>> snapshot;
 
 				if (auto locked = Manager_wp.lock()) {
 					snapshot = locked->GetClients();
 				}
 
-				for (auto pair : snapshot) {
-					if (*packet->payload_up == pair.second->nickname) { // 이거 버그났었음. 
+				for (auto& client : snapshot) {
+					if (*packet->payload_up == client->nickname) { // 이거 버그났었음. 
 						nick_already_used = true;
 						break;
 					}
@@ -364,10 +381,25 @@ void ClientManager::AddClient(std::shared_ptr<ClientSession> client, SessionID i
 	return;
 };
 
-void ClientManager::RemoveClient(SessionID id) {
+void ClientManager::RemoveClient(const SessionID id) {
 	// 여기에 clients에서 해당 SessionID의 ClientSession만 지우는 로직의 코드
 	std::lock_guard<std::mutex> lock(clients_mutex);
 	clients.erase(id);
+}
+
+void ClientManager::broadcast(std::shared_ptr<Packet> p, const SessionID sender_id) {
+	auto snapshot = GetClients();
+
+	for (auto& client_info : snapshot) {
+		if (client_info->GetClosing()) {
+			continue;
+		}
+		if (client_info->GetSessionID() == sender_id) {
+			continue;
+		}
+
+		client_info->SendQueuePush(p);
+	}
 }
 
 void ClientSession::Run() {

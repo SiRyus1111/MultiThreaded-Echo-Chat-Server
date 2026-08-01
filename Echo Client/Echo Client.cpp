@@ -140,6 +140,7 @@ public:
             case PacketType::NICKNAME_CHANGE_FAILED:
             {
                 LineLogger::GetInstance().WriteChatLog(res.nick, res.payload);
+                LineLogger::GetInstance().WriteInputLog("Message to send (Maximum 4096 Bytes) : "); // 메시지 찍은 직후 프롬프트 다시 그려주기. 이건 구조적 한계라 어쩔 수가 없다.
                 break;
             }
             // 닉네임 설정 성공은 좀 특수한 케이스로,
@@ -148,6 +149,7 @@ public:
             case PacketType::NICKNAME_CHANGE_SUCESS:
             {
                 LineLogger::GetInstance().WriteChatLog(res.nick, nick_change_sucess_msg);
+                LineLogger::GetInstance().WriteInputLog("Message to send (Maximum 4096 Bytes) : "); // 메시지 찍은 직후 프롬프트 다시 그려주기. 이건 구조적 한계라 어쩔 수가 없다.
                 nick_ = res.payload;
             }
 

@@ -589,42 +589,31 @@ public:
 
 ## 14. Broadcast snapshot 구조
 
-`ClientManager::Broadcast()`는 다음 흐름으로 구현할 예정입니다.
+`ClientManager::broadcast()`는 다음 흐름으로 구현되어 있습니다.
 
 ```text
-1. ClientManager가 clients_mutex를 잡는다.
-2. 현재 clients 컨테이너의 snapshot을 복사한다.
-3. clients_mutex를 해제한다.
-4. snapshot을 순회한다.
-5. closing == true인 세션은 건너뛴다.
-6. 각 ClientSession의 SendPacket()을 호출한다.
-7. SendPacket() 내부에서는 해당 ClientSession의 send_mutex만 잡는다.
+1. GetClients()를 호출해 clients 컨테이너의 snapshot(vector<shared_ptr<ClientSession>>)을 얻는다. (clients_mutex는 GetClients() 내부에서 짧게 잡혔다 풀림)
+2. snapshot을 순회한다.
+3. GetClosing() == true인 세션은 건너뛴다.
+4. GetSessionID() == sender_id인 세션(발신자 자신)은 건너뛴다.
+5. 나머지 세션의 SendQueuePush(p)를 호출한다.
 ```
 
-예상 구조:
+실제 구조:
 
 ```cpp
-void ClientManager::Broadcast(
-    const char* msg,
-    uint32_t len,
-    PacketType type
-) {
-    std::vector<std::shared_ptr<ClientSession>> snapshot;
+void ClientManager::broadcast(std::shared_ptr<Packet> p, const SessionID sender_id) {
+    auto snapshot = GetClients();
 
-    {
-        std::lock_guard<std::mutex> lock(clients_mutex);
-
-        for (auto& client : clients) {
-            snapshot.push_back(client);
+    for (auto& client_info : snapshot) {
+        if (client_info->GetClosing()) {
+            continue;
         }
-    }
-
-    for (auto& client : snapshot) {
-        if (client->IsClosing()) {
+        if (client_info->GetSessionID() == sender_id) {
             continue;
         }
 
-        client->SendQueuePush(packet); // 실제 송신은 해당 세션의 SendRun()이 수행
+        client_info->SendQueuePush(p); // 실제 송신은 해당 세션의 SendRun()이 수행
     }
 }
 ```
@@ -856,22 +845,8 @@ WriteTransportLog(...)
 향후 확장 후보로 남겨둡니다.
 
 ---
-## 16. 아직 남은 정책 결정
 
-Broadcast 단계에서 아직 결정해야 할 정책은 다음과 같습니다.
-
-- sender 자신에게도 메시지를 보낼 것인가?
-- `SendPacket()` 실패 시 즉시 `closing = true`로 바꿀 것인가?
-- 송신 실패한 세션을 Broadcast 내부에서 제거할 것인가?
-- 제거 요청은 즉시 수행할 것인가, 별도 정리 단계에서 수행할 것인가?
-- 느린 클라이언트가 있을 때 send timeout 또는 send queue를 둘 것인가?
-- detach 기반 구조를 계속 유지할 것인가, thread 관리 모델을 바꿀 것인가?
-
-현재 단계에서는 Echo Server 구조 안정화가 우선입니다.
-
----
-
-## 17. Send Queue 구조 도입 완료
+## 16. Send Queue 구조 도입 완료
 
 당초에는 `Broadcast()`가 각 `ClientSession::SendPacket()`을 직접 호출하는 구조를 검토했고,
 클라이언트 수가 많아지거나 느린 클라이언트 문제가 커질 경우를 대비해 다음 구조를 향후 검토 과제로 남겨두었습니다.
@@ -901,7 +876,7 @@ ClientSession
 
 ---
 
-## 18. 정리
+## 17. 정리
 
 현재 멀티스레딩 설계의 핵심은 다음과 같습니다.
 

@@ -315,6 +315,15 @@ LineLogger::GetInstance().WriteChatLog(res.nick, res.payload);
 LineLogger::GetInstance().WriteChatLog(res.nick, "서버가 연결을 종료합니다.");
 ```
 
+`WriteInputLog()`는 `CHAT_MESSAGE` 수신 시뿐 아니라, `NICKNAME_CHANGE_FAILED` / `NICKNAME_CHANGE_SUCESS` 응답을 출력한 직후에도 호출됩니다.
+서버로부터 온 응답이 콘솔에 출력될 때마다 입력 프롬프트를 다시 그려주기 위한 것으로, 세 경우 모두 동일한 목적(프롬프트 재출력)을 가집니다.
+
+```cpp
+// CHAT_MESSAGE / NICKNAME_CHANGE_FAILED / NICKNAME_CHANGE_SUCESS 수신 시
+LineLogger::GetInstance().WriteChatLog(res.nick, ...);
+LineLogger::GetInstance().WriteInputLog("Message to send (Maximum 4096 Bytes) : ");
+```
+
 ---
 
 ## 3-6. InputParser / ParsedInput

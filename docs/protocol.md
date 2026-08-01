@@ -326,6 +326,9 @@ SERVER_NICK = "ServerMessage"
 클라이언트 닉네임으로는 이 값을 설정할 수 없으며,
 서버는 이 값을 통해 "이 패킷은 서버가 직접 생성한 것"임을 수신자가 식별할 수 있게 합니다.
 
+브로드캐스트 도입 이후 `CHAT_MESSAGE`는 `ClientManager::broadcast()`로 위임되며, 헤더의 발신자 닉네임을 덮어쓰지 않고 수신 당시의 값을 그대로 전달합니다.
+따라서 `ECHO_NICK`은 현재 코드 내에서 실제로 사용되는 곳이 없습니다. 상수 자체는 향후 다른 서버 생성 패킷에서 재사용될 가능성을 고려해 유지합니다.
+
 ## 3. Payload
 
 Payload는 실제 메시지 데이터입니다.
@@ -454,10 +457,10 @@ while 이미 받은 길이 < 전체 길이:
 5. Payload 송신
 ```
 
-즉, `Run()`은 byte order 변환이나 Header / Payload 송수신 세부 절차를 직접 알 필요가 없습니다.
+즉, `RecvRun()`은 byte order 변환이나 Header / Payload 송수신 세부 절차를 직접 알 필요가 없습니다.
 
 ```text
-Run()
+RecvRun()
   → RecvPacket()        → RecvResult 반환
   → 수신 상태 확인       → 문제 있으면 HandleTransportException(state)
   → HandleRecvPacket()  → 패킷 타입별 처리 (echo, 세션 종료 등)
@@ -480,7 +483,7 @@ RecvResult.state가 정상인 경우
                             → 각 송신(SendPacket())이 실패하면 HandleTransportException() 호출
 
   → PacketType별 처리 (클라이언트 기준, 기존 구조 유지)
-    CHAT_MESSAGE          → WriteChatLog()로 수신 메시지 출력
+    CHAT_MESSAGE          → ClientManager::broadcast(packet, session_id) 위임 (closing 세션 / 발신자 자신 제외, 헤더의 nickname은 수정하지 않고 그대로 전달)
     HEADER_ERROR          → WriteChatLog() 후 TryMarkClosing()
     NICKNAME_CHANGE_SUCESS  → nick_ 갱신 (res.payload), 성공 메시지 출력
     NICKNAME_CHANGE_FAILED  → 실패 원인 메시지 출력
@@ -514,7 +517,7 @@ Header_B
 Payload_B
 ```
 
-이 문제는 추후 `ClientSession`별 `send_mutex`를 `SendPacket()` 내부에 적용하여 해결할 예정입니다.
+이 문제는 `ClientSession`별 `Send Queue`를 두는 형태로 해결했습니다.
 
 ## 7. NetState
 

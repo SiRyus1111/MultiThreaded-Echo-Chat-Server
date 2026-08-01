@@ -300,3 +300,14 @@ IP:Port만으로는 부족해.
   - 자세한거 도저히 못쓰겠다.. 뇌 용량 초과!
   - 자세한건 [여기서](./IdeaScatch/26.07.19%20MarkClosing%20개편.md)
 - 이제 좀 달려보자.. 다음에는 `Packet` 구조체 기반 리팩토링임..
+
+### 26.08.01
+
+- (밀린 로그 작성)
+- 얼마만의 개발로그냐ㅋㅋ
+- `Packet` 기반 개편 / `Send Queue` 도입 / send, recv thread 도입
+  - 핵심 목적 :
+    - `Packet` 기반 개편 : `Send Queue`에 넣을 패킷 하나의 단위를 `Packet`으로 정함
+    - `Send Queue` 도입 : 브로드캐스트 환경에서 송신 책임을 오로지 하나의 send thread로만 제한
+    - send, recv thread 도입 : 기존 1:1 송신 구조를 ㅏ용할 수 없어서 N:M 송 / 수신을 적용하기 위해
+  - 자세한건 [여기서](./IdeaScatch/26.06.22%20브로드캐스트%20설계.md)

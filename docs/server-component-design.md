@@ -1229,8 +1229,9 @@ void HandleRecvPacket(std::shared_ptr<Packet> packet);
 ```text
 switch (static_cast<PacketType>(ntohl(packet->header.type)))
   CHAT_MESSAGE
-    → 같은 packet의 header.nickname을 ECHO_NICK으로 덮어쓴 뒤 SendPacket(packet) (echo)
-    → 송신 실패 시 HandleTransportException(send_state)
+    → Manager_wp.lock() 성공 시 manager->broadcast(packet, session_id) 위임
+    → broadcast() 내부에서 closing 세션 / 발신자 자신(session_id) 제외 후 각 대상 세션의 SendQueuePush() 호출
+    → 헤더의 nickname은 수정하지 않고 수신 당시(발신자의) 값을 그대로 전달
 
   HEADER_ERROR
     → TryMarkClosing() 성공 시 RemoveThisClient()
@@ -1725,15 +1726,25 @@ SessionID 기반 제거 구조의 장점은 다음과 같습니다.
 ## 7-3. GetClients()
 
 ```cpp
-std::unordered_map<SessionID, std::shared_ptr<ClientSession>> GetClients();
+std::vector<std::shared_ptr<ClientSession>> GetClients();
 ```
 
 `GetClients()`는 현재 `clients` 컨테이너의 snapshot을 반환하는 함수입니다.
 
 ```cpp
-std::unordered_map<SessionID, std::shared_ptr<ClientSession>> ClientManager::GetClients() {
-    std::lock_guard<std::mutex> lock(clients_mutex);
-    return clients;
+std::vector<std::shared_ptr<ClientSession>> ClientManager::GetClients() {
+    std::vector<std::shared_ptr<ClientSession>> snapshot;
+    snapshot.reserve(clients.size());
+
+    {
+        std::lock_guard<std::mutex> lock(clients_mutex);
+
+        for (const auto& [id, session_ptr] : clients) {
+            snapshot.push_back(session_ptr);
+        }
+    }
+
+    return snapshot;
 }
 ```
 
@@ -1757,15 +1768,22 @@ if (auto manager = Manager_wp.lock()) {
 핵심은 `clients_mutex`를 잡은 상태에서 snapshot만 복사하고 즉시 해제하는 것입니다.
 이렇게 하면 중복 검사 중 다른 세션의 lock 대기를 최소화할 수 있습니다.
 
-## 7-4. Broadcast() [Planned]
+#### vector를 선택한 이유
+
+`clients`는 `unordered_map<SessionID, shared_ptr<ClientSession>>`이지만, `GetClients()`의 호출부(닉네임 중복 검사, `broadcast()`)는 모두
+"SessionID로 특정 세션을 찾는" 용도가 아니라 "전체를 순회"하는 용도로만 snapshot을 사용합니다.
+`ClientSession`이 이미 자기 자신의 `session_id`를 값으로 가지고 있어(`GetSessionID()`), map의 key는 순회 목적에서는 불필요한 정보입니다.
+
+따라서 `GetClients()`는 `unordered_map` 전체를 복사하는 대신, `shared_ptr<ClientSession>` 값만 `vector`로 복사합니다.
+`snapshot.reserve(clients.size())`로 미리 메모리를 확보해, `clients_mutex`를 잡고 있는 짧은 구간 안에서 재할당이 발생하지 않도록 합니다.
+
+## 7-4. broadcast()
 
 ```cpp
-void Broadcast(...);
+void broadcast(std::shared_ptr<Packet> p, SessionID sender_id);
 ```
 
-`Broadcast()`는 추후 Chat Server 단계에서 구현할 함수입니다.
-
-역할은 한 클라이언트가 보낸 메시지를 다른 클라이언트들에게 전달하는 것입니다.
+`broadcast()`는 한 클라이언트가 보낸 메시지를 다른 클라이언트들에게 전달하는 함수입니다.
 
 ```text
 Client A → Server → Client B
@@ -1773,35 +1791,29 @@ Client A → Server → Client B
                   → Client D
 ```
 
-초기 설계 방향은 다음과 같습니다.
+실제 구조는 다음과 같습니다.
 
 ```text
-1. clients_mutex를 잡는다.
-2. 현재 clients 목록의 snapshot을 복사한다.
-3. clients_mutex를 해제한다.
-4. snapshot을 순회한다.
-5. closing == true인 세션은 건너뛴다.
-6. 각 ClientSession의 SendPacket()을 호출한다.
+1. GetClients()로 clients 목록의 snapshot(vector<shared_ptr<ClientSession>>)을 얻는다. (clients_mutex는 GetClients() 내부에서 짧게 잡혔다 풀림)
+2. snapshot을 순회한다.
+3. GetClosing() == true인 세션은 건너뛴다.
+4. GetSessionID() == sender_id인 세션(발신자 자신)은 건너뛴다.
+5. 나머지 세션의 SendQueuePush(p)를 호출한다.
 ```
 
 ```cpp
-// 예상 구조, 아직 미구현
-ClientManager::Broadcast(SessionID session, const char* message, int len) {
-    std::unordered_map<SessionID, std::shared_ptr<ClientSession>> snapshot;
-    {
-        std::lock_guard<std::mutex> lock(client_mutex);
-        snapshot = clients;
-    }
+void ClientManager::broadcast(std::shared_ptr<Packet> p, const SessionID sender_id) {
+    auto snapshot = GetClients();
 
-    for (auto [ID, pSession] : snapshot){
-        if (ID == session) {
+    for (auto& client_info : snapshot) {
+        if (client_info->GetClosing()) {
             continue;
         }
-        if (closing == true) {
+        if (client_info->GetSessionID() == sender_id) {
             continue;
         }
 
-        pSession->SendPacket(message, len, PacketType::CHAT_MESSAGE);
+        client_info->SendQueuePush(p);
     }
 }
 ```
@@ -1809,21 +1821,22 @@ ClientManager::Broadcast(SessionID session, const char* message, int len) {
 이 구조를 사용하는 이유는,
 `clients_mutex`를 잡은 상태에서 실제 `send()`를 오래 수행하지 않기 위해서입니다.
 
-`clients_mutex`를 짧게 잡게 된다면, 후일에 발생할 수 있는 데드락 위험과 락 경합을 줄알 수 있습니다.
+`clients_mutex`를 짧게 잡게 된다면, 후일에 발생할 수 있는 데드락 위험과 락 경합을 줄일 수 있습니다.
 
 그리고 `send()`는 block될 수 있으므로,
 manager lock을 잡은 상태에서 모든 클라이언트에게 send하면
 느린 클라이언트 하나가 전체 서버 흐름에 영향을 줄 수 있습니다.
 
-따라서 `Broadcast()`에서는 clients 목록을 짧게 snapshot으로 복사하고,
-실제 송신은 manager lock을 풀고 수행하는 구조를 목표로 합니다.
+따라서 `broadcast()`는 clients 목록을 짧게 snapshot으로 복사하고,
+실제 송신은 manager lock을 풀고, 해당 세션을 담당하는 `SendRun()`이 수행하는 구조를 취합니다.
+`broadcast()`를 호출한 스레드는 `SendQueuePush()`만 수행하고 `send()`를 직접 호출하지 않습니다.
 
 ```text
 clients_mutex
   → clients 목록 보호
 
-send_mutex
-  → 특정 ClientSession의 Header + Payload 송신 순서 보호
+send_queue_mutex
+  → 특정 ClientSession의 Send Queue push() / pop() 보호 (Header + Payload 송신 순서 자체는 SendRun() 하나로 송신 주체가 고정되어 구조적으로 보장됨)
 ```
 
 ---

@@ -300,6 +300,8 @@ public:
 		}
 		else if (State.protocol_error) {
 
+			LineLogger::GetInstance().WriteSessionLog(session_id, nickname, ClientAddrStr, ntohs(ClientAddr.sin_port), LineLogger::LogType::PROTOCOL_ERROR, "Protocol Error occured.");
+
 			std::shared_ptr<Packet> packet = std::make_shared<Packet>();
 
 			packet->header.type = htonl(static_cast<int32_t>(PacketType::HEADER_ERROR));
@@ -477,8 +479,10 @@ void ClientSession::SendRun() {
 			send_res.protocol_error ||
 			send_res.peer_closed) {
 			HandleTransportException(send_res);
+			break;
 		}
 	}
+
 }
 
 NetState ClientSession::SendPacket(std::shared_ptr<Packet> packet) {
@@ -658,11 +662,15 @@ void client_thread(std::shared_ptr<ClientSession> session) { // detach()로 분�
 void client_recv_thread(std::shared_ptr<ClientSession> session) {
 	session->RecvRun();
 
+	LineLogger::GetInstance().WriteLog("[Thread Exit] recv thread finished. SessionID = ", session->GetSessionID());
+
 	return;
 }
 
 void client_send_thread(std::shared_ptr<ClientSession> session) {
 	session->SendRun();
+
+	LineLogger::GetInstance().WriteLog("[Thread Exit] send thread finished. SessionID = ", session->GetSessionID());
 
 	return;
 }

@@ -1047,11 +1047,11 @@ bool TryMarkClosing();
 기존에는 `MarkClosing()`이 단순히 `closing.store(true)`만 수행하는 무조건적 setter였습니다.
 하지만 이 방식은 같은 세션에 대해 종료 처리가 두 번 이상 실행되는 것을 막지 못했습니다.
 
-예를 들어 `HandleTransportException()`의 `protocol_error` 분기는 에러 패킷 송신에 실패하면
-자기 자신을 재귀 호출합니다. 이 재귀 호출이 발생하면 함수 본문(로그 출력, `RemoveThisClient()`)이
-다시 한 번 실행될 수 있었습니다. 또한 추후 Broadcast 단계에서는 다른 client_thread가
-`Broadcast()`를 통해 같은 세션의 `SendPacket()`을 호출하다 실패하여 `HandleTransportException()`을
-동시에 트리거할 수도 있습니다.
+예를 들어 `HandleTransportException()`의 `protocol_error` 분기는 에러 패킷 송신에 실패하면 자기 자신을 재귀 호출합니다. 
+이 재귀 호출이 발생하면 함수 본문(로그 출력, `RemoveThisClient()`)이 다시 한 번 실행될 수 있었습니다. 
+또한 Broadcast 단계에서는 다른 send_client_thread가
+`Broadcast()`를 통해 같은 세션의 `SendQueuePush()`을 호출하다 실패하여
+`HandleTransportException()`을 동시에 트리거할 수도 있습니다.
 
 `TryMarkClosing()`은 `std::atomic<bool>::compare_exchange_strong()`을 사용해
 `closing`을 `false → true`로 바꾸는 시도가 **정확히 한 번만 성공**하도록 만듭니다.
@@ -1571,8 +1571,11 @@ ClientSession 객체는 소멸하지 않는다.
 ClientManager
   └── unordered_map<SessionID, shared_ptr<ClientSession>>
 
-client_thread()
+client_recv_thread()
   └── shared_ptr<ClientSession>
+
+client_send_thread()
+└── shared_ptr<ClientSession>
 ```
 
 따라서 `ClientManager`에서 세션을 제거하더라도,

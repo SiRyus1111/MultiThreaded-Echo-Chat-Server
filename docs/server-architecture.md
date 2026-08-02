@@ -124,15 +124,26 @@ client_thread에 넘긴다.
 "한 클라이언트만 계속 메시지를 보내고 다른 클라이언트는 안 보내는" 상황처럼 recv/send 호출 빈도가
 서로 어긋날 수 있어, 두 흐름을 분리했습니다.
 
+각 스레드가 확실히 종료되었는지 확인하기 위해서,
+각 스레드의 종료 시 Logging을 수행합니다.
+
 현재 형태는 다음과 같습니다.
 
 ```cpp
 void client_recv_thread(std::shared_ptr<ClientSession> session) {
     session->RecvRun();
+
+    LineLogger::GetInstance().WriteLog("[Thread Exit] recv thread finished. SessionID = ", session->GetSessionID());
+
+    return;
 }
 
 void client_send_thread(std::shared_ptr<ClientSession> session) {
     session->SendRun();
+
+    LineLogger::GetInstance().WriteLog("[Thread Exit] send thread finished. SessionID = ", session->GetSessionID());
+
+    return;
 }
 ```
 

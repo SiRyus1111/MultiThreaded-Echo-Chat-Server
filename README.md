@@ -4,8 +4,8 @@
 > 멀티클라이언트 / 멀티스레드 Echo Server로 확장한 뒤,
 > 최종적으로 브로드캐스트 기반 Chat Server까지 발전시키는 프로젝트입니다.
 
-> 현재 단계의 목표는 완성된 Chat Server가 아니라,
-> **멀티클라이언트 Echo Server를 안정적으로 구성하기 위한 서버 기틀을 만드는 것**입니다.
+> 현재 단계의 목표는 완성된 Chat Server에,
+> 수직적이고 수평적인 기능을 추가하는 것을 목표로 합니다.
 
 > 이 프로젝트는 단순히 여러 클라이언트를 동시에 처리하는 데서 끝나지 않고,
 > 클라이언트 세션 관리, socket lifetime 관리, 객체 소유권 설계,
@@ -451,12 +451,12 @@ Client A → Server → Client B
 
 중기 목표:
 
-- Broadcast Chat Server 구현
 - message type 확장 (`JOIN`, `LEAVE`, `SERVER_NOTICE` 등)
 - 송신 실패 세션 정리 정책 구현
 
 장기 목표:
 
 - detach 기반 종료 정책 검증
-- send queue 구조 검토
 - select() 기반 멀티플렉싱 서버로 확장 가능성 검토
+- 논블로킹 소켓 적용 검토
+- Thread Pool 적용 검토

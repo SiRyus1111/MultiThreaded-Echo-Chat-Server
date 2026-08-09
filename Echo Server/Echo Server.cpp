@@ -22,6 +22,7 @@
 // OOP 싫어... RAII 싫어.. 근데 왜 재밌냐 시발
 
 using SessionID = uint64_t;
+using RoomID = uint64_t;
 using Nickname = std::string;
 
 const int SERVER_PORT = 9000;
@@ -59,14 +60,19 @@ struct RecvResult {
 };
 
 class ClientSession;
+class Room;
 
-class ClientManager : public std::enable_shared_from_this<ClientManager> {
+class Manager : public std::enable_shared_from_this<Manager> {
 private:
 	std::unordered_map<SessionID, std::shared_ptr<ClientSession>> clients;
 	std::mutex clients_mutex;
+
+	std::unordered_map<RoomID, std::shared_ptr<Room>> rooms;
+	std::mutex rooms_mutex;
+	std::atomic<RoomID> current_room_id_to_be_generated;
 public:
-	ClientManager() {};
-	~ClientManager() {};
+	Manager() : current_room_id_to_be_generated(0) {};
+	~Manager() {};
 
 	void AddClient(std::shared_ptr<ClientSession> client, SessionID id);
 
@@ -74,7 +80,7 @@ public:
 
 	void broadcast(std::shared_ptr<Packet> p, SessionID sender_id);
 
-	// ClientSession에서 ClientManager::clients를 얻을 필요가 있을 때 사용하기 위한 함수
+	// ClientSession에서 Manager::clients를 얻을 필요가 있을 때 사용하기 위한 함수
 	// SessionID가 이미 ClientSession 객체 내부에 있으므로 std::vector의 형식으로 std::shared_ptr<ClientSession> 객체만 복사함
     std::vector<std::shared_ptr<ClientSession>> GetClients() {
 
@@ -92,9 +98,41 @@ public:
 		return snapshot;
 	}
 
+	bool CreateRoom(std::shared_ptr<ClientSession> session_to_create);
+	bool DeleteRoom(RoomID room_id);
+
+	bool JoinRoom(RoomID room_id, std::shared_ptr<ClientSession> client);
+	bool LeaveRoom(std::shared_ptr<ClientSession> client);
+
 	// ClientSession 객체 복사 방지용
-	ClientManager& operator=(const ClientManager& c) = delete;
-	ClientManager(const ClientManager&) = delete;
+	Manager& operator=(const Manager& c) = delete;
+	Manager(const Manager&) = delete;
+};
+
+class Room : public std::enable_shared_from_this<Room> {
+private:
+	std::unordered_map<SessionID, std::weak_ptr<ClientSession>> members;
+	std::weak_ptr<Manager> manager_wp;
+	RoomID room_id;
+	std::atomic<bool> shutting = false; // 이거 일반 bool 변수로 바꿔놔야함. 하지만 룸 종료 권한 관련 문제가 생길 경우 CAS 연산이 필요할 수 있기에 현행유지.
+	std::mutex room_state_mutex; // 캡슐화(함부로 이 락 잡아서 발생하는 데드락 방지)
+public:
+	Room(RoomID this_room_id,
+		std::shared_ptr<Manager> manager_sp)
+		: room_id(this_room_id), manager_wp(manager_sp) {
+
+	}
+
+	std::vector<std::weak_ptr<ClientSession>> GetMembers();
+
+	bool SetInitMember(std::shared_ptr<ClientSession> session_to_create);
+
+	bool AddMember(std::shared_ptr<ClientSession> client);
+	bool RemoveMember(SessionID id);
+
+	void Shutdown();
+	bool BroadcastThisRoom(std::shared_ptr<Packet>);
+
 };
 
 class ClientSession : public std::enable_shared_from_this<ClientSession> {
@@ -102,14 +140,19 @@ private:
 	std::unique_ptr<ClientSocket> ClientSock;
 	sockaddr_in ClientAddr;
 	char ClientAddrStr[INET_ADDRSTRLEN];
-	std::weak_ptr<ClientManager> Manager_wp;
+	std::weak_ptr<Manager> Manager_wp;
 	NetState ClientState; // 단순 값 복사
 	std::atomic<bool> closing = false; // alignas(64) 가급적 필요할 듯. false sharing 고려해야함.
 	SessionID session_id;
 	Nickname nickname;
+
 	std::queue<std::shared_ptr<Packet>> send_queue;
 	std::mutex send_queue_mutex;
 	std::condition_variable send_queue_cv;
+
+	std::weak_ptr<Room> current_room; // 룸이 없는 상태 : nullptr로 처리
+	mutable std::mutex current_room_mutex; // current_room의 읽기 / 쓰기에 대한 mutex, 이 뮤텍스는 const함수(읽기 전용) 함수(GetRoom())에서도 잡으므로 mutable
+
 public:	
 	ClientSession(std::unique_ptr<ClientSocket> s, sockaddr_in addr, SessionID id) 
 		: ClientSock(std::move(s)), 
@@ -151,6 +194,19 @@ public:
 		return std::string(ClientAddrStr, strlen(ClientAddrStr));
 	}
 
+	std::shared_ptr<Room> GetRoom() const {
+		std::lock_guard<std::mutex> lock(current_room_mutex);
+		return current_room.lock();
+	}
+
+	void SetRoom(std::shared_ptr<Room> room_to_set) {
+		std::lock_guard<std::mutex> lock(current_room_mutex);
+		current_room = room_to_set;
+
+		return;
+	}
+
+
 	bool SendQueuePush(std::shared_ptr<Packet> packet) {
 		{
 			std::lock_guard<std::mutex> lock(send_queue_mutex);
@@ -186,6 +242,76 @@ public:
 		send_queue_cv.notify_all();
 	}
 
+	void HandleChatMessagePacket(std::shared_ptr<Packet> packet) {
+		if (auto manager_sp = Manager_wp.lock()) {
+			manager_sp->broadcast(packet, session_id);
+		}
+	}
+
+	void HandleHeaderErrorPacket(std::shared_ptr<Packet> packet) {
+		// 수신한 패킷의 타입이 HEADER_ERROR일 때 실행할 코드
+		LineLogger::GetInstance().WriteSessionLog(session_id, nickname, ClientAddrStr, ntohs(ClientAddr.sin_port), LineLogger::LogType::RECEIVE_ERROR_PACKET, "Received an error packet from a Client.");
+		// 여기 수정 필요함. 꼭 기억해두셈. 여기 RemoveThisClient() 함수 없음. CAS 기반 MarkClosing() 함수 추가할 때 이거 추가하셈.
+		// 수정 완료
+		TryMarkClosing();
+	}
+
+	void HandleNicknameChangePacket(std::shared_ptr<Packet> packet) {
+
+		if (ntohl(packet->header.length) > MAX_NICKNAME_LENGTH) {
+			// 닉네임 설정 실패 시 정책에 맞게 실패한 이유를 페이로드에 실어서 보냄
+			packet->header.type = htonl(static_cast<int32_t>(PacketType::NICKNAME_CHANGE_FAILED));
+			memset(&packet->header.nickname, '\0', HEADER_NICKNAME_SIZE); // 패딩 채우기
+			memcpy(&packet->header.nickname, SERVER_NICK.c_str(), SERVER_NICK.size());
+			*packet->payload_up = nick_length_exceed;
+			packet->header.length = htonl(nick_length_exceed.size());
+
+			SendQueuePush(packet);
+
+			return;
+			// break하는 코드 추가
+		}
+
+		bool nick_already_used = false;
+		std::vector<std::shared_ptr<ClientSession>> snapshot;
+
+		if (auto locked = Manager_wp.lock()) {
+			snapshot = locked->GetClients();
+		}
+
+		for (auto& client : snapshot) {
+			if (*packet->payload_up == client->nickname) { // 이거 버그났었음. 
+				nick_already_used = true;
+				return;
+			}
+		}
+
+		if (nick_already_used) {
+			// 닉네임 설정 실패 시 정책에 맞게 실패한 이유를 페이로드에 실어서 보냄
+			packet->header.type = htonl(static_cast<int32_t>(PacketType::NICKNAME_CHANGE_FAILED));
+			memset(&packet->header.nickname, '\0', HEADER_NICKNAME_SIZE); // 패딩 채우기
+			memcpy(&packet->header.nickname, SERVER_NICK.c_str(), SERVER_NICK.size());
+			*packet->payload_up = nick_already_used_msg;
+			packet->header.length = htonl(nick_already_used_msg.size());
+
+			SendQueuePush(packet);
+
+			return;
+		}
+		// 이 이후로는 유효한 닉네임인 경우에만 실행될 수 있음
+
+		nickname = *packet->payload_up;
+
+		// 닉네임 설정 성공 시 클라이언트의 지역 닉네임을 갱신하기 위해 클라이언트가 갱신할 닉네임을 페이로드에 실어서 보내고,
+		// 닉네임 설정 성공 메시지는 전적으로 클라이언트에게 책임을 맏김
+		packet->header.type = htonl(static_cast<int32_t>(PacketType::NICKNAME_CHANGE_SUCESS));
+		memset(&packet->header.nickname, '\0', HEADER_NICKNAME_SIZE); // 패딩 채우기
+		memcpy(&packet->header.nickname, SERVER_NICK.c_str(), SERVER_NICK.size());
+		// 페이로드는 변경할 닉네임. 그래서 그대로여도 됨.
+
+		SendQueuePush(packet);
+	}
+
 	void HandleRecvPacket(std::shared_ptr<Packet> packet) { // 이거 RecvResult가 아닌 Packet 기반으로 수정해야함
 		bool quit = false;
 
@@ -200,77 +326,20 @@ public:
 
 				SendQueuePush(packet);
 				*/
-				if (auto manager_sp = Manager_wp.lock()) {
-					manager_sp->broadcast(packet, session_id);
-				}
+				HandleChatMessagePacket(packet);
 
 			    break;
 		    }
 			case PacketType::HEADER_ERROR:
 			{
-				// 수신한 패킷의 타입이 HEADER_ERROR일 때 실행할 코드
-				LineLogger::GetInstance().WriteSessionLog(session_id, nickname, ClientAddrStr, ntohs(ClientAddr.sin_port), LineLogger::LogType::RECEIVE_ERROR_PACKET, "Received an error packet from a Client.");
-			    // 여기 수정 필요함. 꼭 기억해두셈. 여기 RemoveThisClient() 함수 없음. CAS 기반 MarkClosing() 함수 추가할 때 이거 추가하셈.
-				// 수정 완료
-				TryMarkClosing();
+				HandleHeaderErrorPacket(packet);
 
 				break;
 			}
 			case PacketType::NICKNAME_CHANGE:
 			{
-				if (ntohl(packet->header.length) > MAX_NICKNAME_LENGTH) {
-					// 닉네임 설정 실패 시 정책에 맞게 실패한 이유를 페이로드에 실어서 보냄
-					packet->header.type = htonl(static_cast<int32_t>(PacketType::NICKNAME_CHANGE_FAILED));
-					memset(&packet->header.nickname, '\0', HEADER_NICKNAME_SIZE); // 패딩 채우기
-					memcpy(&packet->header.nickname, SERVER_NICK.c_str(), SERVER_NICK.size());
-					*packet->payload_up = nick_length_exceed;
-					packet->header.length = htonl(nick_length_exceed.size());
-
-					SendQueuePush(packet);
-
-					break;
-					// break하는 코드 추가
-				}
-
-				bool nick_already_used = false;
-				std::vector<std::shared_ptr<ClientSession>> snapshot;
-
-				if (auto locked = Manager_wp.lock()) {
-					snapshot = locked->GetClients();
-				}
-
-				for (auto& client : snapshot) {
-					if (*packet->payload_up == client->nickname) { // 이거 버그났었음. 
-						nick_already_used = true;
-						break;
-					}
-				}
-
-				if (nick_already_used) {
-					// 닉네임 설정 실패 시 정책에 맞게 실패한 이유를 페이로드에 실어서 보냄
-					packet->header.type = htonl(static_cast<int32_t>(PacketType::NICKNAME_CHANGE_FAILED));
-					memset(&packet->header.nickname, '\0', HEADER_NICKNAME_SIZE); // 패딩 채우기
-					memcpy(&packet->header.nickname, SERVER_NICK.c_str(), SERVER_NICK.size());
-					*packet->payload_up = nick_already_used_msg;
-					packet->header.length = htonl(nick_already_used_msg.size());
-
-					SendQueuePush(packet);
-
-					break;
-				}
-				// 이 이후로는 유효한 닉네임인 경우에만 실행될 수 있음
-
-				nickname = *packet->payload_up;
-
-				// 닉네임 설정 성공 시 클라이언트의 지역 닉네임을 갱신하기 위해 클라이언트가 갱신할 닉네임을 페이로드에 실어서 보내고,
-				// 닉네임 설정 성공 메시지는 전적으로 클라이언트에게 책임을 맏김
-				packet->header.type = htonl(static_cast<int32_t>(PacketType::NICKNAME_CHANGE_SUCESS));
-				memset(&packet->header.nickname, '\0', HEADER_NICKNAME_SIZE); // 패딩 채우기
-				memcpy(&packet->header.nickname, SERVER_NICK.c_str(), SERVER_NICK.size());
-				// 페이로드는 변경할 닉네임. 그래서 그대로여도 됨.
-
-				SendQueuePush(packet);
-
+				
+				HandleNicknameChangePacket(packet);
 
 				break;
 			}
@@ -322,8 +391,8 @@ public:
 		return;
 	}
 
-	// share_from_this()로 받기 / ClientManager 객체에서 사용하는 함수
-	void AddToManager(std::shared_ptr<ClientManager> Manager_sp) {
+	// share_from_this()로 받기 / Manager 객체에서 사용하는 함수
+	void AddToManager(std::shared_ptr<Manager> Manager_sp) {
 		Manager_wp = Manager_sp;
 		return;
 	}
@@ -351,6 +420,12 @@ public:
 
 		// 이 이후를 실행할 수 있는 스레드는 종료 책임을 가진다.
 
+		if (!current_room.expired()) { // 어떤 룸에 소속되어있는 경우에 대한 처리
+			if (auto manager_sp = Manager_wp.lock()) {
+				manager_sp->LeaveRoom(shared_from_this()); // LeaveRoom() 함수 도중에 룸이 폭파되어서 false가 반환된 경우도 상관 없음(애초에 이 코드는 룸이 폭파된 경우(current_room == nullptr) 실행되지 않아도 됨)
+			}
+		}
+
 		ClientSock->ClientSockShutdown(); // 만약 SOCKET_ERROR를 반환해도 상관없음. 그러면 Recv / Send도 안되는거 아님?
 		RemoveThisClient();
 
@@ -362,7 +437,7 @@ public:
 			locked->RemoveClient(session_id);
 		}
 		else {
-			std::cout << "ClientManager 객체 이미 소멸됨. RemoveClient()가 실행되지 않습니다.\n";
+			std::cout << "Manager 객체 이미 소멸됨. RemoveClient()가 실행되지 않습니다.\n";
 		}
 	}
 
@@ -372,7 +447,197 @@ public:
 
 };
 
-void ClientManager::AddClient(std::shared_ptr<ClientSession> client, SessionID id) {
+// 룸을 생성하는 함수
+bool Manager::CreateRoom(std::shared_ptr<ClientSession> session_to_create) {
+	if (!session_to_create) return false; // 먼저 유효한 세션인지 확인
+
+	uint64_t this_room_id = current_room_id_to_be_generated.fetch_add(1); // current_room_id_to_be_generated를 원자적으로 1 증가시키며 해당 룸 아이디 생성(fetch_add가 여러 스레드일 경우 문제생길 수 있어서 추후 수정 예정)
+
+	auto new_room = std::make_shared<Room>(this_room_id, shared_from_this()); // Room 객체 생성
+
+	if (!new_room->SetInitMember(session_to_create)) { // 해당 룸을 생성한 세션이 자동으로 해당 룸에 들어가도록 설정, 만약 실패할 경우 생성된 룸을 rooms에 넣지 않음, 그렇게 된다면 해당 Room 객체는 함수 종료 시 자동으로 소멸됨
+		return false;
+	}
+
+	std::lock_guard<std::mutex> lock(rooms_mutex);
+
+	rooms[this_room_id] = std::move(new_room); // 생성된 룸을 rooms에 넣음
+
+	return true;
+}
+
+bool Manager::DeleteRoom(RoomID room_id) {
+	std::shared_ptr<Room> target;
+	{
+		std::lock_guard<std::mutex> lock(rooms_mutex);
+
+		auto it = rooms.find(room_id); // 이미 다른 스레드가 삭제한 경우를 대비해서 [] 기반 접근이 아닌 find()로 해결함
+		if (it == rooms.end()) return false;
+
+		target = it->second;
+
+		rooms.erase(it);
+	}
+	target->Shutdown(); // 누가 Room을 변경(AddMember() 등)하고 있을 경우 해당 함수가 가지고있는 room_state_mutex를 못잡아서 blocking됨. 즉, target이 소멸되지 않음.
+
+	return true;
+}
+
+bool Manager::JoinRoom(RoomID room_id, std::shared_ptr<ClientSession> client) {
+
+	// 이미 다른 룸에 소속되어있는 경우는 AddMember() 함수가 검사함.
+
+	if (client == nullptr) {
+		false;
+	}
+
+	// AddMember() 호출 및 추가 코드 + 락(rooms_mutex) 잡음
+	std::shared_ptr<Room> target;
+	{
+		std::lock_guard<std::mutex> lock(rooms_mutex);
+
+		auto it = rooms.find(room_id);
+		if (it == rooms.end()) return false;
+
+		target = it->second;
+	}
+
+	return target->AddMember(client);
+}
+
+// JoinRoom()과 추상화 수준을 맞추기 위해서 rooms 목록을 사용할 필요가 없지만 Manager를 통해서 LeaveRoom()을 수행한다.
+bool Manager::LeaveRoom(std::shared_ptr<ClientSession> client) {
+	// RemoveMember() 호출 및 추가 코드 + 락 잡음
+	if (client == nullptr) { // 혹시 모를 예외처리
+		return false;
+	}
+
+	// Manager::rooms를 건들지 않으니 rooms_mutex를 잡을 이유 없음
+
+	auto room_to_leave = client->GetRoom();
+	if (room_to_leave == nullptr) { // 만약 이미 룸이 터진 경우(LeaveRoom() 함수 호출과 GetRoom() 함수 호출 사이에 룸이 터지면 이게 가능함)
+		return false; // 어차피 룸이 터지면 ClientSession::current_room도 무효화되니까 이것만 해도 상관없음.
+	}
+
+	return room_to_leave->RemoveMember(client->GetSessionID());
+}
+
+// 소멸자에서 Room 소멸 Logging
+
+// 룸 초기화 전용 함수
+// 호출 시 해당 객체에 대한 shared_ptr로 호출함
+bool Room::SetInitMember(std::shared_ptr<ClientSession> session_to_create) {
+	if (!session_to_create) return false;
+
+	SessionID id = session_to_create->GetSessionID();
+
+	std::lock_guard<std::mutex> lock(room_state_mutex);
+
+	if (shutting.load()) return false;
+
+	// 불변식 3, 4 만족(members에 추가 / current_room 참조가 둘 다 성공하거나 둘 다 실패함.) - 근데 이거 도중에 해당 룸이 날아가면 어떻게되냐? - 문제 없음. 5-1 참조
+	session_to_create->SetRoom(shared_from_this()); // 이미 shared_ptr로 생성된 객체이므로 문제 없음!
+	members[id] = session_to_create;
+	return true;
+}
+
+// 초기화 후 다른 클라이언트가 해당 룸에 들어올 때 전용 함수
+// 호출 시 해당 객체에 대한 shared_ptr로 호출함
+// 호출 주체 : Manager
+bool Room::AddMember(std::shared_ptr<ClientSession> client) {
+	if ((client == nullptr) || (client->GetRoom().get() != this)) { // client가 유효하지 않거나 이미 다른 룸에 소속되어있는 경우
+		return false;
+	}
+
+	SessionID id = client->GetSessionID();
+
+	std::lock_guard<std::mutex> lock(room_state_mutex); // shutting을 변경하려면 해당 락을 잡아야됨. 그래서.. (5-3 참조)
+
+	if (shutting.load()) return false;
+
+	// 여기도 불변식 3, 4 만족 - 같은 문제 공유
+	client->SetRoom(shared_from_this());
+	members[id] = client;
+	return true;
+}
+
+// session_id를 받아 해당 session id의 클라이언트를 룸에서 제거하는 함수
+// 호출 시 해당 객체에 대한 shared_ptr로 호출함
+// 호출 주체 : Manager
+bool Room::RemoveMember(SessionID id) {
+	std::lock_guard<std::mutex> lock(room_state_mutex);
+
+	if (shutting.load()) return false;
+
+	auto it = members.find(id);
+	if (it == members.end()) return false;
+
+	if (auto client_sp = it->second.lock()) {
+		if (client_sp->GetRoom().get() == this) { // 아직도 나를 가리킬 때만 ClientSession::current_room을 nullptr로
+			client_sp->SetRoom(nullptr);
+		}
+	}
+	// 해당 client 객체가 사라졌어도 별다른 처리를 하지 않는다.
+
+	members.erase(it); // 이미 해당 객체가 사라졌어도 weak_ptr 지우기
+
+	return true;
+}
+
+std::vector<std::weak_ptr<ClientSession>> Room::GetMembers() {
+	std::vector<std::weak_ptr<ClientSession>> snapshot;
+
+	{
+		std::lock_guard<std::mutex> lock(room_state_mutex);
+
+		// 락 잡은 상태에서 shutting 플래그를 확인해서 Shutdown() 함수가 호출됐을 때 shutting == true를 놓칠 가능성 없앰
+		// 다른 shutting 플래그 확인하는 부분에서도 이 논리로 락을 잡은 상태로 shutting 플래그를 확인함
+		if (shutting.load()) { // 만약 룸이 논리적 폐쇄됐다면 빈 스냅샷 반환
+			return snapshot;
+		}
+
+		snapshot.reserve(members.size()); // 미리 members의 크기 이상만큼 메모리를 할당받아서 추가적인 메모리 할당 최적화
+
+		for (const auto& [id, session_ptr] : members) {
+			snapshot.push_back(session_ptr);
+		}
+	}
+
+	return snapshot;
+}
+
+// 해당 함수가 락을 잡아야 shutting이 true가 됨
+void Room::Shutdown() {
+
+	bool expected = false;
+
+	std::lock_guard<std::mutex> lock(room_state_mutex);
+
+
+	if (!shutting.compare_exchange_strong(expected, true)) { // 이미 다른 스레드가 shutting == true로 바꿨다면 해당 스레드는 shutdown 절차를 진행하지 않음
+		return;
+	}
+
+	// CAS 연산으로, shutdown 절차를 진행할 책임을 처음으로 shutting = true로 바꾼 스레드에게 넘김.
+
+	for (auto& [id, client_wp] : members) {
+		if (auto client_sp = client_wp.lock()) {
+			client_sp->SetRoom(nullptr);
+		}
+	}
+
+	members.clear();
+}
+
+bool Room::BroadcastThisRoom(std::shared_ptr<Packet>) {
+	std::vector broadcast_members = GetMembers();
+
+	// 여기 미완
+
+	return true;
+}
+
+void Manager::AddClient(std::shared_ptr<ClientSession> client, SessionID id) {
 
 	// ClientSession 객체에 shared_ptr을 넘겨줘서 ClientSession 객체의 weak_ptr을 초기화.
 	client->AddToManager(shared_from_this());
@@ -383,13 +648,13 @@ void ClientManager::AddClient(std::shared_ptr<ClientSession> client, SessionID i
 	return;
 };
 
-void ClientManager::RemoveClient(const SessionID id) {
+void Manager::RemoveClient(const SessionID id) {
 	// 여기에 clients에서 해당 SessionID의 ClientSession만 지우는 로직의 코드
 	std::lock_guard<std::mutex> lock(clients_mutex);
 	clients.erase(id);
 }
 
-void ClientManager::broadcast(std::shared_ptr<Packet> p, const SessionID sender_id) {
+void Manager::broadcast(std::shared_ptr<Packet> p, const SessionID sender_id) {
 	auto snapshot = GetClients();
 
 	for (auto& client_info : snapshot) {
@@ -679,7 +944,7 @@ int main() {
 	try {
 		WinsockGuard winsock;
 
-		auto manager = std::make_shared<ClientManager>();
+		auto manager = std::make_shared<Manager>();
 		SessionID next_session_id = INITIAL_SESSION_ID;
 
 		ListenSocket server_sock;

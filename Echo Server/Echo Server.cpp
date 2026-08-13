@@ -120,7 +120,11 @@ public:
 	Room(RoomID this_room_id,
 		std::shared_ptr<Manager> manager_sp)
 		: room_id(this_room_id), manager_wp(manager_sp) {
+		LineLogger::GetInstance().WriteLog("[Room Created] A new room has been created. Room ID : ", room_id);
+	}
 
+	~Room() {
+		LineLogger::GetInstance().WriteLog("[Room Deleted] The room has been closed. Room ID : ", room_id);
 	}
 
 	std::vector<std::weak_ptr<ClientSession>> GetMembers();
@@ -131,7 +135,7 @@ public:
 	bool RemoveMember(SessionID id);
 
 	void Shutdown();
-	bool BroadcastThisRoom(std::shared_ptr<Packet>);
+	bool BroadcastThisRoom(std::shared_ptr<Packet>, const SessionID sender_id);
 
 };
 
@@ -313,7 +317,6 @@ public:
 	}
 
 	void HandleRecvPacket(std::shared_ptr<Packet> packet) { // 이거 RecvResult가 아닌 Packet 기반으로 수정해야함
-		bool quit = false;
 
 		switch (static_cast<PacketType>(ntohl(packet->header.type))) {
 	    	case PacketType::CHAT_MESSAGE: // 여기는 SendPacket() 함수 그대로 쓰는걸로 일단..
@@ -419,14 +422,23 @@ public:
 			
 
 		// 이 이후를 실행할 수 있는 스레드는 종료 책임을 가진다.
+		std::weak_ptr<Room> current_room_for_termination;
+		{
+			std::lock_guard<std::mutex> lock(current_room_mutex);
 
-		if (!current_room.expired()) { // 어떤 룸에 소속되어있는 경우에 대한 처리
+			current_room_for_termination = current_room;
+		}
+		// current_room 복사만 하고 락을 풀고나옴(lock ordering 지켜야함)
+		// 하지만, 종료 예정인 ClientSession의 current_room에 대한 원자성은 지켜야함.
+
+		// current_room_mutex를 들지 않고 복사한 weak_ptr로 종료 절차 수행
+		if (!current_room_for_termination.expired()) {
 			if (auto manager_sp = Manager_wp.lock()) {
-				manager_sp->LeaveRoom(shared_from_this()); // LeaveRoom() 함수 도중에 룸이 폭파되어서 false가 반환된 경우도 상관 없음(애초에 이 코드는 룸이 폭파된 경우(current_room == nullptr) 실행되지 않아도 됨)
+				manager_sp->LeaveRoom(shared_from_this()); // 어차피 이 작업은 room_state_mutex를 잡아야 실행되기 때문에 사전에 해당 함수(LeaveRoom())가 호출되었을 경우에도 문제 없음.
 			}
 		}
 
-		ClientSock->ClientSockShutdown(); // 만약 SOCKET_ERROR를 반환해도 상관없음. 그러면 Recv / Send도 안되는거 아님?
+		ClientSock->ClientSockShutdown(); // 만약 SOCKET_ERROR를 반환해도 상관없음. 그러면 Recv / Send도 안되는거 아님? 그러니까 ㅇㅋ지.
 		RemoveThisClient();
 
 		return true;
@@ -448,6 +460,7 @@ public:
 };
 
 // 룸을 생성하는 함수
+// 성공 / 실패 여부를 true / false로 반환함
 bool Manager::CreateRoom(std::shared_ptr<ClientSession> session_to_create) {
 	if (!session_to_create) return false; // 먼저 유효한 세션인지 확인
 
@@ -457,15 +470,20 @@ bool Manager::CreateRoom(std::shared_ptr<ClientSession> session_to_create) {
 
 	if (!new_room->SetInitMember(session_to_create)) { // 해당 룸을 생성한 세션이 자동으로 해당 룸에 들어가도록 설정, 만약 실패할 경우 생성된 룸을 rooms에 넣지 않음, 그렇게 된다면 해당 Room 객체는 함수 종료 시 자동으로 소멸됨
 		return false;
+		// 실패 시 new_room 자동 소멸 + SetInitMember() 함수에서 room_state_mutex까지 잡은 상태에서 shutting을 확인하므로 문제 없음.
 	}
 
-	std::lock_guard<std::mutex> lock(rooms_mutex);
-
-	rooms[this_room_id] = std::move(new_room); // 생성된 룸을 rooms에 넣음
+	// 이 시점의 코드가 실행될 수 있는건 SetInitMember() 함수가 성공한 경우 뿐
+	{
+		std::lock_guard<std::mutex> lock(rooms_mutex);
+		rooms[this_room_id] = std::move(new_room); // 생성된 룸을 rooms에 넣음(shared_ptr로 함수 종료 후에도 수명 보장됨)
+	}
 
 	return true;
 }
 
+// 룸을 삭제하는 함수
+// 성공 / 실패 여부를 true / false로 반환함
 bool Manager::DeleteRoom(RoomID room_id) {
 	std::shared_ptr<Room> target;
 	{
@@ -483,6 +501,8 @@ bool Manager::DeleteRoom(RoomID room_id) {
 	return true;
 }
 
+// 특정 룸 ID와 클라이언트 세션을 입력받아 해당 룸에 입장하는 함수
+// 성공 / 실패 여부를 true / false로 반환함
 bool Manager::JoinRoom(RoomID room_id, std::shared_ptr<ClientSession> client) {
 
 	// 이미 다른 룸에 소속되어있는 경우는 AddMember() 함수가 검사함.
@@ -505,9 +525,13 @@ bool Manager::JoinRoom(RoomID room_id, std::shared_ptr<ClientSession> client) {
 	return target->AddMember(client);
 }
 
+// 클라이언트 세션을 입력받아 해당 클라이언트 세션이 소속되어있는 룸에서 해당 클라이언트 세션을 뺴는 함수
 // JoinRoom()과 추상화 수준을 맞추기 위해서 rooms 목록을 사용할 필요가 없지만 Manager를 통해서 LeaveRoom()을 수행한다.
+// 성공 / 실패 여부를 true / false로 반환함
 bool Manager::LeaveRoom(std::shared_ptr<ClientSession> client) {
 	// RemoveMember() 호출 및 추가 코드 + 락 잡음
+
+	// 특정 룸에 소속되어있어야 이 함수를 호출할 수 있어서 룸 소속 예외처리는 할 필요 없음.
 	if (client == nullptr) { // 혹시 모를 예외처리
 		return false;
 	}
@@ -522,10 +546,10 @@ bool Manager::LeaveRoom(std::shared_ptr<ClientSession> client) {
 	return room_to_leave->RemoveMember(client->GetSessionID());
 }
 
-// 소멸자에서 Room 소멸 Logging
-
 // 룸 초기화 전용 함수
 // 호출 시 해당 객체에 대한 shared_ptr로 호출함
+// 호출 주체 : Manager
+// 초기 멤버 추가 성공 / 실패에 따라 true / false를 반환한다.
 bool Room::SetInitMember(std::shared_ptr<ClientSession> session_to_create) {
 	if (!session_to_create) return false;
 
@@ -544,8 +568,9 @@ bool Room::SetInitMember(std::shared_ptr<ClientSession> session_to_create) {
 // 초기화 후 다른 클라이언트가 해당 룸에 들어올 때 전용 함수
 // 호출 시 해당 객체에 대한 shared_ptr로 호출함
 // 호출 주체 : Manager
+// 멤버 추가 성공 / 실패에 따라 true / false를 반환한다.
 bool Room::AddMember(std::shared_ptr<ClientSession> client) {
-	if ((client == nullptr) || (client->GetRoom().get() != this)) { // client가 유효하지 않거나 이미 다른 룸에 소속되어있는 경우
+	if ((client == nullptr) || (client->GetRoom() != nullptr)) { // client가 유효하지 않거나 이미 다른 룸에 소속되어있는 경우
 		return false;
 	}
 
@@ -564,6 +589,7 @@ bool Room::AddMember(std::shared_ptr<ClientSession> client) {
 // session_id를 받아 해당 session id의 클라이언트를 룸에서 제거하는 함수
 // 호출 시 해당 객체에 대한 shared_ptr로 호출함
 // 호출 주체 : Manager
+// 멤버 제거 성공 / 실패에 따라 true / false를 반환한다.
 bool Room::RemoveMember(SessionID id) {
 	std::lock_guard<std::mutex> lock(room_state_mutex);
 
@@ -607,6 +633,7 @@ std::vector<std::weak_ptr<ClientSession>> Room::GetMembers() {
 }
 
 // 해당 함수가 락을 잡아야 shutting이 true가 됨
+// 호출 주체 : Manager
 void Room::Shutdown() {
 
 	bool expected = false;
@@ -614,7 +641,7 @@ void Room::Shutdown() {
 	std::lock_guard<std::mutex> lock(room_state_mutex);
 
 
-	if (!shutting.compare_exchange_strong(expected, true)) { // 이미 다른 스레드가 shutting == true로 바꿨다면 해당 스레드는 shutdown 절차를 진행하지 않음
+	if (!shutting.compare_exchange_strong(expected, true)) { // 이미 다른 스레드가 shutting == true로 바꿨다면 해당 스레드는 shutdown 절차를 진행하지 않음. (현재는 내가 이걸 아는게 CAS뿐이라 이걸로 구현해놓음.)
 		return;
 	}
 
@@ -629,10 +656,23 @@ void Room::Shutdown() {
 	members.clear();
 }
 
-bool Room::BroadcastThisRoom(std::shared_ptr<Packet>) {
-	std::vector broadcast_members = GetMembers();
+bool Room::BroadcastThisRoom(std::shared_ptr<Packet> packet, const SessionID sender_id) {
 
-	// 여기 미완
+	// 스냅샷을 따서 브로드캐스트 중 세션이 입 / 퇴장하는 문제 해결
+	std::vector members_snapshot = GetMembers();
+
+	// shutting == true가 되어도 브로드캐스트는 끝까지 수행해야하기 때문에 shutting 체크를 하지 않음
+
+	for (auto& client_wp : members_snapshot) { // 스냅샷이기 때문에 도중에 원본 members가 소멸해도 문제 없음
+
+		// 중간에 shutting == true가 되더라도 메시지 전송(Send Queue에 Push)은 다 끝냄.
+		if (auto client_sp = client_wp.lock()) { // weak_ptr를 기반으로 접근해서 도중에 세션이 사라지더라도 댕글링 포인터 문제가 발생하지 않음
+			if (client_sp->GetSessionID() == sender_id) {
+				continue;
+			}
+			client_sp->SendQueuePush(packet);
+		}
+	}
 
 	return true;
 }

@@ -131,7 +131,11 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClCompile Include="ClientSession.cpp" />
     <ClCompile Include="Echo Server.cpp" />
+    <ClCompile Include="Manager.cpp" />
+    <ClCompile Include="Room.cpp" />
+    <ClCompile Include="RoomTask.cpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

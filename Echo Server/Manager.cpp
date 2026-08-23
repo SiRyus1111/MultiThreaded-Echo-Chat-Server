@@ -3,6 +3,10 @@
 #include "Room.h"
 #include "RoomTask.h"
 
+void room_thread(std::shared_ptr<Room> room) {
+	room->RoomRun();
+}
+
 void Manager::RemoveRoomToManager(RoomID room_id) {
 	{
 		std::lock_guard<std::mutex> lock(rooms_mutex);
@@ -19,7 +23,10 @@ bool Manager::LeaveRoom(std::shared_ptr<ClientSession> client) {
 
 	if (!room->RoomTasksPush(task)) return false; // 이미 is_tasks_shutting이면 여기서 false
 
-	future.wait(); // RemoveMember()가 실제로 끝날 때까지 호출 스레드가 대기(RemoveMember() 실행 확인)
+	if (!future.get()) { // RemoveMember()가 실제로 끝날 때까지 호출 스레드가 대기(RemoveMember() 실행 확인)(성공 / 실패 여부까지 받아서 불변식 깨지 않나 확인)
+	    return false;
+	}
+	
 	return true;
 }
 
@@ -37,13 +44,51 @@ bool Manager::JoinRoom(RoomID room_id, std::shared_ptr<ClientSession> client) {
 	}
 
 	auto task = std::make_shared<JoinRoomTask>(client);
+	auto future = task->GetFuture();
 
 	if (!room->RoomTasksPush(task)) {
 		return false;
 	}
 
+	if (!future.get()) {
+        return false;
+    }
+
 	return true;
 
+}
+
+bool Manager::CreateRoom(std::shared_ptr<ClientSession> client_to_create) {
+    if (client_to_create == nullptr) {
+        return false;
+    }
+
+    RoomID this_room_id = current_room_id_to_be_generated.fetch_add(1);
+    std::shared_ptr<Room> this_room = std::make_shared<Room>(this_room_id, shared_from_this());
+
+    std::thread assigned_thread(room_thread, this_room);
+
+    auto task = std::make_shared<JoinRoomTask>(client_to_create);
+    auto future = task->GetFuture();
+
+    this_room->RoomTasksPush(task);
+
+    if (!future.get()) {
+        return false;
+    }
+
+    // 앞 구간에서 예외가 터지면 정상적인 룸이 아닐 것이기 떄문에 룸이 그대로 증발하도록 룸 목록에 추가를 마지막에 함
+    {
+        std::lock_guard<std::mutex> rooms_lock(rooms_mutex);
+        rooms[this_room_id] = this_room;
+    }
+
+    {
+        std::lock_guard<std::mutex> rooms_threads_lock(rooms_threads_mutex);
+        rooms_threads[this_room_id] = std::move(assigned_thread);
+    }
+
+    return true;
 }
 
 bool Manager::DeleteRoom(RoomID room_id) {
@@ -67,18 +112,23 @@ bool Manager::DeleteRoom(RoomID room_id) {
 
 	// 어차피 join()이 기다리는 함수니 Shutdown()이 종료될 때까지 기다릴 필요는 없음.
 	// Room::shutdown()이 실행됐다면 shutting == true일 것이므로 해당 스레드는 종료됨
-	{
-		std::lock_guard<std::mutex> lock(rooms_threads_mutex);
+    std::thread this_room_thread;
+    {
+        std::lock_guard<std::mutex> lock(rooms_threads_mutex);
 
-		auto it = rooms_threads.find(room_id);
-		if (it != rooms_threads.end()) {
-			std::thread this_room_thread = std::move(it->second);
+        auto it = rooms_threads.find(room_id);
+        if (it == rooms_threads.end()) {
+            return false;
+        }
+		
+		this_room_thread = std::move(it->second);
+		rooms_threads.erase(room_id);
+    }
 
-			if (this_room_thread.joinable()) {
-				this_room_thread.join();
-			}
-		}
-	}
+    // 오래 걸릴지도 모르는 무거운 join()은 lock을 잡지 않고 실행
+    if (this_room_thread.joinable()) {
+        this_room_thread.join();
+    }
 
 
 	return true;

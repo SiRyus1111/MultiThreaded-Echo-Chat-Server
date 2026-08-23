@@ -41,11 +41,11 @@ bool Room::AddMember(std::shared_ptr<ClientSession> client) {
 	// 룸을 수정하는 주체가 스레드 하나이기에 룸에 상태에 대한 락은 필요 없음,
 	// 하지만 클라이언트의 current_room을 수정하는 스레드는 여러개일 수 있기 때문에 current_room_mutex의 unique_lock을 얻음
 	std::unique_lock<std::mutex> client_lock = client->GetCurrentRoomLock();
-	client_lock.lock(); // 여기서 한 번 current_room_mutex를 잡음
+	client_lock.lock();
 
 	// members가 변하면 -> current_room도 변하도록 미리 current_room_mutex를 잡아둠
 	// 중간에 다른 스레드가 current_room을 변경할 수 없어 room.members contains client <-> client.current_room == room이 성립함
-	client->SetRoom(shared_from_this()); // 여기서 한 번 더 current_room_mutex를 잡음(그래서 recursive_mutex 쓰는거)
+    client->SetRoomUnlocked(shared_from_this());
 	members[client->GetSessionID()] = client;
 
 	return true;
@@ -100,8 +100,21 @@ void Room::RoomBroadcast(std::shared_ptr<Packet> packet, SessionID sender_id) {
 void Room::Shutdown() {
 	shutting = true;
 
+	// 룸 삭제 패킷 세팅
+    std::shared_ptr<Packet> packet;
+    packet->header.type = static_cast<int32_t>(PacketType::ROOM_DELETED);
+    packet->header.length = 0;
+
+	memset(packet->header.nickname, '\0', HEADER_NICKNAME_SIZE);
+    memcpy(packet->header.nickname, SERVER_NICK.c_str(), SERVER_NICK.size());
+    
+    // 페이로드 세팅은 하지 않음(빈 페이로드로 보냄)
+    packet->payload_up->clear();
+
+
 	for (auto [id, client_wp] : members) {
 		if (auto client_sp = client_wp.lock()) {
+			client_sp->SendQueuePush(packet);
 			client_sp->SetRoom(nullptr);
 		}
 	}

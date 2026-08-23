@@ -199,7 +199,7 @@ NetState ClientSession::SendPacket(std::shared_ptr<Packet> packet) {
 	send_host_header.type = ntohl(packet->header.type);
 
 	// 메시지 길이 검사
-	if (send_host_header.length > PAYLOAD_SIZE || send_host_header.length == 0) {
+	if (send_host_header.length > PAYLOAD_SIZE) {
 		ClientState.protocol_error = true;
 		send_packet_state.protocol_error = true;
 		return send_packet_state;
@@ -242,6 +242,11 @@ NetState ClientSession::SendPacket(std::shared_ptr<Packet> packet) {
 	}
 	ClientState.header_send = false;
 	send_packet_state.header_send = false;
+
+	if (send_host_header.length == 0) { // 페이로드 송신 전 빈 페이로드 검사(예외 아님)
+		// 굳이 페이로드를 전송 할 필요 없음(페이로드가 0바이트)
+		return send_packet_state;
+	}
 
 	// 페이로드 송신
 	ClientState.payload_send = true;
@@ -299,7 +304,7 @@ RecvResult ClientSession::RecvPacket() {
 	nick_buf[MAX_NICKNAME_LENGTH] = '\0'; // 32바이트짜리 닉네임일 경우에도 문자열로 읽을 수 있게 맨 끝에 널문자 붙임. 32바이트보다 닉네임을 표현하는 바이트 수가 적더라도 이미 그 빈 바이트들은 '\0'으로 처리되어있어서 문제 없음
 	*/
 
-	if (recv_host_header.length > PAYLOAD_SIZE || recv_host_header.length == 0) { // length == 0이어도 protocol error로 처리
+	if (recv_host_header.length > PAYLOAD_SIZE) {
 		ClientState.protocol_error = true;
 		recv_packet_state.protocol_error = true;
 		result.state = recv_packet_state;
@@ -317,6 +322,12 @@ RecvResult ClientSession::RecvPacket() {
 		recv_packet_state.protocol_error = true;
 		result.state = recv_packet_state;
 
+		return result;
+	}
+
+	// 유효성 검사 후에 페이로드 0 검사를 해야 유효하지 않은 패킷을 수신하는 문제 예방 가능
+	if (recv_host_header.length == 0) {
+		result.packet->payload_up->clear(); // 받을 페이로드가 없으므로 빈 문자열로 세팅
 		return result;
 	}
 

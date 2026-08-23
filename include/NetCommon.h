@@ -17,16 +17,43 @@ enum class PacketType : int32_t {
 */
 
 enum class PacketType : int32_t {
-    CHAT_MESSAGE = 1,
-    NICKNAME_CHANGE = 2,
-    HEADER_ERROR = 3,
-    NICKNAME_CHANGE_FAILED = 4,
-    NICKNAME_CHANGE_SUCESS = 5
+    // 기본 패킷 타입
+    
+    // 서버가 수신 / 클라이언트가 송신
+    CHAT_MESSAGE = 1, // 전역 브로드캐스트
+    NICKNAME_CHANGE = 2, // 닉네임 변경
+
+    // 클라이언트가 수신 / 서버가 송신
+    HEADER_ERROR = 3, // 헤더 에러
+    NICKNAME_CHANGE_FAILED = 4, // 닉네임 변경 실패
+    NICKNAME_CHANGE_SUCESS = 5, // 닉네임 변경 성공
+    
+    // 룸 관련 패킷 타입
+
+    // 서버가 수신 / 클라이언트가 송신
+    JOIN_ROOM = 101, // 룸 입장
+    LEAVE_ROOM = 102, // 룸 퇴장
+    ROOM_MESSAGE = 103, // 룸 브로드캐스트 / 이건 성공일 때만 전달되기 때문에 실패 패킷 타입을 만들 필요가 없음.
+    CREATE_ROOM = 104, // 룸 생성
+    DELETE_ROOM = 105, // 룸 삭제
+
+    // 클라이언트가 수신 / 서버가 송신
+    // 이 패킷 타입들은 내가 다 생각이 있던거야.
+    // 룸에 대한건 성공 / 실패가 나뉠 수 있으니 이렇게 해놓은거.
+    JOIN_ROOM_SUCCESS = 201, // 룸 입장 성공
+    LEAVE_ROOM_SUCCESS = 202, // 룸 퇴장 성공
+    CREATE_ROOM_SUCCESS = 203, // 룸 생성 성공
+    DELETE_ROOM_SUCCESS = 204, // 룸 삭제 성공
+    JOIN_ROOM_FAILED = 205, // 룸 입장 실패
+    LEAVE_ROOM_FAILED = 206, // 룸 퇴장 실패
+    CREATE_ROOM_FAILED = 207, // 룸 생성 실패
+    DELETE_ROOM_FAILED = 208, // 룸 삭제 실패
+    ROOM_DELETED = 209 // 룸 삭제됨
 };
 
 #pragma pack(push, 1)
 struct PacketHeader {
-    int32_t type;
+    int32_t type; // 의미(PacketType)가 아닌 값(int32_t)으로 가짐
     uint32_t length;
     char nickname[32];
 };

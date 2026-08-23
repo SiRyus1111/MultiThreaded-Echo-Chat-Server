@@ -2,12 +2,11 @@
 #include "Room.h"
 
 void JoinRoomTask::Execute(Room& room) {
-	room.AddMember(client);
+	res.set_value(room.AddMember(client));
 }
 
 void LeaveRoomTask::Execute(Room& room) {
-	room.RemoveMember(session_id);
-	done.set_value(); // 해당 작업이 실제로 처리되었다는 신호
+	res.set_value(room.RemoveMember(session_id)); // 해당 작업이 실제로 처리되었다는 신호
 }
 
 void BroadcastRoomTask::Execute(Room& room) {

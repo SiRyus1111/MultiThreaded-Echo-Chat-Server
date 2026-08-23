@@ -16,9 +16,13 @@ public:
 class JoinRoomTask : public RoomTask {
 private:
 	std::shared_ptr<ClientSession> client;
+    std::promise<bool> res;
 public:
 	JoinRoomTask(std::shared_ptr<ClientSession> _client) : client(_client) {
 
+	}
+	std::future<bool> GetFuture() {
+		return res.get_future();
 	}
 	void Execute(Room& room) override;
 };
@@ -26,13 +30,13 @@ public:
 class LeaveRoomTask : public RoomTask {
 private:
 	SessionID session_id;
-	std::promise<void> done;
+	std::promise<bool> res;
 public:
 	LeaveRoomTask(SessionID _session_id) : session_id(_session_id) {
 
 	}
-	std::future<void> GetFuture() { // 작업이 끝났음을 나타내는 future를 get하는 getter 함수
-		return done.get_future();
+	std::future<bool> GetFuture() { // 작업이 끝났음을 나타내는 future를 get하는 getter 함수
+		return res.get_future();
 	}
 	void Execute(Room& room) override;
 };

@@ -38,10 +38,6 @@ void client_send_thread(std::shared_ptr<ClientSession> session) {
 	return;
 }
 
-void room_thread(std::shared_ptr<Room> room) {
-	room->RoomRun();
-}
-
 int main() {
 	try {
 		WinsockGuard winsock;

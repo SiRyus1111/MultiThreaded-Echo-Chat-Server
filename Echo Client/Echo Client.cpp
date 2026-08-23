@@ -7,6 +7,8 @@
 #include "SocketRAII.h"
 #include "LineLogger.h"
 #include <atomic>
+#include <memory>
+#include <thread>
 
 const char* SERVER_ADDR = "127.0.0.1";
 const int SERVER_PORT = 9000;
@@ -380,7 +382,7 @@ NetState ClientApp::SendPacket(const char* msg, uint32_t len, PacketType type, N
 
     PacketHeader send_host_header{};
 
-    if (len > PAYLOAD_SIZE || len == 0) {
+    if (len > PAYLOAD_SIZE) {
         send_state.protocol_error = true;
         state_.protocol_error = true;
     }
@@ -431,6 +433,11 @@ NetState ClientApp::SendPacket(const char* msg, uint32_t len, PacketType type, N
     state_.header_send = false;
     send_state.header_send = false;
 
+	if (send_host_header.length == 0) { // 페이로드 송신 전 빈 페이로드 검사(예외 아님)
+		// 굳이 페이로드를 전송 할 필요 없음(페이로드가 0바이트)
+		return send_state;
+	}
+
     // 페이로드 send()
     state_.payload_send = true;
     send_state.payload_send = true;
@@ -460,6 +467,7 @@ RecvResult ClientApp::RecvPacket() {
 
     // 헤더 recv()
     state_.header_recv = true;
+    recv_state.header_recv = true;
     int header_recv_res = sock_.ConnectSockRecv(state_, (char*)&recv_net_header, HEADER_SIZE);
 
     if (header_recv_res == SOCKET_ERROR) {
@@ -476,6 +484,7 @@ RecvResult ClientApp::RecvPacket() {
         return result;
     }
 
+    recv_state.header_recv = false;
     state_.header_recv = false;
 
     // 헤더 해석
@@ -489,7 +498,7 @@ RecvResult ClientApp::RecvPacket() {
     memcpy(nick_buf, recv_net_header.nickname, HEADER_NICKNAME_SIZE);
     nick_buf[MAX_NICKNAME_LENGTH] = '\0'; // 32바이트짜리 닉네임일 경우에도 문자열로 읽을 수 있게 맨 끝에 널문자 붙임. 32바이트보다 닉네임을 표현하는 바이트 수가 적더라도 이미 그 빈 바이트들은 '\0'으로 처리되어있어서 문제 없음
 
-    if (recv_host_header.length > 4096 || recv_host_header.length == 0) {
+    if (recv_host_header.length > 4096) {
         state_.protocol_error = true;
         recv_state.protocol_error = true;
         result.state = recv_state;
@@ -512,8 +521,15 @@ RecvResult ClientApp::RecvPacket() {
     result.length = recv_host_header.length;
     result.nick = nick_buf;
 
+    // 유효성 검사 후에 페이로드 0 검사를 해야 유효하지 않은 패킷을 수신하는 문제 예방 가능
+    if (recv_host_header.length == 0) {
+        result.payload.clear();
+        return result;
+    }
+
     // 페이로드 recv()
     state_.payload_recv = true;
+    recv_state.payload_recv = true;
     int payload_recv_res = sock_.ConnectSockRecv(state_, buf, recv_host_header.length);
 
     if (payload_recv_res == SOCKET_ERROR) {
@@ -531,12 +547,11 @@ RecvResult ClientApp::RecvPacket() {
     }
 
     state_.payload_recv = false;
+    recv_state.payload_recv = false;
 
     buf[recv_host_header.length] = '\0';
 
     result.payload = buf;
-
-\
 
     return result;
 }

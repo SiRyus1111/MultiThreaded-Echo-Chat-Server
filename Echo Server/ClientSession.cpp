@@ -81,17 +81,27 @@ bool ClientSession::TryMarkClosing() {
 
 	// 이 이후를 실행할 수 있는 스레드는 종료 책임을 가진다.
 
-	{
-		std::lock_guard<std::mutex> lock(current_room_mutex);
-		if (!current_room.expired()) {
-			if (auto mamager_sp = Manager_wp.lock()) {
+    // 이 사이에 AddMember()가 실행되어도 어차피 룸을 얻는 것은 current_room_mutex때문에 해당 룸이 변경된 후이기 때문에 문제 없음
+    // 해당 룸에 LeaveRoom()을 호출하게 됨
 
-				if (!mamager_sp->LeaveRoom(shared_from_this())) { // 만약 LeaveRoom() 함수가 실패한 경우(이미 해당 룸이 폭파될 예정)
-					current_room.reset(); // 자신의 current_room만 빠르게 reset()
-				}
-			}
-		}
-	}
+    std::shared_ptr<Room> room;
+    {
+        std::lock_guard<std::mutex> lock(current_room_mutex);
+        room = current_room.lock(); // closing=true 이후(이거 중요함), 락 안에서 '지금' 값 다시 읽기
+
+        // Closing 처리와 이 과정의 실행 사이에 AddMember()가 수행되어도
+        // AddMember()가 락을 먼저 잡은 경우 : 룸에 입장 후 뒤의 LeaveRoom()이 실행됨
+        // 이 함수가 먼저 락을 잡은 경우 : 이미 closing == true이므로 AddMember()가 실행되지 않음.
+    }
+
+    if (room != nullptr) {
+        if (auto mamager_sp = Manager_wp.lock()) {
+
+            if (!mamager_sp->LeaveRoom(shared_from_this())) { // 만약 LeaveRoom() 함수가 실패한 경우(이미 해당 룸이 폭파될 예정)
+                current_room.reset(); // 자신의 current_room만 빠르게 reset()
+            }
+        }
+    }
 
 	ClientSock->ClientSockShutdown(); // 만약 SOCKET_ERROR를 반환해도 상관없음. 그러면 Recv / Send도 안되는거 아님?
 	RemoveThisClient();

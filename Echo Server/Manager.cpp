@@ -14,52 +14,69 @@ void Manager::RemoveRoomToManager(RoomID room_id) {
 	}
 }
 
-bool Manager::LeaveRoom(std::shared_ptr<ClientSession> client) {
-	auto room = client->GetRoom();
-	if (!room) return false; // 이미 룸이 삭제되어서 GetRoom이 nullptr를 반환하는 것에 대한 예외처리
+bool Manager::LeaveRoom(std::shared_ptr<ClientSession> client){
+    auto room = client->GetRoom(); // shared_ptr 반환
+    if (!room) {
+        LineLogger::GetInstance().WriteLog("[Leave Room Failed] Failed to leave the room because no rooms available. Room ID : ", room->GetRoomID(), ", Session ID : ", client->GetSessionID());    
+        return false; // 이미 룸이 삭제되어서 GetRoom이 nullptr를 반환하는 것에 대한 예외처리
+    }
 
-	auto task = std::make_shared<LeaveRoomTask>(client->GetSessionID());
-	auto future = task->GetFuture();
+    auto task = std::make_shared<LeaveRoomTask>(client->GetSessionID());
+    auto future = task->GetFuture();
 
-	if (!room->RoomTasksPush(task)) return false; // 이미 is_tasks_shutting이면 여기서 false
+    if (!room->RoomTasksPush(task)) { 
+        LineLogger::GetInstance().WriteLog("[Leave Room Failed] Failed to leave the room because ShutdownRoomTask has already been pushed. Room ID : ", room->GetRoomID(), ", Session ID : ", client->GetSessionID());
+        return false; // 이미 is_tasks_shutting이면 여기서 false
+    }
 
-	if (!future.get()) { // RemoveMember()가 실제로 끝날 때까지 호출 스레드가 대기(RemoveMember() 실행 확인)(성공 / 실패 여부까지 받아서 불변식 깨지 않나 확인)
-	    return false;
-	}
-	
-	return true;
-}
-
-bool Manager::JoinRoom(RoomID room_id, std::shared_ptr<ClientSession> client) {
-	std::shared_ptr<Room> room;
-	{
-		std::lock_guard<std::mutex> lock(rooms_mutex);
-
-		auto it = rooms.find(room_id);
-		if (it == rooms.end()) {
-			return false;
-		}
-
-		room = it->second;
-	}
-
-	auto task = std::make_shared<JoinRoomTask>(client);
-	auto future = task->GetFuture();
-
-	if (!room->RoomTasksPush(task)) {
-		return false;
-	}
-
-	if (!future.get()) {
+    if (!future.get()) { // RemoveMember()가 실제로 끝날 때까지 호출 스레드가 대기(RemoveMember() 실행 확인)(성공 / 실패 여부까지 받아서 불변식 깨지 않나 확인)
+        LineLogger::GetInstance().WriteLog("[Leave Room Failed] Failed to leave the room because the task on that room failed. Room ID : ", room->GetRoomID(), ", Session ID : ", client->GetSessionID());
         return false;
     }
 
-	return true;
+    LineLogger::GetInstance().WriteLog("[Leave Room] Left the room. Room ID : ", room->GetRoomID(), ", Session ID : ", client->GetSessionID());
+
+    return true;
+}
+
+bool Manager::JoinRoom(RoomID room_id, std::shared_ptr<ClientSession> client) {
+    std::shared_ptr<Room> room;
+    {
+        std::lock_guard<std::mutex> lock(rooms_mutex);
+
+        auto it = rooms.find(room_id);
+        if (it == rooms.end()) {
+            LineLogger::GetInstance().WriteLog("[Join Room Failed] Failed to join the room because it was deleted. Room ID : ", room->GetRoomID(), ", Session ID : ", client->GetSessionID());
+            return false;
+        }
+
+        room = it->second;
+    }
+    
+    auto task = std::make_shared<JoinRoomTask>(client);
+    auto future = task->GetFuture();
+
+    if (!room->RoomTasksPush(task)) {
+		LineLogger::GetInstance().WriteLog("[Join Room Failed] Failed to join the room because ShutdownRoomTask has already been pushed. Room ID : ", room->GetRoomID(), ", Session ID : ", client->GetSessionID());
+        return false;
+    }
+
+    if (!future.get()) {
+        LineLogger::GetInstance().WriteLog("[Join Room Failed] Failed to join the room because the task on that room failed. Room ID : ", room->GetRoomID(), ", Session ID : ", client->GetSessionID());
+        return false;
+    }
+
+    LineLogger::GetInstance().WriteLog("[Join Room] Joined the room. Room ID : ", room->GetRoomID(), ", Session ID : ", client->GetSessionID());
+
+    // 로그를 찍는 시점에는 해당 객체들의 수명이 보장됨.
+
+    return true;
 
 }
 
 bool Manager::CreateRoom(std::shared_ptr<ClientSession> client_to_create) {
     if (client_to_create == nullptr) {
+        LineLogger::GetInstance().WriteLog("[Create Room Failed] Failed to create room because client is invalid.");
         return false;
     }
 
@@ -74,6 +91,7 @@ bool Manager::CreateRoom(std::shared_ptr<ClientSession> client_to_create) {
     this_room->RoomTasksPush(task);
 
     if (!future.get()) {
+        LineLogger::GetInstance().WriteLog("[Create Room Failed] Failed to create room because default member setup failed.");
         return false;
     }
 
@@ -88,6 +106,8 @@ bool Manager::CreateRoom(std::shared_ptr<ClientSession> client_to_create) {
         rooms_threads[this_room_id] = std::move(assigned_thread);
     }
 
+    LineLogger::GetInstance().WriteLog("[Room Created] Room Created. Room ID : ", this_room_id, ", Session ID that created the room : ", client_to_create->GetSessionID());
+
     return true;
 }
 
@@ -98,6 +118,7 @@ bool Manager::DeleteRoom(RoomID room_id) {
 
 		auto it = rooms.find(room_id);
 		if (it == rooms.end()) {
+            LineLogger::GetInstance().WriteLog("[Delete Room Failed] Failed to delete room because it doesn't exist in the room list. Room ID : ", room_id);
 			return false;
 		}
 
@@ -107,6 +128,7 @@ bool Manager::DeleteRoom(RoomID room_id) {
 	auto task = std::make_shared<ShutdownRoomTask>();
 
 	if (!room->RoomTasksPush(task)) {
+        LineLogger::GetInstance().WriteLog("[Delete Room Failed] Failed to delete room because ShutdownRoomTask has already been pushed. Room ID : ", room_id);
 		return false;
 	}
 
@@ -118,6 +140,7 @@ bool Manager::DeleteRoom(RoomID room_id) {
 
         auto it = rooms_threads.find(room_id);
         if (it == rooms_threads.end()) {
+            LineLogger::GetInstance().WriteLog("[Delete Room Failed] Failed to delete room because its thread doesn't exist in the room's thread list. Room ID : ", room_id);
             return false;
         }
 		
@@ -130,6 +153,7 @@ bool Manager::DeleteRoom(RoomID room_id) {
         this_room_thread.join();
     }
 
+    LineLogger::GetInstance().WriteLog("[Room Deleted] Room Deleted. Room ID : ", room_id);
 
 	return true;
 }

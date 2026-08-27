@@ -34,7 +34,10 @@ std::shared_ptr<RoomTask> Room::RoomTasksPop() {
 }
 
 bool Room::AddMember(std::shared_ptr<ClientSession> client) {
-	if (!client || (client->GetRoom() != nullptr)) false;
+    if (!client) {
+        LineLogger::GetInstance().WriteLog("[Add Room Member Failed] Failed to add member because client was Invalid. Room ID : ", room_id);
+        return false;   
+    }
 
 	// 정책을 ShutdownRoomTask가 push() 된 후에는 새로운 작업을 큐에 넣지 않는 것으로 잡았으므로 shutting == true 검사는 필요 없음
 
@@ -43,10 +46,24 @@ bool Room::AddMember(std::shared_ptr<ClientSession> client) {
 	std::unique_lock<std::mutex> client_lock = client->GetCurrentRoomLock();
 	client_lock.lock();
 
+	// 혹시 closing == true일 때 룸에 들어갈까봐 검사
+    // 여기서 먼저 current_room_mutex를 잡으면 AddMember() 후 TryMarkClosing() 함수의 RemoveMember() 함수가 실행되게됨
+    // TryMarkClosing() 함수에서 먼저 current_room_mutex를 잡으면 이 검사에서 걸러짐.
+    if (!client->GetRoomUnlocked()) {
+        LineLogger::GetInstance().WriteLog("[Add Room Member Failed] Failed to add member because client is already assigned to another room. Room Id : ", room_id, ", Session ID : ", client->GetSessionID());
+        return false;
+    }
+    if (client->GetClosing()) {
+        LineLogger::GetInstance().WriteLog("[Add Room Member Failed] Failed to add member because client if already closed. Room ID : ", room_id, ", Session ID : ", client->GetSessionID());
+        return false;
+    }
+
 	// members가 변하면 -> current_room도 변하도록 미리 current_room_mutex를 잡아둠
 	// 중간에 다른 스레드가 current_room을 변경할 수 없어 room.members contains client <-> client.current_room == room이 성립함
     client->SetRoomUnlocked(shared_from_this());
 	members[client->GetSessionID()] = client;
+
+    LineLogger::GetInstance().WriteLog("[Add Room Member] Member added. Room ID : ", room_id,", Session ID : ", client->GetSessionID());
 
 	return true;
 }
@@ -54,7 +71,10 @@ bool Room::AddMember(std::shared_ptr<ClientSession> client) {
 bool Room::RemoveMember(SessionID session_id) {
 
 	auto it = members.find(session_id);
-	if (it == members.end()) return false;
+    if (it == members.end()){
+        LineLogger::GetInstance().WriteLog("[Remove Room Member Failed] Failed to Remove Member because they are not present in the room. Room ID : ", room_id, ", Session ID : ", session_id);
+        return false;
+    }
 
 	auto client_wp = it->second;
 
@@ -62,10 +82,11 @@ bool Room::RemoveMember(SessionID session_id) {
 		std::unique_lock<std::mutex> client_lock = client_sp->GetCurrentRoomLock();
 		client_lock.lock(); // 위와 같은 이유로 current_room_mutex를 먼저 잡고 current_room / members에 대한 변경을 진행함
 
-		client_sp->SetRoom(nullptr);
+        client_sp->SetRoomUnlocked(nullptr);
 		members.erase(session_id);
-	}
 
+		LineLogger::GetInstance().WriteLog("[Remove Room Member] Member Removed. Room ID : ", room_id, ", Session ID : ", client_sp->GetSessionID()); // 이건 여기서 성공 로그를 찍음.
+	}
 
 	return true;
 }
@@ -88,13 +109,15 @@ RoomID Room::GetRoomID() const {
 void Room::RoomBroadcast(std::shared_ptr<Packet> packet, SessionID sender_id) {
 	for (auto [id, client_wp] : members) {
 		if (auto client_sp = client_wp.lock()) {
-			if (client_sp->GetSessionID() == sender_id) {
+			if ((client_sp->GetSessionID() == sender_id) || client_sp->GetClosing()) {
 				continue;
 			}
 			client_sp->SendQueuePush(packet);
 		}
 
 	}
+
+	LineLogger::GetInstance().WriteLog("[Room Broadcast] Room Broadcast Complete. RoomID : ", room_id, ", SenderID :", sender_id);
 }
 
 void Room::Shutdown() {
@@ -124,6 +147,8 @@ void Room::Shutdown() {
 	if (auto manager_sp = manager_wp.lock()) {
 		manager_sp->RemoveRoomToManager(room_id);
 	}
+
+	LineLogger::GetInstance().WriteLog("[Room Shutdown] Shutdown Complete. RoomID : ", room_id);
 }
 
 void Room::RoomRun() {

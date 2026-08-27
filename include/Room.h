@@ -27,10 +27,10 @@ public:
 	Room(RoomID this_room_id,
 		std::shared_ptr<Manager> manager_sp)
 		: room_id(this_room_id), manager_wp(manager_sp), shutting(false), is_tasks_shutting(false) {
-		LineLogger::GetInstance().WriteLog("[Room Create] The room has been created. Room ID : ", room_id);
+        LineLogger::GetInstance().WriteLog("[Room Object Create] The room object has been created. Room ID : ", room_id);
 	}
 	~Room() {
-		LineLogger::GetInstance().WriteLog("[Room Deleted] The room has been closed. Room ID : ", room_id);
+        LineLogger::GetInstance().WriteLog("[Room Object Deleted] The room object has been deleted. Room ID : ", room_id);
 	}
 
 	bool RoomTasksPush(std::shared_ptr<RoomTask> task_requested_by_client);

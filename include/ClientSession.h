@@ -80,9 +80,12 @@ public:
 	}
 
 	std::shared_ptr<Room> GetRoom() const {
-		std::lock_guard<std::mutex> lock(current_room_mutex);
-		return current_room.lock();
-	}
+        std::lock_guard<std::mutex> lock(current_room_mutex);
+        return GetRoomUnlocked();
+    }
+    std::shared_ptr<Room> GetRoomUnlocked() const {
+        return current_room.lock();
+    }
 
 	std::unique_lock<std::mutex> GetCurrentRoomLock();
 

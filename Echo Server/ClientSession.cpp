@@ -210,7 +210,7 @@ NetState ClientSession::SendPacket(std::shared_ptr<Packet> packet) {
 
 
     // 패킷 유효성 검사
-	if (VerifySendPacket(packet)){
+	if (!VerifySendPacket(packet)){
 		ClientState.protocol_error = true;
 		send_packet_state.protocol_error = true;
 
@@ -302,7 +302,7 @@ RecvResult ClientSession::RecvPacket() {
 	nick_buf[MAX_NICKNAME_LENGTH] = '\0'; // 32바이트짜리 닉네임일 경우에도 문자열로 읽을 수 있게 맨 끝에 널문자 붙임. 32바이트보다 닉네임을 표현하는 바이트 수가 적더라도 이미 그 빈 바이트들은 '\0'으로 처리되어있어서 문제 없음
 	*/
 
-	if (VerifyRecvPacket(packet)) {
+	if (!VerifyRecvPacket(packet)) {
 		ClientState.protocol_error = true;
 		recv_packet_state.protocol_error = true;
 		result.state = recv_packet_state;

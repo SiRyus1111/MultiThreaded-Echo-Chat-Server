@@ -126,7 +126,7 @@ public:
             	                || (type == PacketType::CREATE_ROOM)
                 	            || (type == PacketType::DELETE_ROOM);
 
-		bool is_length_valid = (packet->header.length > PAYLOAD_SIZE);
+		bool is_length_valid = (packet->header.length <= PAYLOAD_SIZE);
 
     	return (is_init_packet_type || is_nick_packet_type || is_room_packet_type) && is_length_valid;
 	}
@@ -151,7 +151,7 @@ public:
             	                || (type == PacketType::DELETE_ROOM_FAILED)
                 	            || (type == PacketType::ROOM_DELETED);
 		
-		bool is_length_valid = (packet->header.length > PAYLOAD_SIZE);
+		bool is_length_valid = (packet->header.length <= PAYLOAD_SIZE);
 
     	return (is_init_packet_type || is_nick_packet_type || is_room_packet_type) && is_length_valid;
 	}

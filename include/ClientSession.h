@@ -108,8 +108,8 @@ public:
 	}
 
 	// 페이로드 수신 전에 해당 패킷을 넣어버려도 페이로드 사용 안하니까 괜찮음
-	bool VerifyRecvPacket(std::shared_ptr<Packet> packet) {
-    	PacketType type = static_cast<PacketType>(packet->header.type);
+	bool VerifyRecvPacket(std::shared_ptr<Packet> packet) { // 디버깅 포인트 : 헤더가 네트워크 바이트 정렬이란 것을 잊고있었음..
+    	PacketType type = static_cast<PacketType>(ntohl(packet->header.type));
     
 	    // 검사해야할 조건이 많고
     	// 다양한 패킷 타입이 있으므로
@@ -126,13 +126,13 @@ public:
             	                || (type == PacketType::CREATE_ROOM)
                 	            || (type == PacketType::DELETE_ROOM);
 
-		bool is_length_valid = (packet->header.length <= PAYLOAD_SIZE);
+		bool is_length_valid = (ntohl(packet->header.length) <= PAYLOAD_SIZE);
 
     	return (is_init_packet_type || is_nick_packet_type || is_room_packet_type) && is_length_valid;
 	}
 
-	bool VerifySendPacket(std::shared_ptr<Packet> packet) {
-    	PacketType type = static_cast<PacketType>(packet->header.type);
+	bool VerifySendPacket(std::shared_ptr<Packet> packet) { // 디버깅 포인트 : 헤더가 네트워크 바이트 정렬이란 것을 잊고있었음..
+    	PacketType type = static_cast<PacketType>(ntohl(packet->header.type));
 
 	    bool is_init_packet_type = (type == PacketType::CHAT_MESSAGE)
     	                        || (type == PacketType::HEADER_ERROR);
@@ -151,7 +151,7 @@ public:
             	                || (type == PacketType::DELETE_ROOM_FAILED)
                 	            || (type == PacketType::ROOM_DELETED);
 		
-		bool is_length_valid = (packet->header.length <= PAYLOAD_SIZE);
+		bool is_length_valid = (ntohl(packet->header.length) <= PAYLOAD_SIZE);
 
     	return (is_init_packet_type || is_nick_packet_type || is_room_packet_type) && is_length_valid;
 	}

@@ -219,6 +219,49 @@ public:
 
     void SendRun();
 
+    // 페이로드 수신 전에 해당 패킷을 넣어버려도 페이로드 사용 안하니까 괜찮음
+    bool VerifyRecvPacket(PacketType type, uint32_t length) {
+
+        bool is_init_packet_type = (type == PacketType::CHAT_MESSAGE)
+                                || (type == PacketType::HEADER_ERROR);
+
+        bool is_nick_packet_type = (type == PacketType::NICKNAME_CHANGE_SUCESS)
+                                || (type == PacketType::NICKNAME_CHANGE_FAILED);
+                        
+        bool is_room_packet_type = (type == PacketType::ROOM_MESSAGE)
+                                || (type == PacketType::JOIN_ROOM_SUCCESS)
+                                || (type == PacketType::LEAVE_ROOM_SUCCESS)
+                                || (type == PacketType::CREATE_ROOM_SUCCESS)
+                                || (type == PacketType::DELETE_ROOM_SUCCESS)
+                                || (type == PacketType::JOIN_ROOM_FAILED)
+                                || (type == PacketType::LEAVE_ROOM_FAILED)
+                                || (type == PacketType::CREATE_ROOM_FAILED)
+                                || (type == PacketType::DELETE_ROOM_FAILED)
+                                || (type == PacketType::ROOM_DELETED);
+
+        bool is_length_valid = (ntohl(length <= PAYLOAD_SIZE));
+
+        return (is_init_packet_type || is_nick_packet_type || is_room_packet_type) && is_length_valid;
+    }
+
+    bool VerifySendPacket(PacketType type, uint32_t length) {
+
+        bool is_init_packet_type = (type == PacketType::CHAT_MESSAGE)
+                                || (type == PacketType::HEADER_ERROR);
+    
+        bool is_nick_packet_type = (type == PacketType::NICKNAME_CHANGE);
+
+        bool is_room_packet_type = (type == PacketType::JOIN_ROOM) 
+                                || (type == PacketType::LEAVE_ROOM)
+                                || (type == PacketType::ROOM_MESSAGE)
+                                || (type == PacketType::CREATE_ROOM)
+                                || (type == PacketType::DELETE_ROOM);
+
+        bool is_length_valid = (length <= PAYLOAD_SIZE);
+
+        return (is_init_packet_type || is_nick_packet_type || is_room_packet_type) && is_length_valid;
+    }
+
     // nick은 수정할 닉네임이 아닌 해당 패킷을 송 / 수신하는 주체의 닉네임
     NetState SendPacket(const char* msg, uint32_t len, PacketType type, Nickname nick);
 
@@ -382,23 +425,11 @@ NetState ClientApp::SendPacket(const char* msg, uint32_t len, PacketType type, N
 
     PacketHeader send_host_header{};
 
-    if (len > PAYLOAD_SIZE) {
+    if (!VerifySendPacket(type, len)) {
         send_state.protocol_error = true;
         state_.protocol_error = true;
-    }
 
-    if (type != PacketType::CHAT_MESSAGE &&
-        type != PacketType::HEADER_ERROR &&
-        type != PacketType::NICKNAME_CHANGE) {
-        send_state.protocol_error = true;
-        state_.protocol_error = true;
-    }
-
-    // 닉네임 검증은 이미 입력받을 때 보장됨
-    // 하지만 무서운걸..ㅋㅋ
-    if (nick.size() > MAX_NICKNAME_LENGTH) {
-        send_state.protocol_error = true;
-        state_.protocol_error = true;
+        return send_state;
     }
 
     send_host_header.length = len;
@@ -498,18 +529,7 @@ RecvResult ClientApp::RecvPacket() {
     memcpy(nick_buf, recv_net_header.nickname, HEADER_NICKNAME_SIZE);
     nick_buf[MAX_NICKNAME_LENGTH] = '\0'; // 32바이트짜리 닉네임일 경우에도 문자열로 읽을 수 있게 맨 끝에 널문자 붙임. 32바이트보다 닉네임을 표현하는 바이트 수가 적더라도 이미 그 빈 바이트들은 '\0'으로 처리되어있어서 문제 없음
 
-    if (recv_host_header.length > 4096) {
-        state_.protocol_error = true;
-        recv_state.protocol_error = true;
-        result.state = recv_state;
-
-        return result;
-    }
-
-    if (recv_host_header.type != static_cast<int32_t>(PacketType::CHAT_MESSAGE) &&
-        recv_host_header.type != static_cast<int32_t>(PacketType::HEADER_ERROR) &&
-        recv_host_header.type != static_cast<int32_t>(PacketType::NICKNAME_CHANGE_FAILED) && 
-        recv_host_header.type != static_cast<int32_t>(PacketType::NICKNAME_CHANGE_SUCESS)) {
+    if (!VerifyRecvPacket(static_cast<PacketType>(recv_host_header.type), recv_host_header.length)) {
         state_.protocol_error = true;
         recv_state.protocol_error = true;
         result.state = recv_state;

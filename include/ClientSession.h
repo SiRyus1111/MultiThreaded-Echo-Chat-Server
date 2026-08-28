@@ -107,6 +107,55 @@ public:
 		return true;
 	}
 
+	// 페이로드 수신 전에 해당 패킷을 넣어버려도 페이로드 사용 안하니까 괜찮음
+	bool VerifyRecvPacket(std::shared_ptr<Packet> packet) {
+    	PacketType type = static_cast<PacketType>(packet->header.type);
+    
+	    // 검사해야할 조건이 많고
+    	// 다양한 패킷 타입이 있으므로
+    	// 코드가 지나치게 복잡해질 수 있어서
+    	// 패킷 타입의 카테고리에 따라 다른 bool 변수로 타입을 받음.
+    	bool is_init_packet_type = (type == PacketType::CHAT_MESSAGE)
+        	                    || (type == PacketType::HEADER_ERROR);
+    
+    	bool is_nick_packet_type = (type == PacketType::NICKNAME_CHANGE);
+
+	    bool is_room_packet_type = (type == PacketType::JOIN_ROOM) 
+    	                        || (type == PacketType::LEAVE_ROOM)
+        	                    || (type == PacketType::ROOM_MESSAGE)
+            	                || (type == PacketType::CREATE_ROOM)
+                	            || (type == PacketType::DELETE_ROOM);
+
+		bool is_length_valid = (packet->header.length > PAYLOAD_SIZE);
+
+    	return (is_init_packet_type || is_nick_packet_type || is_room_packet_type) && is_length_valid;
+	}
+
+	bool VerifySendPacket(std::shared_ptr<Packet> packet) {
+    	PacketType type = static_cast<PacketType>(packet->header.type);
+
+	    bool is_init_packet_type = (type == PacketType::CHAT_MESSAGE)
+    	                        || (type == PacketType::HEADER_ERROR);
+
+	    bool is_nick_packet_type = (type == PacketType::NICKNAME_CHANGE_SUCESS)
+    	                        || (type == PacketType::NICKNAME_CHANGE_FAILED);
+                        
+    	bool is_room_packet_type = (type == PacketType::ROOM_MESSAGE)
+        	                    || (type == PacketType::JOIN_ROOM_SUCCESS)
+            	                || (type == PacketType::LEAVE_ROOM_SUCCESS)
+                	            || (type == PacketType::CREATE_ROOM_SUCCESS)
+                    	        || (type == PacketType::DELETE_ROOM_SUCCESS)
+                        	    || (type == PacketType::JOIN_ROOM_FAILED)
+      	                        || (type == PacketType::LEAVE_ROOM_FAILED)
+        	                    || (type == PacketType::CREATE_ROOM_FAILED)
+            	                || (type == PacketType::DELETE_ROOM_FAILED)
+                	            || (type == PacketType::ROOM_DELETED);
+		
+		bool is_length_valid = (packet->header.length > PAYLOAD_SIZE);
+
+    	return (is_init_packet_type || is_nick_packet_type || is_room_packet_type) && is_length_valid;
+	}
+
 	std::shared_ptr<Packet> SendQueuePop() {
 		std::lock_guard<std::mutex> lock(send_queue_mutex);
 

@@ -208,21 +208,9 @@ NetState ClientSession::SendPacket(std::shared_ptr<Packet> packet) {
 	send_host_header.length = ntohl(packet->header.length);
 	send_host_header.type = ntohl(packet->header.type);
 
-	// 메시지 길이 검사
-	if (send_host_header.length > PAYLOAD_SIZE) {
-		ClientState.protocol_error = true;
-		send_packet_state.protocol_error = true;
-		return send_packet_state;
-	}
 
-	// 패킷 타입 유효성 검사
-	PacketType send_packet_type = static_cast<PacketType>(ntohl(packet->header.type));
-
-	if (send_packet_type != PacketType::CHAT_MESSAGE &&
-		send_packet_type != PacketType::HEADER_ERROR &&
-		send_packet_type != PacketType::NICKNAME_CHANGE &&
-		send_packet_type != PacketType::NICKNAME_CHANGE_FAILED &&
-		send_packet_type != PacketType::NICKNAME_CHANGE_SUCESS){
+    // 패킷 유효성 검사
+	if (VerifySendPacket(packet)){
 		ClientState.protocol_error = true;
 		send_packet_state.protocol_error = true;
 
@@ -314,20 +302,7 @@ RecvResult ClientSession::RecvPacket() {
 	nick_buf[MAX_NICKNAME_LENGTH] = '\0'; // 32바이트짜리 닉네임일 경우에도 문자열로 읽을 수 있게 맨 끝에 널문자 붙임. 32바이트보다 닉네임을 표현하는 바이트 수가 적더라도 이미 그 빈 바이트들은 '\0'으로 처리되어있어서 문제 없음
 	*/
 
-	if (recv_host_header.length > PAYLOAD_SIZE) {
-		ClientState.protocol_error = true;
-		recv_packet_state.protocol_error = true;
-		result.state = recv_packet_state;
-
-		return result;
-	}
-
-	// NICKNAME_CHANGE는 닉네임 시스템 구현과 함께 추가할 예정(추가함)
-	if (recv_host_header.type != static_cast<int32_t>(PacketType::CHAT_MESSAGE) &&
-		recv_host_header.type != static_cast<int32_t>(PacketType::HEADER_ERROR) &&
-		recv_host_header.type != static_cast<int32_t>(PacketType::NICKNAME_CHANGE) &&
-		recv_host_header.type != static_cast<int32_t>(PacketType::NICKNAME_CHANGE_FAILED) &&
-		recv_host_header.type != static_cast<int32_t>(PacketType::NICKNAME_CHANGE_SUCESS)) {
+	if (VerifyRecvPacket(packet)) {
 		ClientState.protocol_error = true;
 		recv_packet_state.protocol_error = true;
 		result.state = recv_packet_state;

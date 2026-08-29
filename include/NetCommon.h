@@ -6,6 +6,7 @@
 #include "Common.h"
 #include <cstdint>
 #include "LineLogger.h"
+#include "Types.h"
 
 #pragma comment(lib, "ws2_32.lib")
 
@@ -55,7 +56,7 @@ enum class PacketType : int32_t {
 struct PacketHeader {
     int32_t type; // 의미(PacketType)가 아닌 값(int32_t)으로 가짐
     uint32_t length;
-    char nickname[32];
+    char nickname[MAX_NICKNAME_LENGTH];
 };
 #pragma pack(pop)
 

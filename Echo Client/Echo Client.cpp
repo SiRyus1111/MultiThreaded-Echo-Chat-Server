@@ -6,109 +6,19 @@
 #include "NetCommon.h"
 #include "SocketRAII.h"
 #include "LineLogger.h"
+#include "InputParser.h"
 #include <atomic>
 #include <memory>
 #include <thread>
 
 const char* SERVER_ADDR = "127.0.0.1";
-const int SERVER_PORT = 9000;
-const int PAYLOAD_SIZE = 4096;
-const int BUFFER_SIZE = PAYLOAD_SIZE + 1;
-const int HEADER_TYPE_SIZE = 4;
-const int HEADER_LENGTH_SIZE = 4;
-const int HEADER_NICKNAME_SIZE = 32;
-const int HEADER_SIZE = HEADER_TYPE_SIZE + HEADER_LENGTH_SIZE + HEADER_NICKNAME_SIZE;
 
-const size_t MAX_NICKNAME_LENGTH = 32;
-
-const char header_err_msg[] = "The maximum value of the header's length field has been exceeded. The client is terminating the connection.";
-uint32_t host_err_msg_len = static_cast<uint32_t>(strlen(header_err_msg));
-
-const std::string nick_change_sucess_msg = "Your nickname has been successfully changed.";
-const std::string nick_already_used_msg = "That nickname is already taken. Please enter a different nickname.";
-
-using Nickname = std::string;
-
-struct RecvResult {
+struct ClientRecvResult {
     NetState state{};
     PacketType type = PacketType::CHAT_MESSAGE;
     uint32_t length = 0;
     Nickname nick;
     std::string payload;
-};
-
-// 입력받은 문자열의 첫 n글자(식별자)에 따라 클라이언트에서 입력받은 메시지의 동작을 분리
-
-// 입력받은 메시지를 파싱한 결과
-struct ParsedInput {
-    PacketType type = PacketType::CHAT_MESSAGE; // 오직 보내야할 패킷 타입만 나타냄
-    uint32_t length = 0; // 보내야할 페이로드의 길이를 나타냄
-    std::string payload; // 실제로 보낼 메시지를 나타냄(/nick같은 메시지 식별자 절삭한)
-
-    bool quit = false; // 종료 메시지냐 (이것 먼저 검사)
-    bool valid = true; // 이 파싱된 결과가 유효하냐 (이것 먼저 검사)
-};
-
-class InputParser {
-private:
-
-public:
-    static ParsedInput Parse(const std::string& input) {
-        
-        ParsedInput parsed_input;
-
-        if (input.empty()) {
-            parsed_input.valid = false;
-            return parsed_input;
-        }
-        
-        if (input[0] != '/') { // 일반 메시지인 경우   
-
-            parsed_input.type = PacketType::CHAT_MESSAGE;
-
-            parsed_input.payload = input;
-
-            parsed_input.length = input.size();
-
-            return parsed_input;
-        }
-
-        // 식별자를 봐야하는 메시지인 경우
-
-        if (input == "/quit") { // 종료
-            parsed_input.quit = true;
-            return parsed_input;
-        }
-
-        if (input.starts_with("/nick ")) { // 닉네임 변경
-
-            std::string nickname = input.substr(6); // "/nick "다음 문자열을 nickname으로 복사'
-
-            if (nickname.empty()) {
-                parsed_input.valid = false;
-                return parsed_input;
-            }
-
-            if (nickname.size() > MAX_NICKNAME_LENGTH) {
-                parsed_input.valid = false;
-                return parsed_input;
-            }
-
-            parsed_input.type = PacketType::NICKNAME_CHANGE;
-
-            parsed_input.payload = nickname;
-            parsed_input.length = nickname.size();
-
-            return parsed_input;
-        }
-
-        // 추후에 다른 식별자 추가 가능
-
-        // 여기까지 오려면 input이 !(일반 메시지 || /nick으로 시작하는 메시지 || /quit으로 시작하는 메시지)여야 함.
-        // 즉, 유효하지 않은 메시지.
-        parsed_input.valid = false;
-        return parsed_input;
-    }
 };
 
 class ClientApp : public std::enable_shared_from_this<ClientApp> {
@@ -124,7 +34,7 @@ public:
         nick_.resize(MAX_NICKNAME_LENGTH, '\0'); // 시작할 때 기본 닉네임을 빈 닉네임(모든 비트가 0인 32바이트 문자열)로 바꾸는 코드.
     }
 
-    void HandleRecvPacket(const RecvResult& res) {
+    void HandleRecvPacket(const ClientRecvResult& res) {
         switch (res.type) {
             case PacketType::CHAT_MESSAGE:
             {
@@ -265,7 +175,7 @@ public:
     // nick은 수정할 닉네임이 아닌 해당 패킷을 송 / 수신하는 주체의 닉네임
     NetState SendPacket(const char* msg, uint32_t len, PacketType type, Nickname nick);
 
-    RecvResult RecvPacket();
+    ClientRecvResult RecvPacket();
 
     bool TryMarkClosing() {
         bool expected = false;
@@ -311,7 +221,7 @@ void ClientApp::Run() {
             break;
         }
 
-        RecvResult nickname_change_res = RecvPacket();
+        ClientRecvResult nickname_change_res = RecvPacket();
 
         if (nickname_change_res.state.peer_closed ||
             nickname_change_res.state.protocol_error ||
@@ -393,7 +303,7 @@ void ClientApp::SendRun() {
 
 void ClientApp::RecvRun() {
     while (true) {
-        RecvResult RecvRes = RecvPacket();
+        ClientRecvResult RecvRes = RecvPacket();
 
         if (closing.load()) {
             return;
@@ -485,14 +395,14 @@ NetState ClientApp::SendPacket(const char* msg, uint32_t len, PacketType type, N
     return send_state;
 }
 
-RecvResult ClientApp::RecvPacket() {
+ClientRecvResult ClientApp::RecvPacket() {
 
     char buf[BUFFER_SIZE];
 
     // 해당 수신 자체의 상태
     NetState recv_state{};
 
-    RecvResult result;
+    ClientRecvResult result;
 
     PacketHeader recv_net_header{};
 
